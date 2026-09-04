@@ -52,7 +52,7 @@ extension EngineLoopV2 {
         }
 
         let step = CBv2InFlightStep(
-            participants: Set(work.map(\.rec.id)),
+            compactParticipants: work.map(\.rec.id),
             sampledRows: graph.sampledRows,
             sampledTokens: graph.sampledTokens,
             evalTargets: graph.prefillEvalTargets,

@@ -49,6 +49,62 @@ public enum CBv2AttentionQKVMMA8V1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// H1-ATTN arm. Default ON. Applies to the Q/K/V host and the o_proj host
+    /// in `AttentionOQMVV1.swift`; both read the same env so a submission runs
+    /// one policy.
+    /// `DARKBLOOM_GEMMA4_MMA8_FP16_DEQUANT=0` restores the promoted
+    /// integer-convert A-side fill byte for byte in the same executables: in
+    /// the off state the header text and every registration name are the
+    /// incumbent's, so the off arm is the incumbent kernel, not a twin of it.
+    public static let fp16DequantEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MMA8_FP16_DEQUANT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Registration-key suffix for the H1 arm, empty in the off state, so a
+    /// registered name never outlives the body it was compiled from.
+    static let fp16DequantKeySuffix = (fp16DequantEnabled ? "_h1" : "") + "_bfill_v6"
+
+    /// H1-ATTN: the A-side fill of the 4-bit MMA8 step, shared verbatim by the
+    /// Q/K/V bodies here and the o_proj bodies in `AttentionOQMVV1.swift` (the
+    /// two files carried byte-identical copies of this macro; they now carry
+    /// one).
+    ///
+    /// `float(n)` for a nibble `n` is an integer-to-float convert.
+    /// `0x6400 | n` is the half bit pattern of `1024 + n` for every `n` in
+    /// 0...15: the exponent field is 25 and the bias is 15, so the value is
+    /// `2^10 * (1 + n / 1024)` and the four nibble bits land in the low
+    /// mantissa. `(1024 + n) - 1024` is then exact in half, because both
+    /// operands and the result are exactly representable there. So
+    /// `A.thread_elements()` receives the same float it received before, in
+    /// the same order, into the same unchanged
+    /// `simdgroup_multiply_accumulate` chain -- built in the fp16 pipe instead
+    /// of the integer one. No address is formed, no load moves, no barrier is
+    /// added and no accumulation is reordered.
+    ///
+    /// Only this SUBTRACTION form is exact. Folding the 1024 into the affine
+    /// bias (`b2 = fma(s, -1024, b)`) rounds twice -- `1024 * s + n * s` is
+    /// not `n * s` -- and is a different number. It is also the cheaper of the
+    /// two in AIR, which is exactly what makes it dangerous.
+    ///
+    /// The constant carries its own surrounding blank lines so that the two
+    /// halves of each header rejoin byte for byte.
+    static let mma8StepMacro = fp16DequantEnabled ? """
+
+
+#define MMA8_STEP(BB, J) A.thread_elements()[0] = float(as_type<half>(ushort(0x6400u | extract_bits(wv.x, 4 * (J), 4))) - 1024.0h); A.thread_elements()[1] = float(as_type<half>(ushort(0x6400u | extract_bits(wv.y, 4 * (J), 4))) - 1024.0h); simdgroup_multiply_accumulate(C, A, BB, C);
+
+
+""" : """
+
+
+#define MMA8_STEP(BB, J) A.thread_elements()[0] = float(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = float(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, BB, C);
+
+
+"""
+
     private static let batch = 8
     private static let sequence = 1
     private static let inputWidth = 2816
@@ -58,7 +114,10 @@ public enum CBv2AttentionQKVMMA8V1 {
     private static let simdGroups = 2
     private static let outputsPerGroup = 8
 
-    private static let mma8KernelHeader = """
+    private static let mma8KernelHeader =
+        mma8KernelHeaderPrefix + mma8StepMacro + mma8KernelHeaderSuffix
+
+    private static let mma8KernelHeaderPrefix = """
 #include <metal_simdgroup_matrix>
 
 #ifndef METAL_FUNC
@@ -119,9 +178,9 @@ inline float mma8_runsum4(uint4 r) {
 }
 
 #define MMA8_SETB(BB, W, HI) BB.thread_elements()[0] = mma8_##HI<T>(r0.W); BB.thread_elements()[1] = mma8_##HI<T>(r1.W);
+"""
 
-#define MMA8_STEP(BB, J) A.thread_elements()[0] = float(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = float(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, BB, C);
-
+    private static let mma8KernelHeaderSuffix = """
 template <typename T, int KS, int KFIX>
 METAL_FUNC void qkv_mma8_affine4_g64_impl(
     const device uint32_t* w,
@@ -151,7 +210,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
   float acc0 = 0.0f;
   float acc1 = 0.0f;
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
   uint2 wv_next = *((const device uint2*)(wrow + 32 * g0));
   uint2 wv_next2 =
@@ -186,22 +245,22 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
     // the eight steps keep their order into `C`. The multitile body keeps
     // its hoisted fills: there one fill set serves both tiles.
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_SETB(B0, x, lo)
-    MMA8_STEP(B0, 0)
-    MMA8_SETB(B1, x, hi)
-    MMA8_STEP(B1, 1)
-    MMA8_SETB(B2, y, lo)
-    MMA8_STEP(B2, 2)
-    MMA8_SETB(B3, y, hi)
-    MMA8_STEP(B3, 3)
-    MMA8_SETB(B4, z, lo)
-    MMA8_STEP(B4, 4)
-    MMA8_SETB(B5, z, hi)
-    MMA8_STEP(B5, 5)
-    MMA8_SETB(B6, w, lo)
-    MMA8_STEP(B6, 6)
-    MMA8_SETB(B7, w, hi)
-    MMA8_STEP(B7, 7)
+    MMA8_SETB(B, x, lo)
+    MMA8_STEP(B, 0)
+    MMA8_SETB(B, x, hi)
+    MMA8_STEP(B, 1)
+    MMA8_SETB(B, y, lo)
+    MMA8_STEP(B, 2)
+    MMA8_SETB(B, y, hi)
+    MMA8_STEP(B, 3)
+    MMA8_SETB(B, z, lo)
+    MMA8_STEP(B, 4)
+    MMA8_SETB(B, z, hi)
+    MMA8_STEP(B, 5)
+    MMA8_SETB(B, w, lo)
+    MMA8_STEP(B, 6)
+    MMA8_SETB(B, w, hi)
+    MMA8_STEP(B, 7)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
     acc1 += s * C.thread_elements()[1] + rs.y * b;
@@ -446,7 +505,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_rsp(
   float acc0 = 0.0f;
   float acc1 = 0.0f;
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
 #pragma unroll
   for (int gi = 0; gi < nGroups; ++gi) {
@@ -457,28 +516,27 @@ METAL_FUNC void qkv_mma8_affine4_g64_rsp(
     const float2 rs = float2(
         rs_table[c.fn * G + g], rs_table[(c.fn + 1) * G + g]);
 
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
-
     const uint2 wv = *((const device uint2*)(wrow + 32 * g));
     const float s = float(srow[g]);
     const float b = float(brow[g]);
 
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_STEP(B0, 0)
-    MMA8_STEP(B1, 1)
-    MMA8_STEP(B2, 2)
-    MMA8_STEP(B3, 3)
-    MMA8_STEP(B4, 4)
-    MMA8_STEP(B5, 5)
-    MMA8_STEP(B6, 6)
-    MMA8_STEP(B7, 7)
+    MMA8_SETB(B, x, lo)
+    MMA8_STEP(B, 0)
+    MMA8_SETB(B, x, hi)
+    MMA8_STEP(B, 1)
+    MMA8_SETB(B, y, lo)
+    MMA8_STEP(B, 2)
+    MMA8_SETB(B, y, hi)
+    MMA8_STEP(B, 3)
+    MMA8_SETB(B, z, lo)
+    MMA8_STEP(B, 4)
+    MMA8_SETB(B, z, hi)
+    MMA8_STEP(B, 5)
+    MMA8_SETB(B, w, lo)
+    MMA8_STEP(B, 6)
+    MMA8_SETB(B, w, hi)
+    MMA8_STEP(B, 7)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
     acc1 += s * C.thread_elements()[1] + rs.y * b;
@@ -649,7 +707,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     private static let tilesPerGroup = 2
 
     private static let multiTileKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_v4",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_v4"
+            + fp16DequantKeySuffix,
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -675,7 +734,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     }()
 
     private static let fusedSlidingKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_v1"
+            + fp16DequantKeySuffix,
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y", "y2"],
         source: """
@@ -692,7 +752,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let fusedFullKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_v1"
+            + fp16DequantKeySuffix,
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y", "y2"],
         source: """
@@ -714,7 +775,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     // entries the separate Q and K rsp dispatches would; the SPLIT store
     // keeps QKFUSE-001's two-buffer layout.
     private static let fusedSlidingRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_v1"
+            + fp16DequantKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y", "y2"],
         source: """
@@ -731,7 +793,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let fusedFullRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_v1"
+            + fp16DequantKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y", "y2"],
         source: """
@@ -748,7 +811,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let mma8Kernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_bfill_v4",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_bfill_v4"
+            + fp16DequantKeySuffix,
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -779,7 +843,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     // `rs` component the incumbent computes, and the rsp bodies consume the
     // identical float in the identical accumulator step.
     private static let runsumTableKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_rs_table_k2816_v1",
+        name: "cbv2_b8_rs_table_k2816_v1"
+            + fp16DequantKeySuffix,
         inputNames: ["x"],
         outputNames: ["rs"],
         source: """
@@ -805,7 +870,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let multiTileRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_v1"
+            + fp16DequantKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -822,7 +888,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let mma8RspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_rsp_v1"
+            + fp16DequantKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """

@@ -683,6 +683,18 @@ enum CBv2PrefillSoftmaxVecV1 {
         return max(1, min(640 / threadgroupSize, 1024 / threadgroupSize))
     }
 
+    nonisolated(unsafe) private static var softmaxParamsCache: [UInt64: MLXArray] = [:]
+
+    static func getSoftmaxParamsArray(axisSize: Int, numSimdgroups: Int) -> MLXArray {
+        let key = (UInt64(UInt32(axisSize)) << 32) | UInt64(UInt32(numSimdgroups))
+        if let cached = softmaxParamsCache[key] {
+            return cached
+        }
+        let arr = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        softmaxParamsCache[key] = arr
+        return arr
+    }
+
     /// Runs the vectorized softmax, or returns nil to keep the caller on
     /// the stock `MLX.softmax(scores, axis: -1, precise: true)` call.
     /// `scores` may be any contiguous rank; it is treated as a flat
@@ -700,7 +712,7 @@ enum CBv2PrefillSoftmaxVecV1 {
         let threadgroupSize = ((axisSize + 3) / 4 + 31) / 32 * 32
         guard threadgroupSize > 0, threadgroupSize <= 1024 else { return nil }
         let numSimdgroups = threadgroupSize / 32
-        let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        let paramsArray = getSoftmaxParamsArray(axisSize: axisSize, numSimdgroups: numSimdgroups)
 
         // PROMPT-GLUE2 (pg2): prompt-width score rectangles take the
         // rows-per-threadgroup twin; the incumbent computes the identical
@@ -888,7 +900,8 @@ enum CBv2PrefillAttnTrafficV1 {
         let rows = CBv2PrefillSoftmaxVecV1.rowsPerThreadgroup(
             axisSize: axisSize, threadgroupSize: threadgroupSize)
         guard rows >= 1, rows * threadgroupSize <= 1024 else { return nil }
-        let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        let paramsArray = CBv2PrefillSoftmaxVecV1.getSoftmaxParamsArray(
+            axisSize: axisSize, numSimdgroups: numSimdgroups)
         var statsShape = scores.shape
         statsShape[statsShape.count - 1] = 4
 

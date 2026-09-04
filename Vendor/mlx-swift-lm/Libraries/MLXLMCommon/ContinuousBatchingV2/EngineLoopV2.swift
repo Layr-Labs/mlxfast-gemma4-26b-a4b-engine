@@ -324,6 +324,13 @@ private let cbv2CompactInflightParticipantsEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+private let cbv2ChainedDecodeFastGreedyCheckEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_CBV2_CHAINED_DECODE_FAST_GREEDY_CHECK"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private enum CBv2ParticipantIndex {
     case compact([CBv2RequestID])
     case hashed(Set<CBv2RequestID>)
@@ -1588,10 +1595,15 @@ public final class EngineLoopV2: @unchecked Sendable {
         let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let ids = plan.assignments.map(\.id)
         let rowStates = ids.map { kvStates[$0]! }  // presence pre-checked
-        var params: [CBv2SamplingParams] = []
-        params.reserveCapacity(ids.count)
-        for id in ids { params.append(scheduler.record(for: id)!.request.sampling) }
-
+        var params: [CBv2SamplingParams]?
+        func resolveParams() -> [CBv2SamplingParams] {
+            if let params { return params }
+            var resolved: [CBv2SamplingParams] = []
+            resolved.reserveCapacity(ids.count)
+            for id in ids { resolved.append(scheduler.record(for: id)!.request.sampling) }
+            params = resolved
+            return resolved
+        }
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         // LGH-001. When the sampler would collapse to one `argMax` and the
@@ -1601,9 +1613,24 @@ public final class EngineLoopV2: @unchecked Sendable {
         let sampled: MLXArray
         let cacheInnerState: [MLXArray]
         let stepLogprobs: CBv2StepLogprobs?
+        let admitsGreedy: Bool
+        if cbv2ChainedDecodeFastGreedyCheckEnabled {
+            CBv2EngageMark.once("chained-decode-fast-greedy-check")
+            admitsGreedy = !ids.isEmpty && ids.allSatisfy { id in
+                guard let p = scheduler.record(for: id)?.request.sampling else { return false }
+                return p.temperature < LogitsPipelineV2.greedyEpsilon
+                    && p.topLogprobs == 0
+                    && p.logitBias.isEmpty
+                    && !(p.repetitionPenalty != 1 && p.repetitionContextSize > 0)
+                    && p.frequencyPenalty == 0
+                    && p.presencePenalty == 0
+            }
+        } else {
+            admitsGreedy = (sampler as? CBv2FusedGreedySampler)?.admitsFusedGreedy(params: resolveParams()) ?? false
+        }
         if let fusedSampler = sampler as? CBv2FusedGreedySampler,
             let fusedModel = model as? CBv2ArgmaxDecodeSteppableModel,
-            fusedSampler.admitsFusedGreedy(params: params),
+            admitsGreedy,
             fusedModel.admitsArgmaxDecode(tokens: inputs)
         {
             let caches = eagerCaches(rowStates: rowStates)
@@ -1618,7 +1645,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         } else {
             // Preserve the promoted SOFTCAP-SKIP fallback: callers that need
             // the ordinary logits plane still declare its order-only use.
-            let (last, innerState) = CBv2OrderOnlyLogits.withOrderOnly(params) {
+            let (last, innerState) = CBv2OrderOnlyLogits.withOrderOnly(resolveParams()) {
                 decodeLogits(rowStates: rowStates, tokens: inputs)  // [B, vocab]
             }
             cacheInnerState = innerState
@@ -1630,7 +1657,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             // one launched-but-unconfirmed sample here (the chain invariant).
             let samplerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
             sampled = sampler.sample(
-                logits: last, params: params, requestIDs: ids, stepIndex: stepCount,
+                logits: last, params: resolveParams(), requestIDs: ids, stepIndex: stepCount,
                 pendingSampledTokens: lazyTokens,
                 rowContext: { [scheduler] in
                     ids.map { Self.samplerRow(scheduler.record(for: $0)!) }

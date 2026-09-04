@@ -3905,6 +3905,155 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
   }
 }
 
+// DOWN-TILE-BATCH: the strip walk's tiles streamed through ONE K-loop.
+// KERN-DOWN-TILE below elects a survivor per span of consecutive 8-row
+// y-tiles and then walks those tiles SERIALLY: each tile is a complete
+// pair_impl / qmv_impl call, so a survivor's lifetime is span x ~3 K-blocks
+// of dependent DRAM round trips (704 = 2 * 256 + 192), every tile reloads
+// the same x row, and only four (pair: four) weight words per lane are ever
+// in flight. That is why this plane trails the K = 2816 gathers per byte:
+// it is latency-bound, not bandwidth-bound.
+//
+// This body keeps the survivor set, the tile-to-row mapping and every
+// per-element arithmetic chain of the walk, and changes only the LOAD
+// SCHEDULE: per K-block it issues the packed weight words of NT tiles
+// (NT x 4 rows per simdgroup) together, loads each x row ONCE per block, and
+// runs the tiles' qdots back to back. Per (output row, input row) there is
+// still one accumulator, the same block order (k = 0, 256, then the 24-lane
+// tail), the same `qdot_affine4_g64_word` / `qdot_affine4_pair_word`
+// expression the walk's singles / pair arms evaluate, the same `load_vector`
+// x transform, the same simd_sum and store -- so every output element's add
+// sequence is identical to the walk's. NT is the register budget: the
+// singles arm carries 4 x NT accumulators, the pair arm 8 x NT.
+template <typename T, int NIN, int NT>
+METAL_FUNC void qmv_affine4_g64_down_tiles_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    device T* y0,
+    device T* y1,
+    const int in_vec_size,
+    const uint tile_y0,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 8;
+  constexpr int rows_per_tile = num_simdgroups * results_per_simdgroup;
+  constexpr int NR = NT * results_per_simdgroup;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x0_thread[values_per_thread];
+  thread float x1_thread[values_per_thread];
+  thread uint packed[NR];
+  thread float result0[NR] = {0};
+  thread float result1[NR] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  // Tile t of this phase owns output rows out_row + t * rows_per_tile + r,
+  // exactly the rows the serial walk gave tile (tile_y0 + t).
+  const int out_row = int(tile_y0) * rows_per_tile +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  y0 += out_row;
+  y1 += out_row;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    for (int i = 0; i < NR; i++) {
+      const int roff = (i / results_per_simdgroup) * rows_per_tile +
+          (i % results_per_simdgroup);
+      packed[i] = *((const device uint*)(ws + roff * in_vec_size_w));
+    }
+    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+    float sum1 = 0;
+    if (NIN == 2) {
+      sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+    }
+    for (int i = 0; i < NR; i++) {
+      const int roff = (i / results_per_simdgroup) * rows_per_tile +
+          (i % results_per_simdgroup);
+      const float s = scales[roff * in_vec_size_g];
+      const float b = biases[roff * in_vec_size_g];
+      if (NIN == 2) {
+        float dot0;
+        float dot1;
+        qdot_affine4_pair_word<float, values_per_thread>(
+            packed[i], x0_thread, x1_thread, s, b, sum0, sum1, dot0, dot1);
+        result0[i] += dot0;
+        result1[i] += dot1;
+      } else {
+        result0[i] +=
+            qdot_affine4_g64_word(packed[i], x0_thread, s, b, sum0);
+      }
+    }
+    ws += block_size / 2;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+  }
+
+  // K = 704 leaves 192 values: 24 complete eight-value lane packets, the
+  // same fixed tail the walk's pair impl and qmv_impl take.
+  const uint active_tail_lanes = uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    for (int i = 0; i < NR; i++) {
+      const int roff = (i / results_per_simdgroup) * rows_per_tile +
+          (i % results_per_simdgroup);
+      packed[i] = *((const device uint*)(ws + roff * in_vec_size_w));
+    }
+    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+    float sum1 = 0;
+    if (NIN == 2) {
+      sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+    }
+    for (int i = 0; i < NR; i++) {
+      const int roff = (i / results_per_simdgroup) * rows_per_tile +
+          (i % results_per_simdgroup);
+      const float s = scales[roff * in_vec_size_g];
+      const float b = biases[roff * in_vec_size_g];
+      if (NIN == 2) {
+        float dot0;
+        float dot1;
+        qdot_affine4_pair_word<float, values_per_thread>(
+            packed[i], x0_thread, x1_thread, s, b, sum0, sum1, dot0, dot1);
+        result0[i] += dot0;
+        result1[i] += dot1;
+      } else {
+        result0[i] +=
+            qdot_affine4_g64_word(packed[i], x0_thread, s, b, sum0);
+      }
+    }
+  }
+
+  for (int i = 0; i < NR; i++) {
+    const int roff = (i / results_per_simdgroup) * rows_per_tile +
+        (i % results_per_simdgroup);
+    result0[i] = simd_sum(result0[i]);
+    if (NIN == 2) {
+      result1[i] = simd_sum(result1[i]);
+    }
+    if (simd_lid == 0) {
+      y0[roff] = static_cast<T>(result0[i]);
+      if (NIN == 2) {
+        y1[roff] = static_cast<T>(result1[i]);
+      }
+    }
+  }
+}
+
 // KERN-DOWN-TILE: y-tile coarsening for the K = 704 expert down gather
 // (the only pair-geometry plane at that K; out_vec_size = 2816). The
 // frozen host launches grid (1, N/8 = 352, 64), so every 64-thread group
@@ -3981,14 +4130,18 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
       ? (((route_word >> 14) & 0x3fu) + 1u) > 1u
       : assignment + 1 < 64 &&
           rhs_indices[(assignment + 1) * rhs_stride] == expert;
+  // DOWN-TILE-BATCH: the span's tiles are streamed by the batched body
+  // above instead of the serial per-tile walk. The pair arm takes the span
+  // in two phases of two tiles (8 accumulators x 2 inputs per phase); the
+  // singles arm takes all four tiles in one phase (16 accumulators). Tile
+  // (tid.y + t) keeps the rows, block order and arithmetic the walk gave it.
   if (has_pair) {
     const device T* tile_x1 =
         x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
     device T* tile_y1 = y + (assignment + 1) * out_vec_size;
-    for (int t = 0; t < gemma4_down_tile_span; t++) {
-      uint3 tile_tid = tid;
-      tile_tid.y = tid.y + uint(t);
-      qmv_affine4_g64_pair_impl<T, group_size, bits>(
+    constexpr int pair_tiles_per_phase = 2;
+    for (int t = 0; t < gemma4_down_tile_span; t += pair_tiles_per_phase) {
+      qmv_affine4_g64_down_tiles_impl<T, 2, pair_tiles_per_phase>(
           tile_w,
           tile_scales,
           tile_biases,
@@ -3997,27 +4150,24 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
           tile_y0,
           tile_y1,
           in_vec_size,
-          tile_tid,
+          tid.y + uint(t),
           simd_gid,
           simd_lid);
     }
     return;
   }
-  for (int t = 0; t < gemma4_down_tile_span; t++) {
-    uint3 tile_tid = tid;
-    tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
-        tile_w,
-        tile_scales,
-        tile_biases,
-        tile_x0,
-        tile_y0,
-        in_vec_size,
-        out_vec_size,
-        tile_tid,
-        simd_gid,
-        simd_lid);
-  }
+  qmv_affine4_g64_down_tiles_impl<T, 1, gemma4_down_tile_span>(
+      tile_w,
+      tile_scales,
+      tile_biases,
+      tile_x0,
+      tile_x0,
+      tile_y0,
+      tile_y0,
+      in_vec_size,
+      tid.y,
+      simd_gid,
+      simd_lid);
 }
 
 template <typename T, int group_size, int bits>

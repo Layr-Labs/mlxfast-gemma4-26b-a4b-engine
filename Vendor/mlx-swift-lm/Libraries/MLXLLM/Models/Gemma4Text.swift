@@ -188,6 +188,18 @@ private let gemma4PrefillTailRows: Int = {
     return max(0, value)
 }()
 
+/// Selects the form of the unified CBv2 position-offset capture handed to
+/// RoPE: the capture, or a `+ 0` copy of it.
+///
+/// `DARKBLOOM_GEMMA4_CBV2_ELIDE_OFFSET_COPY=0` (or `false`/`no`/`off`) selects
+/// the copy.
+private let gemma4CBv2ElideUnifiedOffsetCopy: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_CBV2_ELIDE_OFFSET_COPY"]
+    else { return true }
+    return gemma4TruthyFlag(raw)
+}()
+
 /// Parse the independent direct expert-reduction control, which is ON by
 /// default: the coupled weighted-unsort + safe-R1 pair is what was measured
 /// faster, and the ranked box sets no environment.
@@ -6693,7 +6705,11 @@ public class Gemma4TextModelInner: Module {
             guard isCBv2 else { return nil }
             for case let entry? in fullCache {
                 if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
-                    return .batch(offsets + 0)
+                    guard gemma4CBv2ElideUnifiedOffsetCopy else {
+                        return .batch(offsets + 0)
+                    }
+                    CBv2EngageMark.once("cbv2-unified-offset")
+                    return .batch(offsets)
                 }
             }
             return nil

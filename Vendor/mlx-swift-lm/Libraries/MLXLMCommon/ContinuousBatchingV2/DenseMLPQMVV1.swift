@@ -613,7 +613,7 @@ inline float mma8_runsum8(uint4 r) {
 // byte 0..255 and x is unscaled, exactly as the 8-bit `qdot` arm forms its
 // product; a bf16 x carries 8 significant bits and the code 8, so the product
 // needs at most 16 and is exact in fp32.
-#define MMA8_STEP8(BB, WLO, WHI, SH) A.thread_elements()[0] = float(extract_bits(wv.WLO, (SH), 8)); A.thread_elements()[1] = float(extract_bits(wv.WHI, (SH), 8)); simdgroup_multiply_accumulate(C, A, BB, C);
+#define MMA8_STEP8(BB, WLO, WHI, SH) A.thread_elements()[0] = float(as_type<half>(ushort(0x6400u | extract_bits(wv.WLO, (SH), 8))) - 1024.0h); A.thread_elements()[1] = float(as_type<half>(ushort(0x6400u | extract_bits(wv.WHI, (SH), 8))) - 1024.0h); simdgroup_multiply_accumulate(C, A, BB, C);
 
 // x is [8, K] with K % 64 == 0, w is packed [N, K / 4] uint32 (one byte per
 // code, so the row stride is K bytes and K % 64 == 0 keeps every `uint4` load
@@ -652,7 +652,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
   float acc0 = 0.0f;
   float acc1 = 0.0f;
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
   for (int g = g_begin; g < g_end; ++g) {
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
@@ -675,22 +675,22 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     const float b = float(brow[g]);
 
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_SETB(B0, x, lo)
-    MMA8_STEP8(B0, x, z, 0)
-    MMA8_SETB(B1, x, hi)
-    MMA8_STEP8(B1, x, z, 8)
-    MMA8_SETB(B2, y, lo)
-    MMA8_STEP8(B2, x, z, 16)
-    MMA8_SETB(B3, y, hi)
-    MMA8_STEP8(B3, x, z, 24)
-    MMA8_SETB(B4, z, lo)
-    MMA8_STEP8(B4, y, w, 0)
-    MMA8_SETB(B5, z, hi)
-    MMA8_STEP8(B5, y, w, 8)
-    MMA8_SETB(B6, w, lo)
-    MMA8_STEP8(B6, y, w, 16)
-    MMA8_SETB(B7, w, hi)
-    MMA8_STEP8(B7, y, w, 24)
+    MMA8_SETB(B, x, lo)
+    MMA8_STEP8(B, x, z, 0)
+    MMA8_SETB(B, x, hi)
+    MMA8_STEP8(B, x, z, 8)
+    MMA8_SETB(B, y, lo)
+    MMA8_STEP8(B, x, z, 16)
+    MMA8_SETB(B, y, hi)
+    MMA8_STEP8(B, x, z, 24)
+    MMA8_SETB(B, z, lo)
+    MMA8_STEP8(B, y, w, 0)
+    MMA8_SETB(B, z, hi)
+    MMA8_STEP8(B, y, w, 8)
+    MMA8_SETB(B, w, lo)
+    MMA8_STEP8(B, y, w, 16)
+    MMA8_SETB(B, w, hi)
+    MMA8_STEP8(B, y, w, 24)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
     acc1 += s * C.thread_elements()[1] + rs.y * b;
@@ -775,34 +775,21 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
                 const int g = g0 + gi;
                 if (g >= G) continue;
             """)
-        // DMLP-DOWN-CARRY-019: the weight-operand register carry the frontier
-        // applied to the two attention matrix-unit tiers, on the dense down
-        // plane. Every address here is a function of the group index alone, so
-        // one group's codes, scale and bias stay resident in registers while
-        // the next group's are read a whole iteration ahead of their use.
-        // `g_next` is clamped to the last valid group, so the final look-ahead
-        // re-reads a group already read and its value is discarded.
+        // DMLP-DOWN-CARRY-020: carry the down-projection operands one group
+        // ahead across the unrolled iteration, so the memory loads run
+        // concurrently with the MMA8 matrix operations. Down's register
+        // footprint is small enough that the carry does not spill.
         //
         // The read stays at the statement it already occupied. Moving it to the
         // top of the body instead perturbs the close's floating-point
         // contraction and stops the output being bit-identical; keeping it here
         // leaves the emitted arithmetic word for word what the tip emits.
-        //
-        // DMLP-DOWN-CARRY2-021: the codes go TWO groups deep. One iteration of
-        // this body is eight matrix-unit steps and a three-step shuffle chain,
-        // which is well short of a device load's latency, so a single group of
-        // look-ahead leaves the second half of that latency uncovered. The
-        // scale and the bias stay one group ahead: they are two bytes each
-        // against the codes' sixteen, they sit in the same cache lines as their
-        // neighbours, and a second copy of them would cost registers for no
-        // stream. `g` is monotone here and the loop count is a constant, so the
-        // hand-off is register renaming in a fully unrolled body, not a copy.
         replaceOnce(
             """
-              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+              simdgroup_float8x8 B;
             """,
             with: """
-              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+              simdgroup_float8x8 B;
 
               uint4 wv_next = *((const device uint4*)(wrow + 64 * g0));
               uint4 wv_next2 =
@@ -830,7 +817,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }()
 
     private static let mma8DownStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_bfill_v4",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_bfill_halfdeq_v7",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -886,40 +873,11 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
               for (int gi = 0; gi < nGroups; ++gi) {
                 const int g = g0 + gi;
             """)
-        replaceOnce(
-            """
-              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
-            """,
-            with: """
-              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
-
-              uint4 wv_next = *((const device uint4*)(wrow + 64 * g0));
-              uint4 wv_next2 =
-                  *((const device uint4*)(wrow + 64 * min(g0 + 1, G - 1)));
-              T s_next = srow[g0];
-              T b_next = brow[g0];
-            """)
-        replaceOnce(
-            """
-                const uint4 wv = *((const device uint4*)(wrow + 64 * g));
-                const float s = float(srow[g]);
-                const float b = float(brow[g]);
-            """,
-            with: """
-                const uint4 wv = wv_next;
-                const float s = float(s_next);
-                const float b = float(b_next);
-                const int g_next = min(g + 1, G - 1);
-                wv_next = wv_next2;
-                wv_next2 = *((const device uint4*)(wrow + 64 * min(g + 2, G - 1)));
-                s_next = srow[g_next];
-                b_next = brow[g_next];
-            """)
         return result
     }()
 
     private static let mma8GateUpStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_k2816_carry2_u2_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_k2816_u2_halfdeq_v1",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

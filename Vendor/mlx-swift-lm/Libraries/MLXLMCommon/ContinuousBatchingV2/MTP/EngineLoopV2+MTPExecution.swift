@@ -164,21 +164,29 @@ extension EngineLoopV2 {
 
         // Plain sampled tokens stay in plan order. Verify rows are finalized
         // from the target-authoritative acceptance packet instead.
-        var pieces: [MLXArray] = []
-        var sampledRows: [CBv2RequestID] = []
-        var decodeIndex = 0
-        for row in work {
-            if row.isDecode {
-                pieces.append(decodeSampled![decodeIndex ..< decodeIndex + 1])
-                decodeIndex += 1
-                sampledRows.append(row.rec.id)
-            } else if let sampled = prefillSampled[row.rec.id] {
-                pieces.append(sampled)
-                sampledRows.append(row.rec.id)
+        let sampledTokens: MLXArray?
+        let sampledRows: [CBv2RequestID]
+        if decodeRows.count == work.count, let decodeSampled {
+            sampledRows = decodeRows.map(\.rec.id)
+            sampledTokens = decodeSampled
+        } else {
+            var pieces: [MLXArray] = []
+            var sRows: [CBv2RequestID] = []
+            var decodeIndex = 0
+            for row in work {
+                if row.isDecode {
+                    pieces.append(decodeSampled![decodeIndex ..< decodeIndex + 1])
+                    decodeIndex += 1
+                    sRows.append(row.rec.id)
+                } else if let sampled = prefillSampled[row.rec.id] {
+                    pieces.append(sampled)
+                    sRows.append(row.rec.id)
+                }
             }
+            sampledTokens =
+                pieces.isEmpty ? nil : (pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0))
+            sampledRows = sRows
         }
-        let sampledTokens: MLXArray? =
-            pieces.isEmpty ? nil : (pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0))
 
         var asyncEvalTargets = prefillEvalTargets
         if let sampledTokens { asyncEvalTargets.append(sampledTokens) }

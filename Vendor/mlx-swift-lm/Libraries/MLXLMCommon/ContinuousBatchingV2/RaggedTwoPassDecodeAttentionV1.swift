@@ -4102,6 +4102,248 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
+    /// KEQV-D512: dispatch 1 reads the VALUE plane and rebuilds each key row
+    /// in registers instead of streaming the key plane.
+    ///
+    /// Gemma's full-attention layers are k-eq-v: the store dispatch derives
+    /// both planes from ONE raw projection row `r` with one normalizer,
+    /// `V = bf16(r * inverse_rms)` and `K = rope(pos, k_weight * V)`, where
+    /// the proportional table rotates pair `(c, c + D/2)` for the 64 finite
+    /// frequencies and passes the rest through (`1 / +inf = 0`). So every
+    /// stored key row is a per-column scale of the stored value row followed
+    /// by a rotation whose angle is a function of the slot's absolute
+    /// position only. The decode chain therefore streams the same 18 MB
+    /// plane twice per layer (K here, V in dispatch 3) for information it
+    /// holds once. This kernel streams V here too, so the two dispatches
+    /// touch one plane and the key plane is never read by the decode chain.
+    ///
+    /// Arithmetic: `x1 = w[c] * V[c]`, `x2 = w[c + D/2] * V[c + D/2]`,
+    /// `theta = float(pos) * (1 / rope_freqs[c])`, and the store kernel's
+    /// own two rotation expressions with `fast::cos`/`fast::sin` of the same
+    /// `theta` expression, so the cos/sin values are the ones that rotated
+    /// the stored row. The differences to the stored key are the store's
+    /// two BF16 roundings (`rounded[]` before RoPE and the slot store after
+    /// it), which this path skips: bf16-class, zero-mean, on 5 of 30 layers.
+    /// Not bit-exact with the key-plane kernel, by construction.
+    ///
+    /// Slot `s` of a row holds absolute position `position_offsets[row] -
+    /// (key_length - 1) + s`: the store dispatch writes the live token at
+    /// slot `key_length - 1` with position `position_offsets[row]`, and the
+    /// full ring never evicts.
+    ///
+    /// Column ownership is the stock walk's (`bn = lane * 4 + i * 128`), so
+    /// a lane's rotary partner columns sit in its own `i = 2` run: the pair
+    /// is rebuilt in-lane with no shuffle, per key row, then dotted with the
+    /// eight heads' `i = 0` and `i = 2` query runs; runs `i = 1` and `i = 3`
+    /// are pass-through and keep the stock tile shape.
+    private static let qkKeqvSource: String = """
+            constexpr int D = 512;
+            constexpr int GQA = 8;
+            constexpr int HALF = D / 2;
+
+            const int key_length = int(params[0]);
+
+            const int n_chunks = (key_length + 63) / 64;
+            const int z = int(threadgroup_position_in_grid.z);
+            const int chunk = z % n_chunks;
+            const int row_kv = z / n_chunks;
+            const int row = row_kv / 2;
+            const int kv_head = row_kv % 2;
+            const int sg = int(simdgroup_index_in_threadgroup);
+            const int lane = int(thread_index_in_simdgroup);
+
+            const int row_capacity = int(params[2 + row]);
+
+            const device T* value_plane = v0;
+            switch (row) {
+                case 1: value_plane = v1; break;
+                case 2: value_plane = v2; break;
+                case 3: value_plane = v3; break;
+                case 4: value_plane = v4; break;
+                case 5: value_plane = v5; break;
+                case 6: value_plane = v6; break;
+                case 7: value_plane = v7; break;
+                default: break;
+            }
+            value_plane += size_t(kv_head) * size_t(row_capacity) * D;
+
+            const device T* query =
+                queries + size_t(row * 16 + kv_head * GQA) * D;
+            device T* score_rows =
+                scores + size_t(row * 16 + kv_head * GQA) * key_length;
+
+            const int position_base = int(position_offsets[row]) - (key_length - 1);
+            const int bn_base = lane * 4;
+            typedef vec<T, 4> T4;
+
+            float wcol[4][4];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 4; ++i) {
+                const T4 wraw = *reinterpret_cast<const device T4*>(
+                    k_weight + bn_base + i * 128);
+                #pragma clang loop unroll(full)
+                for (int tn = 0; tn < 4; ++tn) {
+                    wcol[i][tn] = static_cast<float>(wraw[tn]);
+                }
+            }
+            float inv_freq[4];
+            #pragma clang loop unroll(full)
+            for (int tn = 0; tn < 4; ++tn) {
+                inv_freq[tn] = 1.0f / rope_freqs[bn_base + tn];
+            }
+
+            const int virtual_groups = (key_length + 15) / 16;
+            const int vtg_lo = chunk * 4;
+            const int vtg_hi = min(vtg_lo + 4, virtual_groups);
+
+            for (int vtg = vtg_lo; vtg < vtg_hi; ++vtg) {
+                int out_row = vtg * 16 + sg * 4;
+                if (out_row >= key_length) continue;
+                out_row = out_row + 4 <= key_length
+                    ? out_row : key_length - 4;
+
+                const device T* mat = value_plane + size_t(out_row) * D;
+                float result[GQA * 4] = {0.0f};
+                float q_coeff[4];
+
+                // Runs i = 0 and i = 2: the rotary pair, rebuilt per key row.
+                #pragma clang loop unroll(full)
+                for (int tm = 0; tm < 4; ++tm) {
+                    const T4 t0 = *reinterpret_cast<const device T4*>(
+                        mat + size_t(tm) * D + bn_base);
+                    const T4 t2 = *reinterpret_cast<const device T4*>(
+                        mat + size_t(tm) * D + bn_base + HALF);
+                    const float L = static_cast<float>(position_base + out_row + tm);
+                    float k0[4];
+                    float k2[4];
+                    #pragma clang loop unroll(full)
+                    for (int tn = 0; tn < 4; ++tn) {
+                        const float x1 = wcol[0][tn] * static_cast<float>(t0[tn]);
+                        const float x2 = wcol[2][tn] * static_cast<float>(t2[tn]);
+                        const bool rotates = inv_freq[tn] != 0.0f;
+                        const float theta = L * inv_freq[tn];
+                        const float costheta = rotates ? metal::fast::cos(theta) : 1.0f;
+                        const float sintheta = rotates ? metal::fast::sin(theta) : 0.0f;
+                        k0[tn] = x1 * costheta - x2 * sintheta;
+                        k2[tn] = x1 * sintheta + x2 * costheta;
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        const T4 q0 = *reinterpret_cast<const device T4*>(
+                            query + h * D + bn_base);
+                        const T4 q2 = *reinterpret_cast<const device T4*>(
+                            query + h * D + bn_base + HALF);
+                        float acc = result[h * 4 + tm];
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            acc += k0[tn] * static_cast<float>(q0[tn]);
+                        }
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            acc += k2[tn] * static_cast<float>(q2[tn]);
+                        }
+                        result[h * 4 + tm] = acc;
+                    }
+                }
+
+                // Runs i = 1 and i = 3: pass-through columns, stock tile shape.
+                #pragma clang loop unroll(full)
+                for (int ip = 0; ip < 2; ++ip) {
+                    const int i = 2 * ip + 1;
+                    const int bn = bn_base + i * 128;
+                    float k_tile[4][4];
+                    #pragma clang loop unroll(full)
+                    for (int tm = 0; tm < 4; ++tm) {
+                        const T4 traw = *reinterpret_cast<const device T4*>(
+                            mat + size_t(tm) * D + bn);
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            k_tile[tm][tn] = wcol[i][tn] * static_cast<float>(traw[tn]);
+                        }
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        const T4 q_raw = *reinterpret_cast<const device T4*>(
+                            query + h * D + bn);
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            q_coeff[tn] = static_cast<float>(q_raw[tn]);
+                        }
+                        #pragma clang loop unroll(full)
+                        for (int tm = 0; tm < 4; ++tm) {
+                            #pragma clang loop unroll(full)
+                            for (int tn = 0; tn < 4; ++tn) {
+                                result[h * 4 + tm] +=
+                                    k_tile[tm][tn] * q_coeff[tn];
+                            }
+                        }
+                    }
+                }
+                // XFOLD, verbatim from the key-plane kernel.
+                {
+                    const bool hi = (lane & 16) != 0;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 16; ++j) {
+                        const float a = result[j];
+                        const float b = result[16 + j];
+                        result[j] = (hi ? b : a)
+                            + simd_shuffle_xor(hi ? a : b, ushort(16));
+                    }
+                }
+                {
+                    const bool hi = (lane & 8) != 0;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 8; ++j) {
+                        const float a = result[j];
+                        const float b = result[8 + j];
+                        result[j] = (hi ? b : a)
+                            + simd_shuffle_xor(hi ? a : b, ushort(8));
+                    }
+                }
+                {
+                    const bool hi = (lane & 4) != 0;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        const float a = result[j];
+                        const float b = result[4 + j];
+                        result[j] = (hi ? b : a)
+                            + simd_shuffle_xor(hi ? a : b, ushort(4));
+                    }
+                }
+                {
+                    const bool hi = (lane & 2) != 0;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 2; ++j) {
+                        const float a = result[j];
+                        const float b = result[2 + j];
+                        result[j] = (hi ? b : a)
+                            + simd_shuffle_xor(hi ? a : b, ushort(2));
+                    }
+                }
+                {
+                    const bool hi = (lane & 1) != 0;
+                    const float a = result[0];
+                    const float b = result[1];
+                    result[0] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(1));
+                }
+                score_rows[size_t(lane >> 2) * key_length + out_row
+                    + (lane & 3)] = static_cast<T>(result[0]);
+            }
+        """
+
+    private static let qkFencedKeqvKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_qk_fenced_keqv_bf16_g8_xfold_v1",
+        inputNames: [
+            "queries",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "params", "k_weight", "position_offsets", "rope_freqs", "store_fence",
+        ],
+        outputNames: ["scores"],
+        source: qkKeqvSource,
+        ensureRowContiguous: true
+    )
+
     /// Dispatch 2 — softmax. A verbatim transcription of
     /// `softmax_single_row` (block_softmax_precise, AccT=float, N_READS=4)
     /// over the 128 score rows; the CALLER sizes the threadgroup exactly
@@ -5819,10 +6061,17 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let liveQueries: MLXArray
         var normalizedKeys: MLXArray? = nil
         var normalizedValues: MLXArray? = nil
+        // KEQV-D512: the same registered k_norm weight, position offsets and
+        // proportional frequency table the store dispatch rotates with are
+        // what dispatch 1 needs to rebuild key rows from the value plane.
+        var keqvInputs: (kWeight: MLXArray, positionOffsets: MLXArray,
+            ropeFrequencies: MLXArray)? = nil
         if normRopeFoldEnabled,
             let normRope = takeFullNormRope(
                 queries: queries, keys: keys, values: values)
         {
+            keqvInputs = (normRope.kWeight, normRope.positionOffsets,
+                normRope.ropeFrequencies)
             let stored = ringStoreNormRopeKernel(
                 keyBuffers + valueBuffers + [
                     paramsArray,
@@ -5864,14 +6113,33 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         }
 
         let chunks = (keyLength + 63) / 64
-        let scores = qkFencedKernel(
-            [liveQueries] + keyBuffers + [paramsArray, storeFence],
-            template: template,
-            grid: (32, 4, batch * kvHeads * chunks),
-            threadGroup: (32, 4, 1),
-            outputShapes: [scratchShape],
-            outputDTypes: [.bfloat16]
-        )[0]
+        let scores: MLXArray
+        if let keqv = keqvInputs {
+            // KEQV-D512: dispatch 1 streams the value plane (the plane
+            // dispatch 3 streams) and rebuilds each key row in registers;
+            // the key plane is not read by the decode chain.
+            scores = qkFencedKeqvKernel(
+                [liveQueries] + valueBuffers + [
+                    paramsArray, keqv.kWeight, keqv.positionOffsets,
+                    keqv.ropeFrequencies, storeFence,
+                ],
+                template: template,
+                grid: (32, 4, batch * kvHeads * chunks),
+                threadGroup: (32, 4, 1),
+                outputShapes: [scratchShape],
+                outputDTypes: [.bfloat16]
+            )[0]
+            CBv2EngageMark.once("d512-keqv-qk")
+        } else {
+            scores = qkFencedKernel(
+                [liveQueries] + keyBuffers + [paramsArray, storeFence],
+                template: template,
+                grid: (32, 4, batch * kvHeads * chunks),
+                threadGroup: (32, 4, 1),
+                outputShapes: [scratchShape],
+                outputDTypes: [.bfloat16]
+            )[0]
+        }
 
         let softmaxThreads = ((keyLength + 3) / 4 + 31) / 32 * 32
         let probs = softmaxActive(

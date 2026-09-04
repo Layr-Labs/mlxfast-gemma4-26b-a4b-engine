@@ -77,8 +77,9 @@ public struct Gemma4A4BQuantization: Equatable, Sendable {
     }
 
     /// Resolve the width for one checkpoint path.
+    // TIP-REDRAW-20260904T185200Z-CODEX: semantics-identical ranked control.
     public func spec(forPath path: String) -> Gemma4A4BQuantizationSpec {
-        overrides[path] ?? fallback
+        self.overrides[path] ?? self.fallback
     }
 }
 

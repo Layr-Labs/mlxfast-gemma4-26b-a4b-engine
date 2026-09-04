@@ -6690,9 +6690,12 @@ public class Gemma4TextModelInner: Module {
         // for every Q/K RoPE call in this forward.
         let unifiedCBv2PositionOffset: Gemma4.PositionOffset? = {
             guard isCBv2 else { return nil }
+            if let first = fullCache.first, let offsets = (first as? CBv2LayerCache)?.unifiedPositionOffsets {
+                return schedulePrefill ? .batch(offsets + 0) : .batch(offsets)
+            }
             for case let entry? in fullCache {
                 if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
-                    return .batch(offsets + 0)
+                    return schedulePrefill ? .batch(offsets + 0) : .batch(offsets)
                 }
             }
             return nil
@@ -7634,3 +7637,4 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
 
 // Ranked resample marker 36: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.
+// Candidate EXP-033: crown 4865fbe rebase + DENSE-GEGLU-EPILOGUE integration + prefill expert unsort tail chain 128-bit vectorization & register hoist (1.075s prefill) + restored AOT metallib decode kernels (fp16Dequant=false, unroll4=false) + periodic usage snapshot (every 16 tokens) + pure-decode token passthrough + decoupled phase-specific RoPE offsets + pre-evaluated switchDownIdentity64 + lock-free pointer GEMV & D512 caches + MTP memoization.

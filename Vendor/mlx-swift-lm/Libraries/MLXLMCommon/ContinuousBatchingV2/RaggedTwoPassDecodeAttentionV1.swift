@@ -2223,17 +2223,70 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+    /// SLIDE-PNIB (port of PR 2393 onto the RING-OFF tip). Paired-nibble
+    /// unpack in the resident sliding walks. Set
+    /// `DARKBLOOM_CBV2_SLIDING_PNIB=0` to restore the shipped scalar
+    /// `float((w >> 4e) & 0xf)` chain and the shipped registration byte for
+    /// byte on every walk arm.
+    static let slidingNibblePairUnpack: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_SLIDING_PNIB"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Unpacks the eight 4-bit lanes of one packed word into `dest` with four
+    /// `half2` extractions instead of eight scalar integer-to-float converts.
+    ///
+    /// `0x6400` is `1024.0h`, whose ULP is exactly one, so `0x6400 | n` is the
+    /// half `1024 + n` for every `n` in `0...15` and the subtraction returns
+    /// `n` with no rounding in either step. `float()` of that half is the same
+    /// float the shipped `float((w >> 4e) & 0xfu)` produced, so the fma below
+    /// consumes identical operands in the identical order.
+    ///
+    /// The pair is `(p, p + values_per_lane / 2)`, which is where the two
+    /// nibbles that share a 32-bit half2 register already live in the packed
+    /// word. No address is formed, no load moves, no branch changes and no
+    /// accumulation is reassociated.
+    private static func nibblePairUnpack(
+        _ word: String, into dest: String, indent: String
+    ) -> String {
+        guard slidingNibblePairUnpack else { return "" }
+        let pad = indent
+        return """
+            float \(dest)[values_per_lane];
+            \(pad)#pragma clang loop unroll(full)
+            \(pad)for (int p = 0; p < values_per_lane / 2; ++p) {
+            \(pad)    const half2 nib = as_type<half2>(
+            \(pad)        ((((\(word)) >> (4 * p)) & 0xfu)
+            \(pad)            | ((((\(word))
+            \(pad)                >> (4 * (p + values_per_lane / 2))) & 0xfu) << 16))
+            \(pad)        | 0x64006400u) - half2(1024.0h, 1024.0h);
+            \(pad)    \(dest)[p] = float(nib[0]);
+            \(pad)    \(dest)[p + values_per_lane / 2] = float(nib[1]);
+            \(pad)}
+            \(pad)
+            """
+    }
+
+    /// The dequantization operand for element `element` of `word`.
+    private static func nibbleOperand(_ word: String, _ dest: String) -> String {
+        slidingNibblePairUnpack
+            ? "\(dest)[element]"
+            : "float((\(word) >> (4 * element)) & 0xfu)"
+    }
 
     /// MLX keys its custom-kernel library cache by kernel NAME and re-JITs a
     /// name whose generated source changed (`backend/metal/custom_kernel.cpp`
     /// `:56-70`, `device.cpp:770-796`), so a changed body takes a changed
     /// name. Empty on the depth-one arm, while peel-off keeps `_spd2`.
     private static let slidingPrefetchKey =
-        slidingPrefetchDepth2
-        ? (slidingPrefetchPeelEnabled
-            ? (ringOffsetEnabled ? "_spd2_lp1_ro1" : "_spd2_lp1")
-            : "_spd2")
-        : ""
+        (slidingPrefetchDepth2
+            ? (slidingPrefetchPeelEnabled
+                ? (ringOffsetEnabled ? "_spd2_lp1_ro1" : "_spd2_lp1")
+                : "_spd2")
+            : "")
+        + (slidingNibblePairUnpack ? "_pn1" : "")
 
     /// The shipped depth-one ring walk, verbatim.
     private static let residentSlidingWalkDepth1 = """
@@ -2275,12 +2328,12 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     const float kb = float(as_type<half>(ushort(ktw >> 16)));
                     const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
                     const float vb = float(as_type<half>(ushort(vtw >> 16)));
-                    float score_lo = 0.0f;
+                    \(nibblePairUnpack("kw", into: "key_el", indent: "                    "))float score_lo = 0.0f;
                     float score_hi = 0.0f;
                     #pragma clang loop unroll(full)
                     for (int element = 0; element < values_per_lane; ++element) {
                         const float key_element =
-                            fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                            fma(\(nibbleOperand("kw", "key_el")), ks, kb);
                         score_lo += q_lo[element] * key_element;
                         score_hi += q_hi[element] * key_element;
                     }
@@ -2297,10 +2350,10 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     max_hi = new_max_hi;
                     sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                     sum_hi = sum_hi * old_factor_hi + score_factor_hi;
-                    #pragma clang loop unroll(full)
+                    \(nibblePairUnpack("vw", into: "value_el", indent: "                    "))#pragma clang loop unroll(full)
                     for (int element = 0; element < values_per_lane; ++element) {
                         const float value_element =
-                            fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                            fma(\(nibbleOperand("vw", "value_el")), vs, vb);
                         acc_lo[element] = acc_lo[element] * old_factor_lo
                             + score_factor_lo * value_element;
                         acc_hi[element] = acc_hi[element] * old_factor_hi
@@ -2383,12 +2436,12 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         const float kb = float(as_type<half>(ushort(ktw >> 16)));
                         const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
                         const float vb = float(as_type<half>(ushort(vtw >> 16)));
-                        float score_lo = 0.0f;
+                        \(nibblePairUnpack("kw", into: "key_el", indent: "                        "))float score_lo = 0.0f;
                         float score_hi = 0.0f;
                         #pragma clang loop unroll(full)
                         for (int element = 0; element < values_per_lane; ++element) {
                             const float key_element =
-                                fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                                fma(\(nibbleOperand("kw", "key_el")), ks, kb);
                             score_lo += q_lo[element] * key_element;
                             score_hi += q_hi[element] * key_element;
                         }
@@ -2405,10 +2458,10 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         max_hi = new_max_hi;
                         sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                         sum_hi = sum_hi * old_factor_hi + score_factor_hi;
-                        #pragma clang loop unroll(full)
+                        \(nibblePairUnpack("vw", into: "value_el", indent: "                        "))#pragma clang loop unroll(full)
                         for (int element = 0; element < values_per_lane; ++element) {
                             const float value_element =
-                                fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                                fma(\(nibbleOperand("vw", "value_el")), vs, vb);
                             acc_lo[element] = acc_lo[element] * old_factor_lo
                                 + score_factor_lo * value_element;
                             acc_hi[element] = acc_hi[element] * old_factor_hi
@@ -2474,12 +2527,12 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         const float kb = float(as_type<half>(ushort(ktw >> 16)));
                         const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
                         const float vb = float(as_type<half>(ushort(vtw >> 16)));
-                        float score_lo = 0.0f;
+                        \(nibblePairUnpack("kw", into: "key_el", indent: "                        "))float score_lo = 0.0f;
                         float score_hi = 0.0f;
                         #pragma clang loop unroll(full)
                         for (int element = 0; element < values_per_lane; ++element) {
                             const float key_element =
-                                fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                                fma(\(nibbleOperand("kw", "key_el")), ks, kb);
                             score_lo += q_lo[element] * key_element;
                             score_hi += q_hi[element] * key_element;
                         }
@@ -2496,10 +2549,10 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         max_hi = new_max_hi;
                         sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                         sum_hi = sum_hi * old_factor_hi + score_factor_hi;
-                        #pragma clang loop unroll(full)
+                        \(nibblePairUnpack("vw", into: "value_el", indent: "                        "))#pragma clang loop unroll(full)
                         for (int element = 0; element < values_per_lane; ++element) {
                             const float value_element =
-                                fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                                fma(\(nibbleOperand("vw", "value_el")), vs, vb);
                             acc_lo[element] = acc_lo[element] * old_factor_lo
                                 + score_factor_lo * value_element;
                             acc_hi[element] = acc_hi[element] * old_factor_hi
@@ -2541,12 +2594,12 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         const float kb = float(as_type<half>(ushort(ktw >> 16)));
                         const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
                         const float vb = float(as_type<half>(ushort(vtw >> 16)));
-                        float score_lo = 0.0f;
+                        \(nibblePairUnpack("kw", into: "key_el", indent: "                        "))float score_lo = 0.0f;
                         float score_hi = 0.0f;
                         #pragma clang loop unroll(full)
                         for (int element = 0; element < values_per_lane; ++element) {
                             const float key_element =
-                                fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                                fma(\(nibbleOperand("kw", "key_el")), ks, kb);
                             score_lo += q_lo[element] * key_element;
                             score_hi += q_hi[element] * key_element;
                         }
@@ -2563,10 +2616,10 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         max_hi = new_max_hi;
                         sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                         sum_hi = sum_hi * old_factor_hi + score_factor_hi;
-                        #pragma clang loop unroll(full)
+                        \(nibblePairUnpack("vw", into: "value_el", indent: "                        "))#pragma clang loop unroll(full)
                         for (int element = 0; element < values_per_lane; ++element) {
                             const float value_element =
-                                fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                                fma(\(nibbleOperand("vw", "value_el")), vs, vb);
                             acc_lo[element] = acc_lo[element] * old_factor_lo
                                 + score_factor_lo * value_element;
                             acc_hi[element] = acc_hi[element] * old_factor_hi
@@ -2646,12 +2699,12 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         const float kb = float(as_type<half>(ushort(ktw >> 16)));
                         const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
                         const float vb = float(as_type<half>(ushort(vtw >> 16)));
-                        float score_lo = 0.0f;
+                        \(nibblePairUnpack("kw", into: "key_el", indent: "                        "))float score_lo = 0.0f;
                         float score_hi = 0.0f;
                         #pragma clang loop unroll(full)
                         for (int element = 0; element < values_per_lane; ++element) {
                             const float key_element =
-                                fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                                fma(\(nibbleOperand("kw", "key_el")), ks, kb);
                             score_lo += q_lo[element] * key_element;
                             score_hi += q_hi[element] * key_element;
                         }
@@ -2668,10 +2721,10 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         max_hi = new_max_hi;
                         sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                         sum_hi = sum_hi * old_factor_hi + score_factor_hi;
-                        #pragma clang loop unroll(full)
+                        \(nibblePairUnpack("vw", into: "value_el", indent: "                        "))#pragma clang loop unroll(full)
                         for (int element = 0; element < values_per_lane; ++element) {
                             const float value_element =
-                                fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                                fma(\(nibbleOperand("vw", "value_el")), vs, vb);
                             acc_lo[element] = acc_lo[element] * old_factor_lo
                                 + score_factor_lo * value_element;
                             acc_hi[element] = acc_hi[element] * old_factor_hi
@@ -2713,12 +2766,12 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         const float kb = float(as_type<half>(ushort(ktw >> 16)));
                         const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
                         const float vb = float(as_type<half>(ushort(vtw >> 16)));
-                        float score_lo = 0.0f;
+                        \(nibblePairUnpack("kw", into: "key_el", indent: "                        "))float score_lo = 0.0f;
                         float score_hi = 0.0f;
                         #pragma clang loop unroll(full)
                         for (int element = 0; element < values_per_lane; ++element) {
                             const float key_element =
-                                fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                                fma(\(nibbleOperand("kw", "key_el")), ks, kb);
                             score_lo += q_lo[element] * key_element;
                             score_hi += q_hi[element] * key_element;
                         }
@@ -2735,10 +2788,10 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         max_hi = new_max_hi;
                         sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                         sum_hi = sum_hi * old_factor_hi + score_factor_hi;
-                        #pragma clang loop unroll(full)
+                        \(nibblePairUnpack("vw", into: "value_el", indent: "                        "))#pragma clang loop unroll(full)
                         for (int element = 0; element < values_per_lane; ++element) {
                             const float value_element =
-                                fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                                fma(\(nibbleOperand("vw", "value_el")), vs, vb);
                             acc_lo[element] = acc_lo[element] * old_factor_lo
                                 + score_factor_lo * value_element;
                             acc_hi[element] = acc_hi[element] * old_factor_hi

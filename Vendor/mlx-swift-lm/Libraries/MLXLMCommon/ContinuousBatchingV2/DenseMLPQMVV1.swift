@@ -128,6 +128,43 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// DENSE-GATEUP-CARRY. The gate/up compile-time K body reads each
+    /// group's sixteen packed codes, scale and bias at the point of use; the
+    /// down twin (`mma8DownStaticKHeader`) carries them. This applies the
+    /// down twin's carry to the gate/up body, statement for statement: the
+    /// operands for group `g0` (and, at depth two, the codes for `g0 + 1`)
+    /// are read before the group loop, and every trip consumes the carried
+    /// values at the statements the reads occupied and re-issues the reads
+    /// for `g + 1` / `g + 2` with min-clamped indices. Addresses, the order
+    /// into `C` and `acc`, and every type are unchanged, so the outputs are
+    /// bit-identical. `DARKBLOOM_GEMMA4_MLP_GATEUP_CARRY=0` restores the
+    /// promoted body and kernel name byte for byte; `=1` carries the codes
+    /// one group deep. `DARKBLOOM_GEMMA4_MLP_GATEUP_CARRY_UNROLL=full`
+    /// walks the groups fully unrolled, as the down twin does.
+    public static let mma8GateUpCarryDepth: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_GATEUP_CARRY"]
+        else { return 2 }
+        let v = raw.trimmingCharacters(in: .whitespaces).lowercased()
+        if ["0", "false", "no", "off"].contains(v) { return 0 }
+        return v == "1" ? 1 : 2
+    }()
+
+    public static let mma8GateUpCarryEnabled: Bool = mma8GateUpCarryDepth > 0
+
+    private static let mma8GateUpCarryFullUnroll: Bool = {
+        guard mma8GateUpCarryEnabled,
+            let raw = ProcessInfo.processInfo.environment[
+                "DARKBLOOM_GEMMA4_MLP_GATEUP_CARRY_UNROLL"]
+        else { return false }
+        return raw.trimmingCharacters(in: .whitespaces).lowercased() == "full"
+    }()
+
+    private static let mma8GateUpCarryKeySuffix: String = {
+        guard mma8GateUpCarryEnabled else { return "" }
+        return "_c\(mma8GateUpCarryDepth)" + (mma8GateUpCarryFullUnroll ? "_uf" : "")
+    }()
+
     /// Gate/up compile-time K walk, unrolled by two. Off keeps the runtime-K
     /// kernel for this plane; the down plane and its switch are unaffected.
     private static let mma8GateUpStaticKEnabled: Bool = {
@@ -905,6 +942,73 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         header: mma8GateUpStaticKHeader,
         ensureRowContiguous: true)
 
+    private static let mma8GateUpCarryHeader: String = {
+        var result = mma8GateUpStaticKHeader
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        if mma8GateUpCarryFullUnroll {
+            replaceOnce(
+                "  #pragma clang loop unroll_count(2)\n  for (int gi = 0; gi < nGroups; ++gi) {",
+                with: "  #pragma unroll\n  for (int gi = 0; gi < nGroups; ++gi) {")
+        }
+        let two = mma8GateUpCarryDepth == 2
+        replaceOnce(
+            """
+              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+            """,
+            with: """
+              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+              uint4 wv_next = *((const device uint4*)(wrow + 64 * g0));
+            """ + (two ? """
+              uint4 wv_next2 =
+                  *((const device uint4*)(wrow + 64 * min(g0 + 1, G - 1)));
+            """ : "") + """
+              T s_next = srow[g0];
+              T b_next = brow[g0];
+            """)
+        replaceOnce(
+            """
+                const uint4 wv = *((const device uint4*)(wrow + 64 * g));
+                const float s = float(srow[g]);
+                const float b = float(brow[g]);
+            """,
+            with: """
+                const uint4 wv = wv_next;
+                const float s = float(s_next);
+                const float b = float(b_next);
+                const int g_next = min(g + 1, G - 1);
+            """ + (two ? """
+                wv_next = wv_next2;
+                wv_next2 = *((const device uint4*)(wrow + 64 * min(g + 2, G - 1)));
+            """ : """
+                wv_next = *((const device uint4*)(wrow + 64 * g_next));
+            """) + """
+                s_next = srow[g_next];
+                b_next = brow[g_next];
+            """)
+        return result
+    }()
+
+    private static let mma8GateUpCarryKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_k2816_u2_v1"
+            + mma8GateUpCarryKeySuffix,
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            gemma4_qmv_mma8_affine8_g64_gateup_k2816_impl<T, 2>(
+                w, scales, biases, x, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            """,
+        header: mma8GateUpCarryHeader,
+        ensureRowContiguous: true)
+
     /// One complete SIMD group per g64 group. Keep all lane results rather
     /// than canonicalizing row sums: the consumer reads its own lane's tree.
     private static let mma8DownLaneSumKernel = MLXFast.metalKernel(
@@ -1360,8 +1464,13 @@ inline U qdot_affine8_registered_v4(
                 if mma8GateUpStaticKEnabled {
                     CBv2EngageMark.once("mlp-gateup-k2816-u2")
                 }
-                selectedMMA = mma8GateUpStaticKEnabled
-                    ? mma8GateUpStaticKKernel : mma8Kernel
+                if mma8GateUpStaticKEnabled && mma8GateUpCarryEnabled {
+                    CBv2EngageMark.once("mlp-gateup-carry")
+                    selectedMMA = mma8GateUpCarryKernel
+                } else {
+                    selectedMMA = mma8GateUpStaticKEnabled
+                        ? mma8GateUpStaticKKernel : mma8Kernel
+                }
             } else {
                 selectedMMA = mma8DownStaticKEnabled
                     ? mma8DownStaticKKernel : mma8Kernel

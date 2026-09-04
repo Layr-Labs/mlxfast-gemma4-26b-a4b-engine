@@ -49,6 +49,62 @@ public enum CBv2AttentionQKVMMA8V1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// QKV-RSP-CARRY. The run-sum-prepass multi-tile body
+    /// (`qkv_mma8_affine4_g64_mt_rsp`) reads each group's packed word,
+    /// scale and bias at the point of use. This carries them the way the
+    /// o_proj rsp/rsp2 bodies carry theirs: the operands for group `g0` (and,
+    /// at depth two, the word for `g0 + 1`) are read before the group loop,
+    /// and every trip consumes the carried values where the reads stood and
+    /// re-issues the reads for `g_next` / `g_next2` with min-clamped indices.
+    /// Addresses, the order of the operands into `C` and `acc`, and every
+    /// type are unchanged, so the outputs are bit-identical.
+    /// `DARKBLOOM_GEMMA4_QKV_RSP_CARRY=0` restores the promoted body and the
+    /// promoted kernel names byte for byte; `=1` carries one group deep.
+    public static let rspCarryDepth: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_RSP_CARRY"]
+        else { return 2 }
+        let v = raw.trimmingCharacters(in: .whitespaces).lowercased()
+        if ["0", "false", "no", "off"].contains(v) { return 0 }
+        return v == "1" ? 1 : 2
+    }()
+
+    public static let rspCarryEnabled: Bool = rspCarryDepth > 0
+
+    private static let rspCarryKeySuffix: String =
+        rspCarryDepth == 0 ? "" : "_rc\(rspCarryDepth)"
+
+    private static func applyRspCarry(to header: String, depth: Int) -> String {
+        var result = header
+        func replace(_ old: String, with new: String) {
+            precondition(
+                result.components(separatedBy: old).count == 2,
+                "qkv rsp carry anchor drift")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        let preload2 = depth == 2
+            ? "  uint2 wv_next2[TILES];\n" : ""
+        let seed2 = depth == 2
+            ? "    wv_next2[t] = *((const device uint2*)(wrow[t] + 32 * (g0 + min(1, nGroups - 1))));\n"
+            : ""
+        replace(
+            "    acc1[t] = 0.0f;\n  }\n\n  const device T* x0 = x + c.fn * K + 8 * c.fm;\n  const device T* x1 = x0 + K;\n\n  simdgroup_float8x8 A;\n  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;\n\n#pragma unroll\n",
+            with: "    acc1[t] = 0.0f;\n  }\n\n  const device T* x0 = x + c.fn * K + 8 * c.fm;\n  const device T* x1 = x0 + K;\n\n  simdgroup_float8x8 A;\n  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;\n\n  uint2 wv_next[TILES];\n" + preload2 + "  float s_next[TILES];\n  float b_next[TILES];\n#pragma clang loop unroll(full)\n  for (int t = 0; t < TILES; ++t) {\n    wv_next[t] = *((const device uint2*)(wrow[t] + 32 * g0));\n" + seed2 + "    s_next[t] = float(srow[t][g0]);\n    b_next[t] = float(brow[t][g0]);\n  }\n\n#pragma unroll\n")
+        let rotate = depth == 2
+            ? "      const int g_next = g0 + min(gi + 1, nGroups - 1);\n      const int g_next2 = g0 + min(gi + 2, nGroups - 1);\n      wv_next[t] = wv_next2[t];\n      wv_next2[t] = *((const device uint2*)(wrow[t] + 32 * g_next2));\n"
+            : "      const int g_next = g0 + min(gi + 1, nGroups - 1);\n      wv_next[t] = *((const device uint2*)(wrow[t] + 32 * g_next));\n"
+        replace(
+            "      const uint2 wv = *((const device uint2*)(wrow[t] + 32 * g));\n      const float s = float(srow[t][g]);\n      const float b = float(brow[t][g]);\n",
+            with: "      const uint2 wv = wv_next[t];\n      const float s = s_next[t];\n      const float b = b_next[t];\n" + rotate + "      s_next[t] = float(srow[t][g_next]);\n      b_next[t] = float(brow[t][g_next]);\n")
+        return result
+    }
+
+    private static let mma8RspCarryHeader: String = applyRspCarry(
+        to: mma8KernelHeader, depth: rspCarryDepth)
+
+    private static let mma8ActiveRspHeader: String =
+        rspCarryEnabled ? mma8RspCarryHeader : mma8KernelHeader
+
     private static let batch = 8
     private static let sequence = 1
     private static let inputWidth = 2816
@@ -714,7 +770,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     // entries the separate Q and K rsp dispatches would; the SPLIT store
     // keeps QKFUSE-001's two-buffer layout.
     private static let fusedSlidingRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_v1"
+            + rspCarryKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y", "y2"],
         source: """
@@ -727,11 +784,12 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
                 thread_index_in_simdgroup, y2);
             return;
             """,
-        header: mma8KernelHeader,
+        header: mma8ActiveRspHeader,
         ensureRowContiguous: true)
 
     private static let fusedFullRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_v1"
+            + rspCarryKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y", "y2"],
         source: """
@@ -744,7 +802,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
                 thread_index_in_simdgroup, y2);
             return;
             """,
-        header: mma8KernelHeader,
+        header: mma8ActiveRspHeader,
         ensureRowContiguous: true)
 
     private static let mma8Kernel = MLXFast.metalKernel(
@@ -805,7 +863,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let multiTileRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_v1"
+            + rspCarryKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -818,7 +877,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: mma8KernelHeader,
+        header: mma8ActiveRspHeader,
         ensureRowContiguous: true)
 
     private static let mma8RspKernel = MLXFast.metalKernel(
@@ -967,6 +1026,9 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             && rsTable!.dtype == .float32
             && rsTable!.shape == [batch, inputWidth / Self.groupSize]
 
+        if tableReady && rspCarryEnabled {
+            CBv2EngageMark.once("qkv-rsp-carry")
+        }
         let kernel =
             qWidth == 4096
             ? (tableReady ? fusedSlidingRspKernel : fusedSlidingKernel)
@@ -1049,6 +1111,9 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         let yTiles = outputWidth / outputsPerGroup
         if multiTileEnabled, yTiles % tilesPerGroup == 0 {
             if tableReady {
+                if rspCarryEnabled {
+                    CBv2EngageMark.once("qkv-rsp-carry")
+                }
                 return multiTileRspKernel(
                     [x, weight, scales, biases, rsTable!],
                     template: [("T", x.dtype)],

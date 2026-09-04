@@ -197,7 +197,13 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
 
     public func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
         let identity = rowStates.map { row -> ObjectIdentifier in
-            guard let anchor = row.compactMap({ $0 }).first else {
+            // HA4: `row.compactMap { $0 }.first` materialised a full
+            // 30-element array (one heap alloc + 30 retains per row, 8 rows
+            // per step) only to read its head. `first(where:)` stops at the
+            // first bound layer and allocates nothing; the explicit
+            // `CBv2SequenceKV?` annotation flattens the double optional.
+            let anchorSlot: CBv2SequenceKV? = row.first(where: { $0 != nil }) ?? nil
+            guard let anchor = anchorSlot else {
                 preconditionFailure("CBv2LayerCacheBank: row owns no storage at any layer")
             }
             return ObjectIdentifier(anchor)

@@ -6686,14 +6686,25 @@ public class Gemma4TextModelInner: Module {
         // no padding and no shared frontier to mask). In v2 mode every layer
         // (including KV-shared ones) has a cache object.
         let isCBv2 = fullCache.contains { ($0 as? (any CBv2AttendingLayerCache)) != nil }
-        // All-contiguous banks expose one position chain. Snapshot it before
+        // All-contiguous banks expose one position chain. Capture it before
         // the first layer advances the chain, then reuse that same lazy array
         // for every Q/K RoPE call in this forward.
+        //
+        // No defensive `+ 0` copy is needed on this chain: the handle read
+        // here is already an immutable snapshot. The bank's shared position
+        // state only ever REBINDS its stored array
+        // (`positionOffsetsState.value = positionOffsetsState.value + L`,
+        // CBv2LayerCache.updateAndAttend) and never mutates one in place, and
+        // the bank elects exactly one owning cache to advance it. A `+ 0` here
+        // would be a whole int32 `[8]` add dispatch at the head of every
+        // forward for a value that cannot shift. The standalone / paged-cache
+        // capture keeps its own `+ 0`: that is a different chain, advanced by
+        // the same layer that reads it.
         let unifiedCBv2PositionOffset: Gemma4.PositionOffset? = {
             guard isCBv2 else { return nil }
             for case let entry? in fullCache {
                 if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
-                    return .batch(offsets + 0)
+                    return .batch(offsets)
                 }
             }
             return nil
@@ -6757,7 +6768,12 @@ public class Gemma4TextModelInner: Module {
                 isCBv2 && prevIdx != idx
                 ? fullCache[prevIdx] as? (any CBv2AttendingLayerCache) : nil
 
-            let mask = maskByType[layer.layerType]
+            // HA5: `maskByType` is only ever written inside the `if !isCBv2`
+            // block above, so on the CBv2 path it is still empty here and the
+            // lookup can only return nil. Skipping it drops one heap-backed
+            // String hash + retain/release per layer per step.
+            let mask: MLXFast.ScaledDotProductAttentionMaskMode? =
+                isCBv2 ? nil : maskByType[layer.layerType]
             // Prompt-path specializations, final layer only. Every earlier
             // layer runs the full chunk unchanged because later positions'
             // K/V depend on it.
@@ -6773,7 +6789,13 @@ public class Gemma4TextModelInner: Module {
                 batchSize: h.dim(0),
                 sequenceLength: h.dim(1),
                 outputTailRows: outputTailRows,
-                hasCapableCache: fullCache[idx] is any CBv2LastQueryPrefillLayerCache)
+                // HA5: `gemma4UseLastQueryPrefill` ANDs `outputTailRows == 1`
+                // into its result, so when that is false the probe's value
+                // cannot change the answer. Guarding it keeps the existential
+                // conformance check off the decode path (outputTailRows is nil
+                // there, because `isFinalPromptLayer` requires schedulePrefill).
+                hasCapableCache: outputTailRows == 1
+                    && (fullCache[idx] is any CBv2LastQueryPrefillLayerCache))
             let (out, kvPair, positionOffset) = layer(
                 h,
                 mask: mask,

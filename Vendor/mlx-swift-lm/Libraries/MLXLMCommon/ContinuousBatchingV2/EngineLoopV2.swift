@@ -324,6 +324,16 @@ private let cbv2CompactInflightParticipantsEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// CBV2-CHAINED-DECODE-SCRATCH kill switch. Reuse is ON by default (the ranked
+/// runner sets no environment); `DARKBLOOM_CBV2_CHAINED_DECODE_SCRATCH` set to
+/// `0`/`false`/`no`/`off` rebuilds the derived arrays every step (bisection).
+private let cbv2ChainedDecodeScratchEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_CBV2_CHAINED_DECODE_SCRATCH"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private enum CBv2ParticipantIndex {
     case compact([CBv2RequestID])
     case hashed(Set<CBv2RequestID>)
@@ -589,6 +599,16 @@ public final class EngineLoopV2: @unchecked Sendable {
     // driver in EngineLoopV2+MTP.swift is part of the loop).
     var detokenizers: [CBv2RequestID: CBv2IncrementalDetokenizer] = [:]
     var kvStates: [CBv2RequestID: [CBv2SequenceKV?]] = [:]
+    /// CBV2-CHAINED-DECODE-SCRATCH. `launchChainedDecode`'s three derived arrays are
+    /// element-wise identical across steady-state token steps. INVARIANT: reusable only
+    /// while the plan's id sequence matches element-wise AND no `kvStates` entry was
+    /// inserted/removed since — `rowStates` snapshots the per-id row arrays, so every
+    /// `kvStates` mutation site in this file clears it. Holding elements is safe:
+    /// `CBv2SequenceKV` is class-bound (`CBv2Contracts.swift:256`), so a cached row holds
+    /// the objects a fresh lookup returns; `CBv2SamplingParams` is a value type read from
+    /// `rec.request`, a `let` that cannot drift.
+    private var chainedDecodeScratch:
+        (ids: [CBv2RequestID], rowStates: [[CBv2SequenceKV?]], params: [CBv2SamplingParams])?
     /// Tokens skipped via prefix-cache adoption, reported in usage.
     private var prefixHitTokens: [CBv2RequestID: Int] = [:]
     /// Lookup/adoption outcome carried to terminal usage.
@@ -1057,6 +1077,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 layerKinds: layerKinds,
                 maxLength: maxLength)
             kvStates[requestID] = state
+            chainedDecodeScratch = nil  // CBV2-CHAINED-DECODE-SCRATCH
             rec.numComputedTokens = adoption.plan.replayStart
             rec.prefixReusePlan = adoption.plan
             prefixHitTokens[requestID] = adoption.plan.prefillTokensSaved
@@ -1241,6 +1262,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 invalidateAdoptedPrefix(id)
                 mtp?.invalidateCarry(id)
                 guard let state = kvStates.removeValue(forKey: id) else { continue }
+                chainedDecodeScratch = nil  // CBV2-CHAINED-DECODE-SCRATCH
                 if previous.containsParticipant(id) {
                     previous.deferredReleases.append(
                         (
@@ -1580,17 +1602,46 @@ public final class EngineLoopV2: @unchecked Sendable {
         return scored.asArray(Int32.self).map(Int.init)
     }
 
+    /// Element-wise row-identity test for CBV2-CHAINED-DECODE-SCRATCH. `CBv2RequestID`
+    /// wraps a `UInt64`, so a steady-state batch costs eight integer compares.
+    private static func chainedScratchRowsMatch(
+        _ cached: [CBv2RequestID], _ assignments: [(id: CBv2RequestID, numTokens: Int)]
+    ) -> Bool {
+        guard cached.count == assignments.count else { return false }
+        for i in cached.indices where cached[i] != assignments[i].id { return false }
+        return true
+    }
+
     /// Pure-decode step fed by the previous step's still-lazy tokens.
     private func launchChainedDecode(
         _ plan: CBv2StepPlan, feeding lazyTokens: MLXArray
     ) -> CBv2InFlightStep {
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
         let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        let ids = plan.assignments.map(\.id)
-        let rowStates = ids.map { kvStates[$0]! }  // presence pre-checked
-        var params: [CBv2SamplingParams] = []
-        params.reserveCapacity(ids.count)
-        for id in ids { params.append(scheduler.record(for: id)!.request.sampling) }
+        // CBV2-CHAINED-DECODE-SCRATCH: reuse the previous chained step's derived
+        // arrays when this plan schedules the same rows in the same order. Any
+        // difference — count, order, one id — falls through to the build below.
+        let ids: [CBv2RequestID]
+        let rowStates: [[CBv2SequenceKV?]]
+        let params: [CBv2SamplingParams]
+        if cbv2ChainedDecodeScratchEnabled, let scratch = chainedDecodeScratch,
+            Self.chainedScratchRowsMatch(scratch.ids, plan.assignments)
+        {
+            CBv2EngageMark.once("chained-decode-scratch")
+            ids = scratch.ids
+            rowStates = scratch.rowStates
+            params = scratch.params
+        } else {
+            ids = plan.assignments.map(\.id)
+            rowStates = ids.map { kvStates[$0]! }  // presence pre-checked
+            var built: [CBv2SamplingParams] = []
+            built.reserveCapacity(ids.count)
+            for id in ids { built.append(scheduler.record(for: id)!.request.sampling) }
+            params = built
+            if cbv2ChainedDecodeScratchEnabled {
+                chainedDecodeScratch = (ids: ids, rowStates: rowStates, params: params)
+            }
+        }
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
@@ -2248,6 +2299,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         sampler.requestDidFinish(id)
 
         if let state = kvStates.removeValue(forKey: id) {
+            chainedDecodeScratch = nil  // CBV2-CHAINED-DECODE-SCRATCH
             let donation = donationIntent(for: rec, reason: reason, state: state)
             if let inFlight, inFlight.containsParticipant(id) {
                 // The in-flight step still references this state — fence the
@@ -2656,6 +2708,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 leasesByID[id] = lease
             }
             if let state = kvStates.removeValue(forKey: id) {
+                chainedDecodeScratch = nil  // CBV2-CHAINED-DECODE-SCRATCH
                 backend.release(state)
             }
         }
@@ -2674,6 +2727,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             let state = try backend.makeSequenceState(
                 layerKinds: layerKinds, promptLength: rec.tokens.count, maxLength: maxLength)
             kvStates[rec.id] = state
+            chainedDecodeScratch = nil  // CBV2-CHAINED-DECODE-SCRATCH
             capacityRequeues.removeValue(forKey: rec.id)
             return state
         } catch let kvError as CBv2KVError {

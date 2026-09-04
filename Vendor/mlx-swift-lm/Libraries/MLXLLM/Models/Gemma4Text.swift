@@ -6180,6 +6180,33 @@ enum Gemma4FusedScaledEmbedding {
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+    /// Kill switch for pre-evaluated embed_scale scalar tensor memoization.
+    static let embedScaleMemoEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_SCALED_EMBED_SCALE_MEMO"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let scaleLock = NSLock()
+    nonisolated(unsafe) private static var cachedScaleArrays: [Float: MLXArray] = [:]
+
+    @inline(__always)
+    private static func scaleArray(for scale: Float) -> MLXArray {
+        guard embedScaleMemoEnabled else {
+            return scale.asMLXArray(dtype: .bfloat16)
+        }
+        scaleLock.lock()
+        defer { scaleLock.unlock() }
+        if let cached = cachedScaleArrays[scale] {
+            return cached
+        }
+        let arr = scale.asMLXArray(dtype: .bfloat16)
+        eval(arr)
+        cachedScaleArrays[scale] = arr
+        return arr
+    }
+
 
     /// This checkpoint's embedding quantization. Anything else fails closed.
     private static let groupSize = 64
@@ -6268,10 +6295,10 @@ enum Gemma4FusedScaledEmbedding {
         let wordsPerRow = weight.dim(1)
 
         CBv2EngageMark.once(length > 1 ? "scaled-embedding" : "scaled-embedding-decode")
+        if embedScaleMemoEnabled { CBv2EngageMark.once("scaled-embed-scale-memo") }
+        let scaleArr = scaleArray(for: embedScale)
         return kernel(
-            // `asMLXArray(dtype:)` is the exact conversion the stock
-            // `MLXArray * Float` overload performs on the scalar.
-            [tokens, weight, scales, biases, embedScale.asMLXArray(dtype: .bfloat16)],
+            [tokens, weight, scales, biases, scaleArr],
             template: [("T", DType.bfloat16)],
             grid: (wordsPerRow, batch * length, 1),
             threadGroup: (32, 8, 1),

@@ -765,7 +765,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// packer stores (`metal::rint` matches MLX `round`), quantized bytes
     /// plus the fp16 tail written at the identical offsets.
     private static let quantPackKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_kvq4g64_pack_d256_v1",
+        name: "cbv2_kvq4g64_pack_d256_unrollvec_v2",
         inputNames: ["x"],
         outputNames: ["packed_w"],
         source: """
@@ -774,19 +774,31 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             constexpr int per_lane = D / simd_width;      // 8 values
             constexpr int group_size = 64;
             constexpr int payload_words = D / 8;          // 32 (8 nibbles each)
+            typedef vec<T, 4> T4;
 
             const int row = int(threadgroup_position_in_grid.x);
             const int lane = int(thread_position_in_threadgroup.x);
             const device T* xr = x + row * D;
             device uint32_t* out = packed_w + row * (payload_words + D / group_size);
+            const device T4* xvec = reinterpret_cast<const device T4*>(xr);
+            float values[per_lane];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < per_lane / 4; ++i) {
+                const T4 v4 = xvec[lane * (per_lane / 4) + i];
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    values[i * 4 + j] = float(v4[j]);
+                }
+            }
 
             // A lane owns 8 consecutive elements, so it lies wholly inside one
             // 64-element group; the eight lanes of a group are contiguous and
             // aligned, so an xor butterfly over 1,2,4 reduces exactly them.
             float vmin = 3.402823466e+38F;
             float vmax = -3.402823466e+38F;
+            #pragma clang loop unroll(full)
             for (int i = 0; i < per_lane; ++i) {
-                const float v = float(xr[lane * per_lane + i]);
+                const float v = values[i];
                 vmin = min(vmin, v);
                 vmax = max(vmax, v);
             }
@@ -801,8 +813,9 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             const float b = float(hb);
 
             uint32_t word = 0u;
+            #pragma clang loop unroll(full)
             for (int i = 0; i < per_lane; ++i) {
-                const float q = metal::rint((float(xr[lane * per_lane + i]) - b) / s);
+                const float q = metal::rint((values[i] - b) / s);
                 word |= uint32_t(clamp(q, 0.0f, 15.0f)) << (4 * i);
             }
             out[lane] = word;
@@ -825,7 +838,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// its text, and a Swift-hosted kernel that changes text without
     /// changing name serves a stale cached body.
     private static let quantPackPairKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_kvq4g64_pack_pair_d256_v1",
+        name: "cbv2_kvq4g64_pack_pair_d256_unrollvec_v2",
         inputNames: ["keys", "values"],
         outputNames: ["packed_w"],
         source: """
@@ -835,6 +848,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             constexpr int group_size = 64;
             constexpr int payload_words = D / 8;          // 32
             constexpr int row_words = payload_words + D / group_size;
+            typedef vec<T, 4> T4;
 
             const int row = int(threadgroup_position_in_grid.x);
             const int plane = row / HEADS;
@@ -842,11 +856,22 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             const int lane = int(thread_position_in_threadgroup.x);
             const device T* src = (plane == 0 ? keys : values) + head * D;
             device uint32_t* out = packed_w + row * row_words;
+            const device T4* srcvec = reinterpret_cast<const device T4*>(src);
+            float values[per_lane];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < per_lane / 4; ++i) {
+                const T4 v4 = srcvec[lane * (per_lane / 4) + i];
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    values[i * 4 + j] = float(v4[j]);
+                }
+            }
 
             float vmin = 3.402823466e+38F;
             float vmax = -3.402823466e+38F;
+            #pragma clang loop unroll(full)
             for (int i = 0; i < per_lane; ++i) {
-                const float v = float(src[lane * per_lane + i]);
+                const float v = values[i];
                 vmin = min(vmin, v);
                 vmax = max(vmax, v);
             }
@@ -861,8 +886,9 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             const float b = float(hb);
 
             uint32_t word = 0u;
+            #pragma clang loop unroll(full)
             for (int i = 0; i < per_lane; ++i) {
-                const float q = metal::rint((float(src[lane * per_lane + i]) - b) / s);
+                const float q = metal::rint((values[i] - b) / s);
                 word |= uint32_t(clamp(q, 0.0f, 15.0f)) << (4 * i);
             }
             out[lane] = word;

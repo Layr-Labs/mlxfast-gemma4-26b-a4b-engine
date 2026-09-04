@@ -597,6 +597,12 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// drain cannot complete until each terminal donation releases its state
     /// back on the engine queue.
     private var pendingDonationReleaseCount = 0
+    /// Engine-thread-confined vectors reused by the MTP decode sampler. The
+    /// rows are rebuilt only when admission order or request sampling changes;
+    /// keeping them on this loop avoids per-round host arrays without a
+    /// process-wide mutable cache (request ids may be reused after finish).
+    var mtpDecodeCachedRowIDs: [CBv2RequestID] = []
+    var mtpDecodeCachedSampling: [CBv2SamplingParams] = []
     /// Resolved vision inputs (validated spans + materialized embeddings),
     /// keyed by request. Kept across PREEMPTION (a full re-prefill replays
     /// the span chunks and needs the embeddings again); dropped at finish.
@@ -1608,7 +1614,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         {
             let caches = eagerCaches(rowStates: rowStates)
             sampled = fusedModel.decodeArgmax(tokens: inputs, caches: caches)
-            cacheInnerState = eagerCacheInnerState(caches)
+            // The fused token roots the same complete Gemma decode graph as
+            // ordinary logits, so reuse its fail-closed compact offsets/fences.
+            cacheInnerState = eagerDecodeEvaluationRoots(caches, logitsRoot: sampled)
             stepLogprobs = nil
             fusedSampler.noteFusedGreedySample()
             if CBv2StepProfiler.enabled {

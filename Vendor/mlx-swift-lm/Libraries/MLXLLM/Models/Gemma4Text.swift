@@ -3594,11 +3594,118 @@ private enum Gemma4RouteGlueFoldV1 {
         let table: SwitchRouteTable
     }
 
-    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_route_monolithic_top8_e128_k8_bf16_v2",
-        inputNames: ["scores", "pes"],
-        outputNames: ["indices", "weights", "row_order", "sorted_keys", "inverse_order"],
-        source: """
+    // MARK: - ROUTE-A2-042 --- the rank predicate as one unsigned compare
+
+    /// `false` only when `DARKBLOOM_GEMMA4_ROUTE_RANK_COMPOSITE` is an
+    /// explicit off value. Off restores the incumbent predicate, its source
+    /// and its name byte for byte.
+    private static let routeA2Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTE_RANK_COMPOSITE"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
+    /// ROUTE-A2-042. The phase-2 rank scatter asks, 64 times per body, whether
+    /// another finalist sorts before this one:
+    ///
+    ///     (other < key) || (other == key && other_assignment < assignment)
+    ///
+    /// That is **lexicographic order on the pair `(key, assignment)`**, and a
+    /// lexicographic order on a pair of bounded unsigned fields is exactly one
+    /// unsigned compare over the fields packed into a single word.
+    ///
+    /// The widths, which the original ticket did not check and got wrong (it
+    /// said a 13-bit composite; it is 29):
+    ///
+    /// * `assignment = tid` indexes 8 rows x top-8 = **[0, 64)** --- 6 bits.
+    ///   The two "other" indices are `source` in `[0, 32)` and
+    ///   `32 + source` in `[32, 64)`, so both are in range as well.
+    /// * `key = sel[assignment]` holds an `item`, built upstream as
+    ///   `(bfloat16_to_uint16(score) << 7) | expert` with `expert < 128`, so
+    ///   `key <= (65535 << 7) | 127 = 8,388,607 < 2^23` --- **23 bits**.
+    /// * composite = `23 + 6 = 29` bits, so `(key << 6) | assignment` cannot
+    ///   overflow a `uint` and no field can bleed into another.
+    ///
+    /// Exactness, by cases and complete. Write `A = (a << 6) | ia` and
+    /// `K = (k << 6) | ik` with `ia, ik < 64`. If `a < k` then
+    /// `A <= (k - 1) << 6 | 63 = (k << 6) - 1 < K`. If `a > k` the same
+    /// argument reversed gives `A > K`. If `a == k` then `A < K` iff
+    /// `ia < ik`. So `A < K` holds exactly when the incumbent predicate holds,
+    /// for every input --- including the self-comparison, where `a == k` and
+    /// `ia == ik` give `A == K` and neither predicate fires.
+    ///
+    /// **No floating point is read, produced, compared or re-rounded
+    /// anywhere in this transform.** It is integer packing over values the
+    /// incumbent already had in registers, so it cannot spend a token of the
+    /// per-stream tolerance budget and needs no fidelity argument at all.
+    /// The `simd_broadcast` pattern, the loop bounds, the unroll pragma and
+    /// the three stores are the incumbent's, unmoved.
+    ///
+    /// Soft-gated: a derivation mismatch leaves the promoted source and name
+    /// in place rather than trapping inside a lazy static.
+    private static let routeA2Source: String? = {
+        var result = incumbentSource
+        func replaceOnce(_ old: String, with new: String) -> Bool {
+            guard result.components(separatedBy: old).count == 2 else { return false }
+            result = result.replacingOccurrences(of: old, with: new)
+            return true
+        }
+        guard replaceOnce(
+            """
+                    const uint key = sel[assignment];
+                    const uint key_low = sel[lane];
+                    const uint key_high = sel[32u + lane];
+                    uint rank = 0;
+            """,
+            with: """
+                    const uint key = sel[assignment];
+                    // ROUTE-A2: (key, assignment) packed into one word.
+                    // assignment < 64 (6 bits); key < 2^23; 29 bits total.
+                    const uint self_composite = (key << 6) | assignment;
+                    const uint composite_low = (sel[lane] << 6) | lane;
+                    const uint composite_high =
+                        (sel[32u + lane] << 6) | (32u + lane);
+                    uint rank = 0;
+            """
+        ) else { return nil }
+        guard replaceOnce(
+            """
+                    for (uint source = 0; source < 32; ++source) {
+                        const uint other_low = simd_broadcast(key_low, ushort(source));
+                        rank += (other_low < key)
+                            || (other_low == key && source < assignment);
+                        const uint other_high = simd_broadcast(key_high, ushort(source));
+                        const uint high_assignment = 32u + source;
+                        rank += (other_high < key)
+                            || (other_high == key && high_assignment < assignment);
+                    }
+            """,
+            with: """
+                    for (uint source = 0; source < 32; ++source) {
+                        rank += simd_broadcast(composite_low, ushort(source))
+                            < self_composite;
+                        rank += simd_broadcast(composite_high, ushort(source))
+                            < self_composite;
+                    }
+            """
+        ) else { return nil }
+        return result
+    }()
+
+    private static let activeSource: String =
+        (routeA2Enabled ? routeA2Source : nil) ?? incumbentSource
+
+    /// Cumulative append: MLX caches pipelines by name and fires
+    /// `clear_library` on a name/source mismatch, so a changed body takes a
+    /// changed name.
+    private static let routeA2Key: String =
+        (routeA2Enabled && routeA2Source != nil) ? "_a2" : ""
+
+    private static let incumbentSource: String = """
             const uint tid = thread_position_in_threadgroup.x;
             const uint row = tid / 128u;
             const uint lane = thread_index_in_simdgroup;
@@ -3696,7 +3803,13 @@ private enum Gemma4RouteGlueFoldV1 {
                 sorted_keys[rank] = key;
                 inverse_order[assignment] = rank;
             }
-        """,
+        """
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_route_monolithic_top8_e128_k8_bf16_v2" + routeA2Key,
+        inputNames: ["scores", "pes"],
+        outputNames: ["indices", "weights", "row_order", "sorted_keys", "inverse_order"],
+        source: activeSource,
         header: """
             inline bool gemma4_finalists_before(uint a, uint b) {
                 const bfloat16_t av = uint16_to_bfloat16(uint16_t(a >> 7));
@@ -4483,7 +4596,7 @@ private enum Gemma4FusedLayerGlue {
     /// features owned by this tail thread. The value remains in registers and
     /// feeds the expert RMS directly, deleting only the reduced `[8, 2816]`
     /// materialization and its standalone dispatch.
-    private static let deferredExpertValuesSource = """
+    private static let deferredExpertValuesIncumbent = """
             T expertv[4];
             const uint assignment_base = row * 8u;
             uint sorted_rows[8];
@@ -4505,9 +4618,93 @@ private enum Gemma4FusedLayerGlue {
             }
     """
 
+    /// `false` only when `DARKBLOOM_GEMMA4_EXPERT_TAIL_GATHER_VEC` is an
+    /// explicit off value. Off restores the incumbent gather, and with it the
+    /// incumbent names, byte for byte in the same executable.
+    private static let expertGatherVecEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_EXPERT_TAIL_GATHER_VEC"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
+    /// GLUE-C1-039. The incumbent walks `i` (the four contiguous features this
+    /// thread owns) outside and `slot` (the top-8 expert assignment) inside,
+    /// so the row read is a scalar at stride 1 and the gather costs 32 scalar
+    /// bf16 device loads per thread. Interchanged --- `slot` outside, the four
+    /// features held in four accumulators --- the four addresses per slot are
+    /// contiguous and become ONE aligned `vec<T, 4>`: 8 vector loads for the
+    /// same 32 elements. That gather is the single dominant term in this
+    /// kernel's traffic (64 %: the `sorted` plane is read exactly once per
+    /// dispatch, 64 x 2816 x 2 B = 360,448 B of ~565,000 B total).
+    ///
+    /// Exactness: this is NOT a reassociation. Projected onto any one output
+    /// feature `i`, the additions into its accumulator still arrive in slot
+    /// order 0...7; the interchange only interleaves four DISJOINT chains. The
+    /// summands are unchanged --- `(float)sorted[...] * (float)routed_weights[slot]`
+    /// rounded to T, per (i, slot), with no cross-feature dependency --- and
+    /// the loaded bf16 bits are the same whether fetched scalar or as lane `i`
+    /// of a vector over the same four contiguous addresses. MLX builds every
+    /// `MLXFast.metalKernel` with fast math OFF, so the written order is the
+    /// executed order in both forms.
+    ///
+    /// This is the shape the tree's own reference already ships: the legacy
+    /// `weighted_expert_unsort_vec8_v3` in `SwitchLayers.swift` is written
+    /// slot-outer over a vector accumulator, and reads this same `sorted`
+    /// buffer through this same `ensureRowContiguous` path with a SIXTEEN-byte
+    /// `vec<T, 8>` load. The scalar `i`-outer form here is the deviation; this
+    /// restores the reference form at half that alignment requirement.
+    ///
+    /// Alignment: the row stride is the literal 2816 = 4 x 704, so
+    /// `sorted_rows[slot] * 2816 = 0 (mod 4)`; `wbase = lid * 4 = 0 (mod 4)`;
+    /// so the element index is a multiple of 4 and the byte offset a multiple
+    /// of 8. `wbase + 3 <= 2815 < 2816`, so no vector straddles a row.
+    private static let deferredExpertValuesVec = """
+            T expertv[4];
+            const uint assignment_base = row * 8u;
+            uint sorted_rows[8];
+            T routed_weights[8];
+            for (uint slot = 0u; slot < 8u; ++slot) {
+                const uint assignment = assignment_base + slot;
+                sorted_rows[slot] = (uint)inverse[assignment];
+                routed_weights[slot] = route_weights[assignment];
+            }
+            {
+                T acc0 = static_cast<T>(0.0f);
+                T acc1 = static_cast<T>(0.0f);
+                T acc2 = static_cast<T>(0.0f);
+                T acc3 = static_cast<T>(0.0f);
+                for (uint slot = 0u; slot < 8u; ++slot) {
+                    const vec<T, 4> source =
+                        *reinterpret_cast<const device vec<T, 4>*>(
+                            sorted + sorted_rows[slot] * 2816u + wbase);
+                    const float weight = (float)routed_weights[slot];
+                    acc0 = acc0 + static_cast<T>((float)source[0] * weight);
+                    acc1 = acc1 + static_cast<T>((float)source[1] * weight);
+                    acc2 = acc2 + static_cast<T>((float)source[2] * weight);
+                    acc3 = acc3 + static_cast<T>((float)source[3] * weight);
+                }
+                expertv[0] = acc0;
+                expertv[1] = acc1;
+                expertv[2] = acc2;
+                expertv[3] = acc3;
+            }
+    """
+
+    private static let deferredExpertValuesSource =
+        expertGatherVecEnabled ? deferredExpertValuesVec : deferredExpertValuesIncumbent
+
+    /// Cumulative append, per this file's own `tbSuffix` precedent: MLX caches
+    /// pipelines by name and calls `clear_library` on a name/source mismatch,
+    /// so a changed body must take a changed name.
+    private static let gatherSuffix: String = expertGatherVecEnabled ? "_c1" : ""
+
     private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1_vec1"
-            + tbSuffix,
+            + tbSuffix + gatherSuffix,
         inputNames: [
             "a", "sorted", "inverse", "route_weights", "res",
             "w1", "w2", "w3", "s",
@@ -4556,7 +4753,7 @@ private enum Gemma4FusedLayerGlue {
         MLXFast.metalKernel(
             name:
                 "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1_rs1"
-                + tbSuffix,
+                + tbSuffix + gatherSuffix,
             inputNames: [
                 "a", "sorted", "inverse", "route_weights", "res",
                 "w1", "w2", "w3", "s", "wn",

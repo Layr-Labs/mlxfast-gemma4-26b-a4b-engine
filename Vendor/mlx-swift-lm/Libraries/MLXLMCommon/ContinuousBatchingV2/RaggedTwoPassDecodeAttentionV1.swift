@@ -12,6 +12,9 @@
 import Foundation
 import MLX
 import MLXFast
+#if canImport(IOKit)
+import IOKit
+#endif
 
 public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let enabled: Bool = {
@@ -2673,6 +2676,112 @@ for (int element = 0; element < values_per_lane; ++element) {
             : "_sr1s\(Int(slidingSoftRefSpan.rounded()))"
     }()
 
+    //
+    //
+    //
+    //
+    /// `DARKBLOOM_CBV2_SLIDING_SPLIT` selects the two-dispatch sliding
+    /// road. Default off; with it off the dispatch below is unchanged.
+    static let slidingSplitEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_SLIDING_SPLIT"]
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }()
+
+    ///
+    /// Block-walks per item. Defaults to `blocks`.
+    /// `DARKBLOOM_CBV2_SLIDING_SPLIT_BLOCKS` requests another value; a request that
+    /// does not satisfy the conditions enforced below is refused and `blocks`
+    /// is used. The conditions are `N % (PF * B) == 0`, `N / (PF * B) >= 2`,
+    /// `simd_width % B == 0`, and `D / simd_width == B`.
+    static let slidingSplitBlocks: Int = {
+        let requested: Int
+        if let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_SLIDING_SPLIT_BLOCKS"]
+        {
+            guard let value = Int(raw) else { return blocks }
+            requested = value
+        } else { requested = blocks }
+        let prefetch = slidingPrefetchDepth2 ? 2 : 1
+        let valuesPerLane = headDim / slidingSplitSimdWidth
+        guard
+            sequenceLength % (prefetch * requested) == 0,
+            sequenceLength / (prefetch * requested) >= 2,
+            slidingSplitSimdWidth % requested == 0,
+            valuesPerLane == requested
+        else { return blocks }
+        return requested
+    }()
+
+    private static let slidingSplitSimdWidth = 32
+
+    ///
+    /// Launch-width ceiling in threads, from
+    /// `DARKBLOOM_CBV2_SLIDING_SPLIT_MAXTPT`, quantised down to a multiple of
+    /// 32. Default 1024.
+    static let slidingSplitMaxThreads: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_SLIDING_SPLIT_MAXTPT"], let value = Int(raw),
+            value >= 32, value <= 1024
+        else { return 1024 }
+        return value - (value % 32)
+    }()
+
+    ///
+    /// Thread-group count for the road, read once at load and overridable
+    /// with `DARKBLOOM_CBV2_SLIDING_SPLIT_GROUPS`. Unreadable, unparseable and
+    /// out-of-band values all return nil, and nil selects the incumbent path.
+    private static let slidingSplitGroupCount: Int? = {
+        if let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_SLIDING_SPLIT_GROUPS"]
+        {
+            guard let forced = Int(raw), forced >= 4, forced <= 256 else { return nil }
+            return forced
+        }
+        #if canImport(IOKit)
+        var iterator: io_iterator_t = 0
+        guard let matching = IOServiceMatching("AGXAccelerator") else { return nil }
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator)
+            == KERN_SUCCESS
+        else { return nil }
+        defer { IOObjectRelease(iterator) }
+        var found: Int? = nil
+        while case let service = IOIteratorNext(iterator), service != 0 {
+            defer { IOObjectRelease(service) }
+            guard found == nil,
+                let property = IORegistryEntryCreateCFProperty(
+                    service, "gpu-core-count" as CFString, kCFAllocatorDefault, 0)?
+                    .takeRetainedValue(),
+                let number = property as? NSNumber
+            else { continue }
+            found = number.intValue
+        }
+        guard let cores = found, cores >= 8, cores <= 128 else { return nil }
+        return cores
+        #else
+        return nil
+        #endif
+    }()
+
+    ///
+    /// The resolved launch, or nil to use the incumbent dispatch. nil when
+    /// the arm is off, when the count does not resolve, when the launch width
+    /// would exceed `slidingSplitMaxThreads`, or when the plan matches the
+    /// incumbent. `DARKBLOOM_CBV2_SLIDING_SPLIT_FORCE` admits the matching plan.
+    static let slidingSplitPlan: (t: Int, w: Int, b: Int)? = {
+        guard slidingSplitEnabled, let cores = slidingSplitGroupCount else { return nil }
+        let b = slidingSplitBlocks
+        let walks = kvHeads * batch * b
+        let t = cores
+        let w = (walks + t - 1) / t
+        guard w >= 1, w * slidingSplitSimdWidth <= slidingSplitMaxThreads else { return nil }
+        let forced = ["1", "true", "yes", "on"].contains(
+            (ProcessInfo.processInfo.environment[
+                "DARKBLOOM_CBV2_SLIDING_SPLIT_FORCE"] ?? "").lowercased())
+        guard forced || !(t == kvHeads * batch && b == blocks) else { return nil }
+        return (t: t, w: w, b: b)
+    }()
     /// The shipped depth-one ring walk, verbatim.
     private static let residentSlidingWalkDepth1 = """
             uint slot = (start + uint(block)) % uint(N);
@@ -3474,6 +3583,584 @@ for (int element = 0; element < values_per_lane; ++element) {
             ensureRowContiguous: true
         )
 
+    //
+    //
+    //
+    /// Second dispatch: folds one item's per-block partials into its output.
+    private static func slidingSplitMergeSource(withORunsum: Bool) -> String {
+        """
+                typedef vec<T, 4> T4;
+                constexpr int simd_width = 32;
+                constexpr int values_per_lane = D / simd_width;
+                constexpr int vectors_per_lane = values_per_lane / 4;
+                constexpr int COLS = BLOCKS;
+                constexpr int sets = simd_width / COLS;
+                constexpr int rounds = (BLOCKS + COLS - 1) / COLS;
+                static_assert(BLOCKS == 8, "resident merge requires eight blocks");
+                static_assert(GQA == 2, "resident merge requires GQA two");
+                static_assert(values_per_lane == COLS,
+                    "the combine writes output_group * values_per_lane + block_lane; "
+                    "that tiles [0, D) only when values_per_lane == COLS");
+
+                const int kv_head = int(threadgroup_position_in_grid.x);
+                const int batch_index = int(threadgroup_position_in_grid.y);
+                const int block = int(simdgroup_index_in_threadgroup);
+                const int query_head = GQA * kv_head;
+                const int batch_head = batch_index * 16 + query_head;
+                const int lane = int(thread_index_in_simdgroup);
+
+                threadgroup T local_partials[GQA * BLOCKS * D];
+                threadgroup float local_sums[GQA * BLOCKS];
+                threadgroup float local_maxs[GQA * BLOCKS];
+                \(withORunsum ? "threadgroup float local_o_rs[GQA * BLOCKS];" : "")
+
+                // Load this item's partials into the layout the combine reads.
+                const int item = batch_index * KV_HEADS + kv_head;
+                device const T* item_partials =
+                    partials + size_t(item) * size_t(GQA * BLOCKS * D);
+                device const float* item_meta =
+                    pmeta + size_t(item) * size_t(2 * GQA * BLOCKS);
+                const int tflat = block * simd_width + lane;
+                constexpr int tcount = BLOCKS * simd_width;
+                for (int i = tflat; i < GQA * BLOCKS * D; i += tcount) {
+                    local_partials[i] = item_partials[i];
+                }
+                for (int i = tflat; i < GQA * BLOCKS; i += tcount) {
+                    local_sums[i] = item_meta[i];
+                    local_maxs[i] = item_meta[GQA * BLOCKS + i];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const int block_lane = lane % COLS;
+                const int output_group = block * sets + lane / COLS;
+                #pragma clang loop unroll(full)
+                for (int head = 0; head < GQA; ++head) {
+                    const threadgroup T* head_partials = local_partials
+                        + head * BLOCKS * D + output_group * values_per_lane;
+                    const threadgroup float* head_sums =
+                        local_sums + head * BLOCKS;
+                    const threadgroup float* head_maxs =
+                        local_maxs + head * BLOCKS;
+                    device T* head_out = out
+                        + (batch_head + head) * D
+                        + output_group * values_per_lane;
+
+                    thread float accumulator[values_per_lane];
+                    #pragma clang loop unroll(full)
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        accumulator[element] = 0.0f;
+                    }
+                    thread float lane_max[rounds];
+                    thread float lane_sum[rounds];
+                    thread float lane_factor[rounds];
+                    float sum_exp_score = 0.0f;
+                    float max_score = -3.402823466e+38F;
+                    #pragma clang loop unroll(full)
+                    for (int round = 0; round < rounds; ++round) {
+                        const int column = block_lane + COLS * round;
+                        const bool live = column < BLOCKS;
+                        lane_max[round] =
+                            live ? head_maxs[column] : -3.402823466e+38F;
+                        lane_sum[round] = live ? head_sums[column] : 0.0f;
+                        max_score = max(max_score, lane_max[round]);
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int stride = 1; stride < COLS; stride <<= 1) {
+                        max_score = max(
+                            max_score,
+                            simd_shuffle_xor(max_score, ushort(stride)));
+                    }
+
+                    #pragma clang loop unroll(full)
+                    for (int round = 0; round < rounds; ++round) {
+                        lane_factor[round] =
+                            fast::exp(lane_max[round] - max_score);
+                        sum_exp_score += lane_factor[round] * lane_sum[round];
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int stride = 1; stride < COLS; stride <<= 1) {
+                        sum_exp_score +=
+                            simd_shuffle_xor(sum_exp_score, ushort(stride));
+                    }
+
+                    #pragma clang loop unroll(full)
+                    for (int round = 0; round < rounds; ++round) {
+                        const int column = block_lane + COLS * round;
+                        if (column < BLOCKS) {
+                            const float factor = lane_factor[round];
+                            const threadgroup T4* partial_vectors =
+                                reinterpret_cast<const threadgroup T4*>(
+                                    head_partials + column * D);
+                            #pragma clang loop unroll(full)
+                            for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                                const T4 partial_vector = partial_vectors[chunk];
+                                #pragma clang loop unroll(full)
+                                for (int j = 0; j < 4; ++j) {
+                                    accumulator[chunk * 4 + j] +=
+                                        factor * float(partial_vector[j]);
+                                }
+                            }
+                        }
+                    }
+
+                    // Each step trades the half of the live slots whose
+                    // element bit matches the partner's column bit and keeps
+                    // the other half, so the live count runs 8, 4, 2, 1 and
+                    // the lane that survives for an element is the one whose
+                    // column index equals it. Every node of the addition tree
+                    // pairs the same two column subtrees the per-element
+                    // butterfly paired.
+                    #pragma clang loop unroll(full)
+                    for (int step = 0; (1 << step) < COLS; ++step) {
+                        const ushort stride = ushort(1 << step);
+                        const bool upper = (block_lane & int(stride)) != 0;
+                        const int live = values_per_lane >> step;
+                        #pragma clang loop unroll(full)
+                        for (int slot = 0; slot < live; slot += 2) {
+                            const float keep = upper
+                                ? accumulator[slot + 1]
+                                : accumulator[slot];
+                            const float trade = upper
+                                ? accumulator[slot]
+                                : accumulator[slot + 1];
+                            accumulator[slot >> 1] =
+                                keep + simd_shuffle_xor(trade, stride);
+                        }
+                    }
+                    const T ov = T(
+                        sum_exp_score == 0.0f
+                            ? accumulator[0]
+                            : accumulator[0] / sum_exp_score);
+                    head_out[block_lane] = ov;
+                \(withORunsum ? residentORunsumFold : "")
+                }
+                \(withORunsum ? residentORunsumStore : "")
+            """
+    }
+
+    /// Second dispatch, without the run-sum table.
+    private static let slidingSplitMergeKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_sp1_merge_q4g64_d256_g2_colred_v1",
+            inputNames: ["partials", "pmeta"],
+            outputNames: ["out"],
+            source: slidingSplitMergeSource(withORunsum: false),
+            ensureRowContiguous: true
+        )
+
+    /// Second dispatch, with the run-sum table as a further output.
+    private static let slidingSplitMergeORunsumKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_sp1_merge_q4g64_d256_g2_colred_ors_v1",
+            inputNames: ["partials", "pmeta"],
+            outputNames: ["out", "o_rs"],
+            source: slidingSplitMergeSource(withORunsum: true),
+            ensureRowContiguous: true
+        )
+
+    //
+    //
+    //
+    /// First dispatch: normalises and rotates the row, walks the window, and
+    /// writes each block's partial result to the plane the second dispatch reads.
+    private static let slidingSplitWalkSource = """
+                typedef vec<T, 4> T4;
+                typedef vec<T, 4> T4;
+                constexpr int simd_width = 32;
+                constexpr int values_per_lane = D / simd_width;
+                constexpr int vectors_per_lane = values_per_lane / 4;
+                constexpr int payload_words = D / 8;
+                constexpr int row_words = payload_words + D / 64;
+                constexpr int current_block = (N - 1) % BLOCKS;
+                constexpr int COLS = BLOCKS;
+                constexpr int sets = simd_width / COLS;
+                constexpr int rounds = (BLOCKS + COLS - 1) / COLS;
+                static_assert(BLOCKS == 8, "resident kernel requires eight blocks");
+                static_assert(GQA == 2, "resident kernel requires GQA two");
+
+                const int lane = int(thread_index_in_simdgroup);
+                const int sg = int(simdgroup_index_in_threadgroup);
+                const int tg = int(threadgroup_position_in_grid.x);
+                constexpr int TOTAL_WALKS = KV_HEADS * BATCH * BLOCKS;
+                static_assert(MAXITEMS >= 1, "at least one item per threadgroup");
+                const int g0 = (TOTAL_WALKS * tg) / TG_COUNT;
+                const int g1 = (TOTAL_WALKS * (tg + 1)) / TG_COUNT;
+                const int nwalks = g1 - g0;
+                const int item0 = g0 / BLOCKS;
+                const int nitems = ((g1 - 1) / BLOCKS) - item0 + 1;
+
+                threadgroup T lq_all[MAXITEMS * GQA * D];
+                threadgroup T lk_all[MAXITEMS * D];
+                threadgroup T lv_all[MAXITEMS * D];
+
+                {
+                    const int slot = sg / (GQA + 2);
+                    const int block = sg % (GQA + 2);
+                    const bool active = sg < nitems * (GQA + 2);
+                    const int item = item0 + (active ? slot : 0);
+                    const int kv_head = item % KV_HEADS;
+                    const int batch_index = item / KV_HEADS;
+                    const int query_head = GQA * kv_head;
+                    const int batch_head = batch_index * 16 + query_head;
+                    const int owner_walk = item * BLOCKS + current_block;
+                    const bool owns_item = owner_walk >= g0 && owner_walk < g1;
+                    threadgroup T* local_queries =
+                        lq_all + (active ? slot : 0) * (GQA * D);
+                    threadgroup T* local_key = lk_all + (active ? slot : 0) * D;
+                    threadgroup T* local_value = lv_all + (active ? slot : 0) * D;
+                    (void)query_head; (void)batch_head; (void)owns_item;
+                    if (active) {
+                // Transcribe gemma4_b8_qkv_rms_norm_rope_v2_vec1 one row per
+                // designated SIMD group. Each lane owns the same two four-value
+                // runs as the standalone kernel's two 32-lane SIMD groups.
+                if (block < GQA + 2) {
+                    const device T* raw_row = raw_queries;
+                    const device T* weight_row = q_weight;
+                    threadgroup T* normalized_row = local_queries;
+                    bool weighted = true;
+                    if (block < GQA) {
+                        raw_row += (batch_head + block) * D;
+                        normalized_row += block * D;
+                    } else if (block == GQA) {
+                        raw_row = raw_keys
+                            + (batch_index * KV_HEADS + kv_head) * D;
+                        weight_row = k_weight;
+                        normalized_row = local_key;
+                    } else {
+                        raw_row = raw_values
+                            + (batch_index * KV_HEADS + kv_head) * D;
+                        normalized_row = local_value;
+                        weighted = false;
+                    }
+
+                    const device T4* raw_vectors =
+                        reinterpret_cast<const device T4*>(raw_row);
+                    const device T4* weight_vectors =
+                        reinterpret_cast<const device T4*>(weight_row);
+                    const T4 vin_first = raw_vectors[lane];
+                    const T4 vin_second = raw_vectors[lane + simd_width];
+                    float sum_first = 0.0f;
+                    float sum_second = 0.0f;
+                    #pragma clang loop unroll(full)
+                    for (int i = 0; i < 4; ++i) {
+                        const float first = float(vin_first[i]);
+                        const float second = float(vin_second[i]);
+                        sum_first += first * first;
+                        sum_second += second * second;
+                    }
+                    sum_first = simd_sum(sum_first);
+                    sum_second = simd_sum(sum_second);
+
+                    // Same second 32-lane tree as partials[0], partials[1],
+                    // partials[2...31] = 0 in the standalone kernel.
+                    float sum = lane == 0 ? sum_first
+                        : (lane == 1 ? sum_second : 0.0f);
+                    sum = simd_sum(sum);
+                    float inverse_rms = 0.0f;
+                    if (lane == 0) {
+                        inverse_rms = metal::precise::rsqrt(
+                            sum / float(D) + 1.0e-6f);
+                    }
+                    inverse_rms = simd_shuffle(inverse_rms, ushort(0));
+
+                    const T4 weight_first = weight_vectors[lane];
+                    const T4 weight_second = weight_vectors[lane + simd_width];
+                    threadgroup T4* normalized_vectors =
+                        reinterpret_cast<threadgroup T4*>(normalized_row);
+                    T4 rounded_first;
+                    T4 rounded_second;
+                    #pragma clang loop unroll(full)
+                    for (int i = 0; i < 4; ++i) {
+                        const T normalized_first =
+                            T(float(vin_first[i]) * inverse_rms);
+                        const T normalized_second =
+                            T(float(vin_second[i]) * inverse_rms);
+                        rounded_first[i] = weighted
+                            ? T(weight_first[i] * normalized_first)
+                            : T(1) * normalized_first;
+                        rounded_second[i] = weighted
+                            ? T(weight_second[i] * normalized_second)
+                            : T(1) * normalized_second;
+                    }
+                    normalized_vectors[lane] = rounded_first;
+                    normalized_vectors[lane + simd_width] = rounded_second;
+
+                    if (block == GQA + 1 && owns_item) {
+                        device T4* value_vectors =
+                            reinterpret_cast<device T4*>(
+                                v_out + (batch_index * KV_HEADS + kv_head) * D);
+                        value_vectors[lane] = rounded_first;
+                        value_vectors[lane + simd_width] = rounded_second;
+                    }
+                }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                {
+                    const int slot = sg / (GQA + 2);
+                    const int block = sg % (GQA + 2);
+                    const bool active = sg < nitems * (GQA + 2);
+                    const int item = item0 + (active ? slot : 0);
+                    const int kv_head = item % KV_HEADS;
+                    const int batch_index = item / KV_HEADS;
+                    const int query_head = GQA * kv_head;
+                    const int batch_head = batch_index * 16 + query_head;
+                    const int owner_walk = item * BLOCKS + current_block;
+                    const bool owns_item = owner_walk >= g0 && owner_walk < g1;
+                    threadgroup T* local_queries =
+                        lq_all + (active ? slot : 0) * (GQA * D);
+                    threadgroup T* local_key = lk_all + (active ? slot : 0) * D;
+                    threadgroup T* local_value = lv_all + (active ? slot : 0) * D;
+                    (void)query_head; (void)batch_head; (void)owns_item;
+                    if (active) {
+                // Q and K preserve the standalone norm kernel's BF16 store
+                // boundary before applying the base-route sliding RoPE.
+                if (block < GQA + 1) {
+                    threadgroup T* normalized_row = block < GQA
+                        ? local_queries + block * D : local_key;
+                    device T* key_output =
+                        k_out + (batch_index * KV_HEADS + kv_head) * D;
+                    const float L = static_cast<float>(
+                        position_offsets[batch_index]);
+                    #pragma clang loop unroll(full)
+                    for (int i = 0; i < 4; ++i) {
+                        const int pair = lane * 4 + i;
+                        const float d = static_cast<float>(pair)
+                            / static_cast<float>(D / 2);
+                        const float inv_freq =
+                            metal::exp2(-d * rope_log2_base[0]);
+                        const float theta = L * inv_freq;
+                        const float costheta = metal::fast::cos(theta);
+                        const float sintheta = metal::fast::sin(theta);
+                        const float x1 =
+                            static_cast<float>(normalized_row[pair]);
+                        const float x2 =
+                            static_cast<float>(normalized_row[pair + D / 2]);
+                        const T rx1 = static_cast<T>(
+                            x1 * costheta - x2 * sintheta);
+                        const T rx2 = static_cast<T>(
+                            x1 * sintheta + x2 * costheta);
+                        normalized_row[pair] = rx1;
+                        normalized_row[pair + D / 2] = rx2;
+                        if (block == GQA) {
+                            if (owns_item) {
+                                key_output[pair] = rx1;
+                                key_output[pair + D / 2] = rx2;
+                            }
+                        }
+                    }
+                }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                {
+                    const bool active = sg < nwalks;
+                    const int g = g0 + (active ? sg : 0);
+                    const int item = g / BLOCKS;
+                    const int block = g % BLOCKS;
+                    const int slot = item - item0;
+                    const int kv_head = item % KV_HEADS;
+                    const int batch_index = item / KV_HEADS;
+                    const int query_head = GQA * kv_head;
+                    const int batch_head = batch_index * 16 + query_head;
+                    const int owner_walk = item * BLOCKS + current_block;
+                    const bool owns_item = owner_walk >= g0 && owner_walk < g1;
+                    threadgroup T* local_queries =
+                        lq_all + (active ? slot : 0) * (GQA * D);
+                    threadgroup T* local_key = lk_all + (active ? slot : 0) * D;
+                    threadgroup T* local_value = lv_all + (active ? slot : 0) * D;
+                    (void)query_head; (void)batch_head; (void)owns_item;
+                    if (active) {
+
+                const device uint32_t* mirror_w = m0;
+                switch (batch_index) {
+                    case 1: mirror_w = m1; break;
+                    case 2: mirror_w = m2; break;
+                    case 3: mirror_w = m3; break;
+                    case 4: mirror_w = m4; break;
+                    case 5: mirror_w = m5; break;
+                    case 6: mirror_w = m6; break;
+                    case 7: mirror_w = m7; break;
+                    default: break;
+                }
+                const device uint32_t* mkeys_w =
+                    mirror_w + kv_head * N * row_words;
+                const device uint32_t* mvalues_w =
+                    mirror_w + (KV_HEADS + kv_head) * N * row_words;
+                const threadgroup T* new_key =
+                    local_key + lane * values_per_lane;
+                const threadgroup T* new_value =
+                    local_value + lane * values_per_lane;
+                const uint start = starts[batch_index];
+                const uint write_slot = (start + uint(N - 1)) % uint(N);
+
+                half khs = half(0.0f);
+                half khb = half(0.0f);
+                half vhs = half(0.0f);
+                half vhb = half(0.0f);
+                uint32_t kword = 0u;
+                uint32_t vword = 0u;
+                if (block == current_block) {
+                    float kmin = 3.402823466e+38F;
+                    float kmax = -3.402823466e+38F;
+                    float vmin = 3.402823466e+38F;
+                    float vmax = -3.402823466e+38F;
+                    float kv[values_per_lane];
+                    float vv[values_per_lane];
+                    const threadgroup T4* kvec =
+                        reinterpret_cast<const threadgroup T4*>(new_key);
+                    const threadgroup T4* vvec =
+                        reinterpret_cast<const threadgroup T4*>(new_value);
+                    #pragma unroll
+                    for (int q = 0; q < values_per_lane / 4; ++q) {
+                        const T4 kq4 = kvec[q];
+                        const T4 vq4 = vvec[q];
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            kv[q * 4 + j] = float(kq4[j]);
+                            vv[q * 4 + j] = float(vq4[j]);
+                            kmin = min(kmin, kv[q * 4 + j]);
+                            kmax = max(kmax, kv[q * 4 + j]);
+                            vmin = min(vmin, vv[q * 4 + j]);
+                            vmax = max(vmax, vv[q * 4 + j]);
+                        }
+                    }
+                    for (uint mask = 1; mask < 8; mask <<= 1) {
+                        kmin = min(kmin, simd_shuffle_xor(kmin, mask));
+                        kmax = max(kmax, simd_shuffle_xor(kmax, mask));
+                        vmin = min(vmin, simd_shuffle_xor(vmin, mask));
+                        vmax = max(vmax, simd_shuffle_xor(vmax, mask));
+                    }
+                    khs = half(max((kmax - kmin) / 15.0f, 1e-6f));
+                    khb = half(kmin);
+                    vhs = half(max((vmax - vmin) / 15.0f, 1e-6f));
+                    vhb = half(vmin);
+                    const float ks = float(khs);
+                    const float kb = float(khb);
+                    const float vs = float(vhs);
+                    const float vb = float(vhb);
+                    #pragma unroll
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float kq = metal::rint((kv[element] - kb) / ks);
+                        const float vq = metal::rint((vv[element] - vb) / vs);
+                        kword |= uint32_t(clamp(kq, 0.0f, 15.0f)) << (4 * element);
+                        vword |= uint32_t(clamp(vq, 0.0f, 15.0f)) << (4 * element);
+                    }
+
+                    device uint32_t* write_key =
+                        const_cast<device uint32_t*>(mkeys_w)
+                        + write_slot * row_words;
+                    device uint32_t* write_value =
+                        const_cast<device uint32_t*>(mvalues_w)
+                        + write_slot * row_words;
+                    write_key[lane] = kword;
+                    write_value[lane] = vword;
+                    if (lane % 8 == 0) {
+                        write_key[payload_words + lane / 8] =
+                            uint32_t(as_type<ushort>(khs))
+                            | (uint32_t(as_type<ushort>(khb)) << 16);
+                        write_value[payload_words + lane / 8] =
+                            uint32_t(as_type<ushort>(vhs))
+                            | (uint32_t(as_type<ushort>(vhb)) << 16);
+                    }
+                }
+                if (batch_index == 0 && kv_head == 0
+                    && block == current_block && lane == 0) {
+                    fence[0] = write_fence[0] + 1;
+                }
+
+                const threadgroup T* query =
+                    local_queries + lane * values_per_lane;
+                device T* partial = partials
+                    + size_t(item) * size_t(GQA * BLOCKS * D)
+                    + block * D + lane * values_per_lane;
+                device float* sum_out =
+                    pmeta + size_t(item) * size_t(2 * GQA * BLOCKS) + block;
+                device float* max_out = pmeta
+                    + size_t(item) * size_t(2 * GQA * BLOCKS) + GQA * BLOCKS + block;
+
+                thread float q_lo[values_per_lane];
+                thread float q_hi[values_per_lane];
+                thread float acc_lo[values_per_lane];
+                thread float acc_hi[values_per_lane];
+                const threadgroup T4* qvec =
+                    reinterpret_cast<const threadgroup T4*>(query);
+                const threadgroup T4* qvec_hi =
+                    reinterpret_cast<const threadgroup T4*>(query + D);
+                #pragma clang loop unroll(full)
+                for (int q = 0; q < values_per_lane / 4; ++q) {
+                    const T4 q4_lo = qvec[q];
+                    const T4 q4_hi = qvec_hi[q];
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        q_lo[q * 4 + j] = float(q4_lo[j]);
+                        q_hi[q * 4 + j] = float(q4_hi[j]);
+                    }
+                }
+                #pragma clang loop unroll(full)
+                for (int element = 0; element < values_per_lane; ++element) {
+                    acc_lo[element] = 0.0f;
+                    acc_hi[element] = 0.0f;
+                }
+
+                float max_lo = -3.402823466e+38F;
+                float max_hi = -3.402823466e+38F;
+                float sum_lo = 0.0f;
+                float sum_hi = 0.0f;
+                \(slidingSoftRefReferenceInit)
+                \(slidingAffineFoldPrologue)
+                \(residentSlidingWalk)
+
+                if (lane == 0) {
+                    sum_out[0] = sum_lo;
+                    max_out[0] = max_lo;
+                    sum_out[BLOCKS] = sum_hi;
+                    max_out[BLOCKS] = max_hi;
+                }
+                device T4* partial_vec_lo =
+                    reinterpret_cast<device T4*>(partial);
+                device T4* partial_vec_hi =
+                    reinterpret_cast<device T4*>(partial + BLOCKS * D);
+                #pragma clang loop unroll(full)
+                for (int q = 0; q < values_per_lane / 4; ++q) {
+                    T4 p4_lo, p4_hi;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        p4_lo[j] = T(acc_lo[q * 4 + j]\(slidingAffineFoldAccLo));
+                        p4_hi[j] = T(acc_hi[q * 4 + j]\(slidingAffineFoldAccHi));
+                    }
+                    partial_vec_lo[q] = p4_lo;
+                    partial_vec_hi[q] = p4_hi;
+                }
+                    }
+                }
+            """
+
+    /// First dispatch. Built only when a plan resolves.
+    private static let slidingSplitWalkKernel: MLXFast.MLXFastKernel? = {
+        guard let plan = slidingSplitPlan else { return nil }
+        return MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_sp1_walk_q4g64_d256_g2_normrope_v1",
+            inputNames: [
+                "raw_queries",
+                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+                "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
+                "position_offsets", "rope_log2_base", "write_fence",
+            ],
+            outputNames: ["fence", "k_out", "v_out", "partials", "pmeta"],
+            source: slidingSplitWalkSource,
+            ensureRowContiguous: true
+        )
+    }()
+
+    /// Items a contiguous span of walks can touch.
+    static var slidingSplitMaxItems: Int {
+        guard let plan = slidingSplitPlan else { return 1 }
+        let total = kvHeads * batch * plan.b
+        let span = (total + plan.t - 1) / plan.t
+        return (span + plan.b - 1) / plan.b + 1
+    }
+
     /// KVQ-PORT: `attendRing` reading the packed 8-bit mirror instead of the
     /// bf16 ring, with the result CONSUMED by pass B exactly as the stock
     /// road consumes it. This is the separate-write road only: the promoted
@@ -3645,6 +4332,82 @@ for (int element = 0; element < values_per_lane; ++element) {
                 let residentDTypes: [DType] = [
                     .bfloat16, .int32, .bfloat16, .bfloat16,
                 ]
+
+                //
+                // Two-dispatch road. A nil plan falls through to the dispatch below.
+                if let plan = slidingSplitPlan, let walkKernel = slidingSplitWalkKernel {
+                    let items = batch * kvHeads
+                    let walkTemplate: [(String, any KernelTemplateArg)] =
+                        residentTemplate + [
+                            ("BATCH", batch),
+                            ("TG_COUNT", plan.t),
+                            ("MAXITEMS", slidingSplitMaxItems),
+                        ]
+                    let walked = walkKernel(
+                        residentInputs,
+                        template: walkTemplate,
+                        grid: (plan.t * plan.w * 32, 1, 1),
+                        threadGroup: (plan.w * 32, 1, 1),
+                        outputShapes: [
+                            [1],
+                            [batch, kvHeads, 1, headDim],
+                            [batch, kvHeads, 1, headDim],
+                            [items, gqa * blocks * headDim],
+                            [items, 2 * gqa * blocks],
+                        ],
+                        outputDTypes: [
+                            .int32, .bfloat16, .bfloat16, .bfloat16, .float32,
+                        ]
+                    )
+                    let mergeInputs = [walked[3], walked[4]]
+                    let merged: [MLXArray]
+                    let mergedRunsum: MLXArray?
+                    if oRunsumFoldEnabled {
+                        merged = slidingSplitMergeORunsumKernel(
+                            mergeInputs,
+                            template: residentTemplate,
+                            grid: (kvHeads * blocks * 32, batch, 1),
+                            threadGroup: (blocks * 32, 1, 1),
+                            outputShapes: [
+                                [batch, queryHeads, 1, headDim],
+                                [batch, queryHeads * headDim / 64],
+                            ],
+                            outputDTypes: [.bfloat16, .float32]
+                        )
+                        mergedRunsum = merged[1]
+                        CBv2EngageMark.once("o-runsum-resident-fold")
+                    } else {
+                        merged = slidingSplitMergeKernel(
+                            mergeInputs,
+                            template: residentTemplate,
+                            grid: (kvHeads * blocks * 32, batch, 1),
+                            threadGroup: (blocks * 32, 1, 1),
+                            outputShapes: [[batch, queryHeads, 1, headDim]],
+                            outputDTypes: [.bfloat16]
+                        )
+                        mergedRunsum = nil
+                    }
+                    publishResidentProducts(
+                        ResidentProducts(
+                            runsumTable: mergedRunsum,
+                            normalizedKeys: walked[1],
+                            normalizedValues: walked[2]),
+                        for: merged[0])
+                    CBv2EngageMark.once("kvq4-fused-live-write")
+                    CBv2EngageMark.once("kvq4-resident-merge")
+                    CBv2EngageMark.once("kvq4-resident-norm-rope")
+                    CBv2EngageMark.once("sliding-split-g\(plan.t)-b\(plan.b)")
+                    if slidingPrefetchDepth2 && slidingPrefetchPeelEnabled {
+                        CBv2EngageMark.once("sliding-prefetch-pf2-tail-peel")
+                    }
+                    if slidingSoftRefWalks.applied {
+                        CBv2EngageMark.once("sliding-softmax-ref")
+                        if slidingAffineFoldActive {
+                            CBv2EngageMark.once("sliding-affine-fold")
+                        }
+                    }
+                    return (merged[0], walked[0])
+                }
                 let resident: [MLXArray]
                 let oRunsum: MLXArray?
                 if oRunsumFoldEnabled {

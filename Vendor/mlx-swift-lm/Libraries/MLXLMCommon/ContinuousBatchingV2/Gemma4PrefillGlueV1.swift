@@ -1,5 +1,6 @@
 // PREFILL-GLUE-001: single-dispatch fusion of the MoE decoder layer's serial
 // norm/residual glue on the PREFILL plane.
+// Independent current-crown TAILLANE replication; executable mechanism from public PR #2592.
 //
 // Every MoE layer runs a strictly serial chain of full-width elementwise and
 // row-reduction passes between its matmuls (`Gemma4DecoderLayer`):
@@ -912,6 +913,129 @@ public enum Gemma4PrefillGlueV1 {
         ensureRowContiguous: true
     )
 
+    /// TAILLANE: `..._EXPERT_TAIL_LANE_EXACT=0` restores the v6 kernel above.
+    private static let tailLaneExact: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_EXPERT_TAIL_LANE_EXACT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// One thread owns `GLUE_NREADS` features, so a thread's window is the
+    /// single `vec<T, 4>` at `base`. v6 also loaded and stored the vector at
+    /// `base + 4`, which is the next thread's window: every `h1`, `res2`, `out`
+    /// and `normed` element was touched twice, and the second half indexed
+    /// `av`, `tv` and `ov` one vector past their `GLUE_NREADS` extent.
+    private static let expertTailChainLaneKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_expert_unsort_tail_chain_2816_slotvec_v7",
+        inputNames: [
+            "sorted", "inverse_order", "route_weights", "h1",
+            "w1", "w2", "w3", "res2", "s", "wn",
+        ],
+        outputNames: ["out", "normed"],
+        source: """
+            threadgroup float local_sums_a[32];
+            threadgroup float local_sums_b[32];
+            threadgroup float local_inv2[2];
+
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+            const uint assignment_base = row * 8;
+
+            uint inv_orders[8];
+            float r_weights[8];
+            #pragma clang loop unroll(full)
+            for (uint slot = 0; slot < 8; ++slot) {
+                const uint assignment = assignment_base + slot;
+                inv_orders[slot] = (uint)inverse_order[assignment];
+                r_weights[slot] = (float)route_weights[assignment];
+            }
+
+            float av[GLUE_NREADS];
+            float bv[GLUE_NREADS];
+            const vec<T, 4> h1_v0 = *((const device vec<T, 4>*)(h1 + base));
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                av[i] = static_cast<float>(h1_v0[i]);
+            }
+
+            T accumulator[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                accumulator[i] = (T)0;
+            }
+            #pragma clang loop unroll(full)
+            for (uint slot = 0; slot < 8; ++slot) {
+                const size_t sorted_base =
+                    size_t(inv_orders[slot]) * GLUE_AXIS + lid * GLUE_NREADS;
+                const vec<T, 4> sv = *((const device vec<T, 4>*)(sorted + sorted_base));
+                const float r_weight = r_weights[slot];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    const T weighted = (T)((float)sv[i] * r_weight);
+                    accumulator[i] = accumulator[i] + weighted;
+                }
+            }
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                bv[i] = static_cast<float>(accumulator[i]);
+            }
+
+            float inv_a = 0;
+            float inv_b = 0;
+            glue_inv_rms2(
+                av, bv, local_sums_a, local_sums_b, local_inv2,
+                simd_lane_id, simd_group_id, GLUE_EPS, inv_a, inv_b);
+
+            float tv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T n1 = static_cast<T>(
+                    w1[j] * static_cast<T>(av[i] * inv_a));
+                const T n2 = static_cast<T>(
+                    w2[j] * static_cast<T>(bv[i] * inv_b));
+                tv[i] = static_cast<float>(static_cast<T>(n1 + n2));
+            }
+
+            const float inv_t = glue_inv_rms(
+                tv, local_sums_a, local_inv2,
+                simd_lane_id, simd_group_id, GLUE_EPS);
+
+            const T scalar = s[0];
+            const vec<T, 4> r2_v0 = *((const device vec<T, 4>*)(res2 + base));
+            float ov[GLUE_NREADS];
+            vec<T, 4> out_v0;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j0 = lid * GLUE_NREADS + i;
+                const T normed3_0 = static_cast<T>(w3[j0] * static_cast<T>(tv[i] * inv_t));
+                const T summed_0 = static_cast<T>(r2_v0[i] + normed3_0);
+                const T scaled_0 = static_cast<T>(summed_0 * scalar);
+                out_v0[i] = scaled_0;
+                ov[i] = static_cast<float>(scaled_0);
+            }
+            *((device vec<T, 4>*)(out + base)) = out_v0;
+
+            const float inv_n = glue_inv_rms(
+                ov, local_sums_a, local_inv2,
+                simd_lane_id, simd_group_id, GLUE_EPS);
+
+            vec<T, 4> normed_v0;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j0 = lid * GLUE_NREADS + i;
+                normed_v0[i] = wn[j0] * static_cast<T>(ov[i] * inv_n);
+            }
+            *((device vec<T, 4>*)(normed + base)) = normed_v0;
+        """,
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
     public static func branchTailChainedUnsort(
         h1: MLXArray,
         expert: WeightedExpertUnsortCarrier,
@@ -947,7 +1071,10 @@ public enum Gemma4PrefillGlueV1 {
         else { return nil }
 
         CBv2EngageMark.once("prefill-expert-tail-fuse")
-        let outputs = expertTailChainKernel(
+        if tailLaneExact {
+            CBv2EngageMark.once("prefill-expert-tail-lane")
+        }
+        let outputs = (tailLaneExact ? expertTailChainLaneKernel : expertTailChainKernel)(
             [
                 expert.sortedOutputs, expert.inverseOrder, expert.weights, h1,
                 w1, w2, w3, residual2, layerScalar, nextInputNormWeight,

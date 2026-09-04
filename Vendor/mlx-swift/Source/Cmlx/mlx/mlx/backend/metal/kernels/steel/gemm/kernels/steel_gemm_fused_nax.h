@@ -249,7 +249,7 @@ template <
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
-  constexpr short SK = 32;
+  constexpr short SK = 64;
 
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;

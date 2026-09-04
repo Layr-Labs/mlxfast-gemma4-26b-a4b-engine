@@ -4176,6 +4176,69 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// FULLKV-VONLY kill switch: `DARKBLOOM_GEMMA4_D512_QK_VONLY` set to
+    /// `0`/`false`/`no`/`off` restores dispatch 1's read of the STORED K
+    /// plane. Default ON.
+    ///
+    /// With the switch ON and the NORMROPE-D512 fold engaged, dispatch 1
+    /// reads the V plane only and rebuilds K in registers as
+    /// `RoPE_s(T(k_weight * V_s))` — the same expression, in the same order,
+    /// with the same BF16 rounding boundary the store dispatch used when it
+    /// wrote that slot (`ringStoreNormRopeKernel` above: the V store is
+    /// `T(1) * normalized`, which is the identity on BF16, and the K store is
+    /// `T(wv[i] * normalized)` followed by the two rotation expressions).
+    /// The store still writes the K plane, so every other reader — prefill,
+    /// the last-query arm, MTP, and the non-fold fallbacks below — is
+    /// untouched, and the cross-check has something to compare against.
+    static let qkVOnlyEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_QK_VONLY"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// FULLKV-VONLY cross-check: `DARKBLOOM_GEMMA4_D512_QK_VONLY_XCHECK` set
+    /// to `1`/`true`/`yes`/`on` selects a twin of dispatch 1 that ALSO reads
+    /// the stored K plane and counts the elements whose `float` bit pattern
+    /// differs from the reconstruction, per threadgroup. Default OFF: the
+    /// default path never binds the K planes, never allocates the counter,
+    /// and never syncs.
+    static let qkVOnlyXCheckEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_QK_VONLY_XCHECK"]
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }()
+
+    nonisolated(unsafe) private static var qkVOnlyXCheckDispatches = 0
+    nonisolated(unsafe) private static var qkVOnlyXCheckMismatches = 0
+    private static let qkVOnlyXCheckLock = NSLock()
+
+    /// Fold one XCHECK window (one dispatch) into the running totals and put
+    /// the result on stderr. Only reached when the XCHECK switch is armed, so
+    /// the `.item()` sync it costs is never on the measured path.
+    private static func reportVOnlyXCheck(_ counts: MLXArray, keyLength: Int) {
+        let mismatches = Int(MLX.sum(counts).item(Int32.self))
+        qkVOnlyXCheckLock.lock()
+        qkVOnlyXCheckDispatches += 1
+        qkVOnlyXCheckMismatches += mismatches
+        let dispatches = qkVOnlyXCheckDispatches
+        let total = qkVOnlyXCheckMismatches
+        qkVOnlyXCheckLock.unlock()
+        if mismatches != 0 {
+            FileHandle.standardError.write(
+                Data(
+                    ("[d512-qk-vonly-xcheck] MISMATCH \(mismatches) K elements "
+                        + "kL=\(keyLength) dispatch=\(dispatches) "
+                        + "cumulative=\(total)\n").utf8))
+        } else if dispatches % 64 == 0 {
+            FileHandle.standardError.write(
+                Data(
+                    ("[d512-qk-vonly-xcheck] ok dispatches=\(dispatches) "
+                        + "cumulative_mismatches=\(total)\n").utf8))
+        }
+    }
+
     /// Dispatch 1 — QKᵀ. Grid: (row, kv head, chunk of 4 virtual gemv
     /// threadgroups = 64 score rows) × 128 threads (4 simdgroups — exactly
     /// the stock gemv threadgroup shape). Each simdgroup replays the stock
@@ -4375,6 +4438,308 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         source: qkSource,
         ensureRowContiguous: true
     )
+
+    /// FULLKV-VONLY — dispatch 1 with the K plane rebuilt from the V plane.
+    ///
+    /// Geometry, traversal, accumulation order and the cross-lane fold are
+    /// the stock `qkSource` above, byte for byte. The ONLY difference is
+    /// where `k_tile` comes from: instead of a `T4` load out of the stored K
+    /// plane it is
+    ///
+    ///     x1 = float(T(k_weight[p]        * V[s][p]))
+    ///     x2 = float(T(k_weight[p + 256]  * V[s][p + 256]))
+    ///     theta = float(s) * (1.0f / rope_freqs[p])
+    ///     K[s][p]       = T(x1 * cos(theta) - x2 * sin(theta))
+    ///     K[s][p + 256] = T(x1 * sin(theta) + x2 * cos(theta))
+    ///
+    /// which is the store dispatch's own sequence with its own BF16 boundary
+    /// (`rounded[element] = T(wv[i] * normalized)`) reproduced in registers.
+    /// `s` is the slot index: the decode store writes slot `key_length - 1`
+    /// with `L = position_offsets[b]`, and `positionOffsets` is rebuilt from
+    /// `absoluteOffset = key_length - 1`; the prefill store writes slot
+    /// `absoluteOffset + l` with `L = row_position[l] + position_offsets[b]`.
+    /// Slot index and RoPE position are therefore the same number, and the
+    /// kernel reads it off `out_row` instead of a table.
+    ///
+    /// Lane ownership makes the rotation local: lane `l` owns columns
+    /// `{4l..4l+3} + {0,128,256,384}`, which is exactly the 8 pairs
+    /// `(p, p+256)` for `p` in `{4l..4l+3}` and `{4l+128..4l+131}`. Both
+    /// members of every pair are already in the lane, so no shuffle is added.
+    private static func qkVOnlySource(xcheck: Bool) -> String {
+        let keyPlane = xcheck ? """
+                    const device T* key_plane = k0;
+                    switch (row) {
+                        case 1: key_plane = k1; break;
+                        case 2: key_plane = k2; break;
+                        case 3: key_plane = k3; break;
+                        case 4: key_plane = k4; break;
+                        case 5: key_plane = k5; break;
+                        case 6: key_plane = k6; break;
+                        case 7: key_plane = k7; break;
+                        default: break;
+                    }
+                    key_plane += size_t(kv_head) * size_t(row_capacity) * D;
+                    threadgroup float xpartials[32];
+                    float mismatches = 0.0f;
+            """ : ""
+        let compare = xcheck ? """
+                            {
+                                const device T* kmat =
+                                    key_plane + size_t(out_row) * D;
+                                #pragma clang loop unroll(full)
+                                for (int i = 0; i < n_iter; ++i) {
+                                    #pragma clang loop unroll(full)
+                                    for (int tm = 0; tm < 4; ++tm) {
+                                        const T4 k_ref =
+                                            *reinterpret_cast<const device T4*>(
+                                                kmat + size_t(tm) * D
+                                                    + lane * 4 + i * 128);
+                                        #pragma clang loop unroll(full)
+                                        for (int t = 0; t < 4; ++t) {
+                                            const uint a = as_type<uint>(
+                                                static_cast<float>(
+                                                    k_tile[i][tm][t]));
+                                            const uint b = as_type<uint>(
+                                                static_cast<float>(k_ref[t]));
+                                            mismatches += (a == b) ? 0.0f : 1.0f;
+                                        }
+                                    }
+                                }
+                            }
+            """ : ""
+        let reduce = xcheck ? """
+                    {
+                        float total = simd_sum(mismatches);
+                        if (sg == 0) xpartials[lane] = 0.0f;
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        if (lane == 0) xpartials[sg] = total;
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        if (sg == 0) {
+                            total = simd_sum(xpartials[lane]);
+                            if (lane == 0) xcheck[z] = int(total);
+                        }
+                    }
+            """ : ""
+        return """
+            constexpr int D = 512;
+            constexpr int GQA = 8;
+            constexpr int HALF = D / 2;
+
+            const int key_length = int(params[0]);
+            const int in_vec_size = int(params[1]);
+
+            const int n_chunks = (key_length + 63) / 64;
+            const int z = int(threadgroup_position_in_grid.z);
+            const int chunk = z % n_chunks;
+            const int row_kv = z / n_chunks;
+            const int row = row_kv / 2;
+            const int kv_head = row_kv % 2;
+            const int sg = int(simdgroup_index_in_threadgroup);
+            const int lane = int(thread_index_in_simdgroup);
+
+            const int row_capacity = int(params[2 + row]);
+
+            const device T* value_plane = v0;
+            switch (row) {
+                case 1: value_plane = v1; break;
+                case 2: value_plane = v2; break;
+                case 3: value_plane = v3; break;
+                case 4: value_plane = v4; break;
+                case 5: value_plane = v5; break;
+                case 6: value_plane = v6; break;
+                case 7: value_plane = v7; break;
+                default: break;
+            }
+            value_plane += size_t(kv_head) * size_t(row_capacity) * D;
+        \(keyPlane)
+            const device T* query =
+                queries + size_t(row * 16 + kv_head * GQA) * D;
+            device T* score_rows =
+                scores + size_t(row * 16 + kv_head * GQA) * key_length;
+
+            const int virtual_groups = (key_length + 15) / 16;
+            const int vtg_lo = chunk * 4;
+            const int vtg_hi = min(vtg_lo + 4, virtual_groups);
+            constexpr int n_iter = D / 128;
+
+            typedef vec<T, 4> T4;
+            // The two column blocks this lane owns below HALF, and their
+            // partners above it. Loop-invariant over out_row, so the weight
+            // and frequency loads happen once per threadgroup, not once per
+            // key row.
+            T4 k_weight_lo[2];
+            T4 k_weight_hi[2];
+            float inv_freq[2][4];
+            #pragma clang loop unroll(full)
+            for (int hb = 0; hb < 2; ++hb) {
+                const int pair_base = lane * 4 + hb * 128;
+                k_weight_lo[hb] = *reinterpret_cast<const device T4*>(
+                    k_weight + pair_base);
+                k_weight_hi[hb] = *reinterpret_cast<const device T4*>(
+                    k_weight + pair_base + HALF);
+                #pragma clang loop unroll(full)
+                for (int t = 0; t < 4; ++t) {
+                    inv_freq[hb][t] = 1.0f / rope_freqs[pair_base + t];
+                }
+            }
+
+            for (int vtg = vtg_lo; vtg < vtg_hi; ++vtg) {
+                int out_row = vtg * 16 + sg * 4;
+                if (out_row >= key_length) continue;
+                out_row = out_row + 4 <= key_length
+                    ? out_row : key_length - 4;
+
+                const device T* vmat = value_plane + size_t(out_row) * D;
+                // XFOLD: one flat accumulator over the same 32 partial sums,
+                // so the cross-lane fold below can address the whole set with
+                // compile-time indices.
+                float result[GQA * 4] = {0.0f};
+                float q_coeff[4];
+                // KTILE, rebuilt: [i][tm] is the 4-wide slice of key row
+                // out_row + tm at columns lane*4 + i*128, i.e. exactly the
+                // `T4` the stored-K read used to fetch at that point.
+                T4 k_tile[n_iter][4];
+                #pragma clang loop unroll(full)
+                for (int hb = 0; hb < 2; ++hb) {
+                    const int pair_base = lane * 4 + hb * 128;
+                    #pragma clang loop unroll(full)
+                    for (int tm = 0; tm < 4; ++tm) {
+                        const device T* vrow = vmat + size_t(tm) * D;
+                        const T4 v_lo = *reinterpret_cast<const device T4*>(
+                            vrow + pair_base);
+                        const T4 v_hi = *reinterpret_cast<const device T4*>(
+                            vrow + pair_base + HALF);
+                        // Slot index IS the RoPE position; see the doc
+                        // comment above.
+                        const float L = static_cast<float>(out_row + tm);
+                        #pragma clang loop unroll(full)
+                        for (int t = 0; t < 4; ++t) {
+                            // The store dispatch's BF16 boundary, reproduced
+                            // before any RoPE arithmetic reads the value.
+                            const T rounded_lo =
+                                T(k_weight_lo[hb][t] * v_lo[t]);
+                            const T rounded_hi =
+                                T(k_weight_hi[hb][t] * v_hi[t]);
+                            const float inv = inv_freq[hb][t];
+                            const float theta = L * inv;
+                            const float costheta = metal::fast::cos(theta);
+                            const float sintheta = metal::fast::sin(theta);
+                            const float x1 =
+                                static_cast<float>(rounded_lo);
+                            const float x2 =
+                                static_cast<float>(rounded_hi);
+                            const float rx1 = x1 * costheta - x2 * sintheta;
+                            const float rx2 = x1 * sintheta + x2 * costheta;
+                            k_tile[hb][tm][t] = static_cast<T>(rx1);
+                            k_tile[hb + 2][tm][t] = static_cast<T>(rx2);
+                        }
+                    }
+                }
+        \(compare)
+                int bn = lane * 4;
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < n_iter; ++i) {
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        const T4 q_raw = *reinterpret_cast<const device T4*>(
+                            query + h * D + bn);
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            q_coeff[tn] = static_cast<float>(q_raw[tn]);
+                        }
+                        #pragma clang loop unroll(full)
+                        for (int tm = 0; tm < 4; ++tm) {
+                            #pragma clang loop unroll(full)
+                            for (int tn = 0; tn < 4; ++tn) {
+                                result[h * 4 + tm] +=
+                                    k_tile[i][tm][tn] * q_coeff[tn];
+                            }
+                        }
+                    }
+                    bn += 128;
+                }
+                // XFOLD: unchanged from `qkSource` — same butterfly, same
+                // merge hierarchy, same landing.
+                {
+                    const bool hi = (lane & 16) != 0;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 16; ++j) {
+                        const float a = result[j];
+                        const float b = result[16 + j];
+                        result[j] = (hi ? b : a)
+                            + simd_shuffle_xor(hi ? a : b, ushort(16));
+                    }
+                }
+                {
+                    const bool hi = (lane & 8) != 0;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 8; ++j) {
+                        const float a = result[j];
+                        const float b = result[8 + j];
+                        result[j] = (hi ? b : a)
+                            + simd_shuffle_xor(hi ? a : b, ushort(8));
+                    }
+                }
+                {
+                    const bool hi = (lane & 4) != 0;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        const float a = result[j];
+                        const float b = result[4 + j];
+                        result[j] = (hi ? b : a)
+                            + simd_shuffle_xor(hi ? a : b, ushort(4));
+                    }
+                }
+                {
+                    const bool hi = (lane & 2) != 0;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 2; ++j) {
+                        const float a = result[j];
+                        const float b = result[2 + j];
+                        result[j] = (hi ? b : a)
+                            + simd_shuffle_xor(hi ? a : b, ushort(2));
+                    }
+                }
+                {
+                    const bool hi = (lane & 1) != 0;
+                    const float a = result[0];
+                    const float b = result[1];
+                    result[0] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(1));
+                }
+                score_rows[size_t(lane >> 2) * key_length + out_row
+                    + (lane & 3)] = static_cast<T>(result[0]);
+            }
+        \(reduce)
+        """
+    }
+
+    private static let qkVOnlyFencedKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_d512_qk_fenced_vonly_bf16_g8_xfold_v1",
+            inputNames: [
+                "queries",
+                "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+                "params", "k_weight", "rope_freqs", "store_fence",
+            ],
+            outputNames: ["scores"],
+            source: qkVOnlySource(xcheck: false),
+            ensureRowContiguous: true
+        )
+
+    private static let qkVOnlyFencedXCheckKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_d512_qk_fenced_vonly_xcheck_bf16_g8_v1",
+            inputNames: [
+                "queries",
+                "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+                "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+                "params", "k_weight", "rope_freqs", "store_fence",
+            ],
+            outputNames: ["scores", "xcheck"],
+            source: qkVOnlySource(xcheck: true),
+            ensureRowContiguous: true
+        )
 
     /// Dispatch 2 — softmax. A verbatim transcription of
     /// `softmax_single_row` (block_softmax_precise, AccT=float, N_READS=4)
@@ -6093,6 +6458,12 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let liveQueries: MLXArray
         var normalizedKeys: MLXArray? = nil
         var normalizedValues: MLXArray? = nil
+        // FULLKV-VONLY carries the two extra kernel inputs only when the
+        // NORMROPE-D512 fold actually ran: they are the very arrays the store
+        // dispatch just used, so a fold miss leaves dispatch 1 on the stored
+        // K plane with no way to reconstruct and no need to.
+        var vonlyKWeight: MLXArray? = nil
+        var vonlyRopeFreqs: MLXArray? = nil
         if normRopeFoldEnabled,
             let normRope = takeFullNormRope(
                 queries: queries, keys: keys, values: values)
@@ -6124,6 +6495,10 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             normalizedKeys = stored[2]
             normalizedValues = stored[3]
             CBv2EngageMark.once("d512-normrope-store")
+            if qkVOnlyEnabled {
+                vonlyKWeight = normRope.kWeight
+                vonlyRopeFreqs = normRope.ropeFrequencies
+            }
         } else {
             storeFence = ringStoreKernel(
                 keyBuffers + valueBuffers
@@ -6138,14 +6513,46 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         }
 
         let chunks = (keyLength + 63) / 64
-        let scores = qkFencedKernel(
-            [liveQueries] + keyBuffers + [paramsArray, storeFence],
-            template: template,
-            grid: (32, 4, batch * kvHeads * chunks),
-            threadGroup: (32, 4, 1),
-            outputShapes: [scratchShape],
-            outputDTypes: [.bfloat16]
-        )[0]
+        let scores: MLXArray
+        if let kWeight = vonlyKWeight, let ropeFreqs = vonlyRopeFreqs {
+            // FULLKV-VONLY: same grid, same threadgroup, same outputs — the
+            // K planes are simply not bound. `storeFence` still orders the
+            // in-place store, which now feeds this dispatch through the V
+            // planes instead of the K planes.
+            if qkVOnlyXCheckEnabled {
+                let checked = qkVOnlyFencedXCheckKernel(
+                    [liveQueries] + valueBuffers + keyBuffers
+                        + [paramsArray, kWeight, ropeFreqs, storeFence],
+                    template: template,
+                    grid: (32, 4, batch * kvHeads * chunks),
+                    threadGroup: (32, 4, 1),
+                    outputShapes: [scratchShape, [batch * kvHeads * chunks]],
+                    outputDTypes: [.bfloat16, .int32]
+                )
+                scores = checked[0]
+                reportVOnlyXCheck(checked[1], keyLength: keyLength)
+            } else {
+                scores = qkVOnlyFencedKernel(
+                    [liveQueries] + valueBuffers
+                        + [paramsArray, kWeight, ropeFreqs, storeFence],
+                    template: template,
+                    grid: (32, 4, batch * kvHeads * chunks),
+                    threadGroup: (32, 4, 1),
+                    outputShapes: [scratchShape],
+                    outputDTypes: [.bfloat16]
+                )[0]
+            }
+            CBv2EngageMark.once("d512-qk-vonly")
+        } else {
+            scores = qkFencedKernel(
+                [liveQueries] + keyBuffers + [paramsArray, storeFence],
+                template: template,
+                grid: (32, 4, batch * kvHeads * chunks),
+                threadGroup: (32, 4, 1),
+                outputShapes: [scratchShape],
+                outputDTypes: [.bfloat16]
+            )[0]
+        }
 
         let softmaxThreads = ((keyLength + 3) / 4 + 31) / 32 * 32
         let probs = softmaxActive(

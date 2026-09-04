@@ -49,7 +49,7 @@ public enum CBv2AttentionOQMVV1 {
     public static let unroll4Enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_OPROJ_UNROLL4"]
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 

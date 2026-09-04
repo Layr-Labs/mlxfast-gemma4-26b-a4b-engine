@@ -59,7 +59,7 @@ public enum CBv2AttentionQKVMMA8V1 {
     public static let fp16DequantEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_MMA8_FP16_DEQUANT"]
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 

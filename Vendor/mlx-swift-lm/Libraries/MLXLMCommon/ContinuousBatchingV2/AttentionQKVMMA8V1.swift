@@ -67,6 +67,19 @@ public enum CBv2AttentionQKVMMA8V1 {
     /// registered name never outlives the body it was compiled from.
     static let fp16DequantKeySuffix = fp16DequantEnabled ? "_h1" : ""
 
+    /// QKV-V-RSP1: the standalone V planes are only 1024 or 2048 columns.
+    /// Select the existing single-tile run-sum body for those widths so the
+    /// ranked M5 Max receives twice as many threadgroups with a smaller live
+    /// accumulator set. Fused Q|K retains the promoted two-tile body.
+    private static let vRspSingleTileEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_V_RSP1"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    // Ranked replication marker R2; comments do not enter the Metal source.
+
     /// H1-ATTN: the A-side fill of the 4-bit MMA8 step, shared verbatim by the
     /// Q/K/V bodies here and the o_proj bodies in `AttentionOQMVV1.swift` (the
     /// two files carried byte-identical copies of this macro; they now carry
@@ -1115,6 +1128,19 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             && rsTable!.shape == [batch, inputWidth / Self.groupSize]
 
         let yTiles = outputWidth / outputsPerGroup
+        if vRspSingleTileEnabled, tableReady,
+            outputWidth == 1024 || outputWidth == 2048
+        {
+            CBv2EngageMark.once("qkv-v-rsp1")
+            return mma8RspKernel(
+                [x, weight, scales, biases, rsTable!],
+                template: [("T", x.dtype)],
+                grid: (simdWidth, yTiles * simdGroups, 1),
+                threadGroup: (simdWidth, simdGroups, 1),
+                outputShapes: [[batch, sequence, outputWidth]],
+                outputDTypes: [x.dtype]
+            )[0]
+        }
         if multiTileEnabled, yTiles % tilesPerGroup == 0 {
             if tableReady {
                 return multiTileRspKernel(

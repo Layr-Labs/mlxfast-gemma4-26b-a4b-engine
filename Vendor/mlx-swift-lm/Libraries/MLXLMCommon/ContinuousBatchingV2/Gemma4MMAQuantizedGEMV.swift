@@ -2617,17 +2617,16 @@ public enum Gemma4MMAQuantizedGEMV {
     /// The affine bias is NOT carried. Version 13 batched it out of the group
     /// walk into one rank-8 MMA per eight groups, so there is no per-group
     /// bias read left in this body to move.
-    private static let sourceV27Carry: String = {
-        var result = sourceV27
+    private static func headCarryRewrite(_ source: String) -> String? {
+        var result = source
 
-        func replaceOnce(_ old: String, with new: String) {
-            let count = result.components(separatedBy: old).count
-            precondition(
-                count == 2, "sourceV27Carry replacement count \(count): \(old)")
+        func replaceOnce(_ old: String, with new: String) -> Bool {
+            guard result.components(separatedBy: old).count == 2 else { return false }
             result = result.replacingOccurrences(of: old, with: new)
+            return true
         }
 
-        replaceOnce(
+        guard replaceOnce(
             """
             simdgroup_matrix<float, 8, 8> acc0 = simdgroup_matrix<float, 8, 8>(0.0f);
             simdgroup_matrix<float, 8, 8> acc1 = simdgroup_matrix<float, 8, 8>(0.0f);
@@ -2680,9 +2679,9 @@ public enum Gemma4MMAQuantizedGEMV {
                 carryS3 = fragmentSRow3[0];
             }
             """
-        )
+        ) else { return nil }
 
-        replaceOnce(
+        guard replaceOnce(
             """
                 const uint packedWord0 =
                     (sgN0 + fragmentRow) * W_ROW_U32 + g * (GROUP / 8);
@@ -2744,8 +2743,17 @@ public enum Gemma4MMAQuantizedGEMV {
                 carryS2 = fragmentSRow2[gNext];
                 carryS3 = fragmentSRow3[gNext];
             """
-        )
+        ) else { return nil }
 
+        return result
+    }
+
+    /// The promoted carry body. A derivation mismatch here is a build error,
+    /// not a silent fallback: this arm is shipped.
+    private static let sourceV27Carry: String = {
+        guard let result = headCarryRewrite(sourceV27) else {
+            preconditionFailure("sourceV27Carry replacement mismatch")
+        }
         return result
     }()
 
@@ -3122,6 +3130,9 @@ public enum Gemma4MMAQuantizedGEMV {
         let logits: MLXFast.MLXFastKernel
         let carry: MLXFast.MLXFastKernel
         let argmax: MLXFast.MLXFastKernel
+        /// HEAD-ARGMAX-CARRY-037. Optional on purpose: a derivation mismatch
+        /// here must leave the three promoted twins exactly as they are.
+        let argmaxCarry: MLXFast.MLXFastKernel?
     }
 
     /// The three `_rl1` twins, or nil when the switch is off or a derivation
@@ -3158,7 +3169,18 @@ public enum Gemma4MMAQuantizedGEMV {
                 outputNames: ["pv", "pi"],
                 source: argmax,
                 header: "#include <metal_simdgroup_matrix>\n",
-                ensureRowContiguous: true))
+                ensureRowContiguous: true),
+            argmaxCarry: sourceV27ArgmaxCarry
+                .flatMap { relayoutRewrite($0, relayoutCarryLanePairs) }
+                .map { carried in
+                    MLXFast.metalKernel(
+                        name: "gemma4_mma_affine4_qmv_m8_v27_argmax_carry_v1_rl1",
+                        inputNames: ["x", "w", "scales", "biases", "xSums"],
+                        outputNames: ["pv", "pi"],
+                        source: carried,
+                        header: "#include <metal_simdgroup_matrix>\n",
+                        ensureRowContiguous: true)
+                })
     }()
 
     private static let relayoutLock = NSLock()
@@ -3472,6 +3494,65 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
+    // MARK: - HEAD-ARGMAX-CARRY-037 --- the carry the argmax path never took
+
+    /// `false` only when `DARKBLOOM_GEMMA4_HEAD_ARGMAX_CARRY` is an explicit
+    /// off value. Off restores `kernelV27Argmax` and the `_argmax_rl1` twin,
+    /// their sources and their names byte for byte in the same executable.
+    private static let argmaxCarryEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_HEAD_ARGMAX_CARRY"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
+    /// HEAD-ARGMAX-CARRY-037. `sourceV27Carry` is `sourceV27` with the weight
+    /// operands carried one group ahead; `sourceV27Argmax` is `sourceV27` with
+    /// the vocabulary store replaced by the in-register top-1 fold. The two
+    /// rewrites anchor on DISJOINT regions of the same body --- the carry on
+    /// the accumulator declarations and on the per-group packed read inside
+    /// the walk, the fold on the store epilogue that runs after the walk ends
+    /// --- so `headCarryRewrite` applies to the folded body unchanged and the
+    /// accumulation region of the result is byte for byte `sourceV27Carry`'s.
+    ///
+    /// This is the arm decode actually takes. `apply()` consults
+    /// `carryEnabled` and has shipped the carry on the logits path since
+    /// MMA-HEAD-CARRY-013; `applyArgmax()` never consulted it, so the tied
+    /// head --- one dispatch per step, and the largest per-dispatch cost in
+    /// the decode window --- has been running the carry-less body while its
+    /// carry twin sits registered, gated, relayout-rewritten and never
+    /// dispatched.
+    ///
+    /// Exactness: the carry changes WHEN a weight operand is read, never
+    /// which value, in what order, or where it rounds. `gNext` is clamped to
+    /// the last valid group so the final look-ahead re-reads a group already
+    /// read and discards it at loop exit, and the `g >= N_GROUPS` trips of the
+    /// unrolled tail block neither consume nor advance the carry. `acc0...acc3`
+    /// are therefore the incumbent's accumulators bit for bit, and the top-1
+    /// fold above them is a pure function of `thread_elements()`.
+    /// `DARKBLOOM_GEMMA4_HEAD_RELAYOUT_XCHECK=1` diffs `pv` and `pi` word for
+    /// word against `kernelV27Argmax` on this exact path; that, not the hand
+    /// argument, is what settles it.
+    ///
+    /// Optional on purpose: a derivation mismatch leaves the promoted argmax
+    /// twin in place instead of trapping inside a lazy static.
+    private static let sourceV27ArgmaxCarry: String? =
+        headCarryRewrite(sourceV27Argmax)
+
+    private static let kernelV27ArgmaxCarry: MLXFast.MLXFastKernel? =
+        sourceV27ArgmaxCarry.map { carried in
+            MLXFast.metalKernel(
+                name: "gemma4_mma_affine4_qmv_m8_v27_argmax_carry_v1",
+                inputNames: ["x", "w", "scales", "biases", "xSums"],
+                outputNames: ["pv", "pi"],
+                source: carried,
+                header: "#include <metal_simdgroup_matrix>\n",
+                ensureRowContiguous: true)
+        }
+
     /// Stage two. One simdgroup per activation row folds that row's `NT`
     /// threadgroup records under the same total order and emits the token id.
     private static let argmaxReduceKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
@@ -3588,8 +3669,17 @@ public enum Gemma4MMAQuantizedGEMV {
         let plane: MLXArray
         if let relaid = relayoutKernels {
             CBv2EngageMark.once("head-relayout")
-            headKernel = relaid.argmax
+            if argmaxCarryEnabled, let carried = relaid.argmaxCarry {
+                CBv2EngageMark.once("head-argmax-carry")
+                headKernel = carried
+            } else {
+                headKernel = relaid.argmax
+            }
             plane = relayoutPlane(for: w, k: k, n: n)
+        } else if argmaxCarryEnabled, let carried = kernelV27ArgmaxCarry {
+            CBv2EngageMark.once("head-argmax-carry")
+            headKernel = carried
+            plane = w
         } else {
             headKernel = kernelV27Argmax
             plane = w

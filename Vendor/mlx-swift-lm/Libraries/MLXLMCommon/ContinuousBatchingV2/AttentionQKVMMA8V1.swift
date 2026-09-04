@@ -49,61 +49,29 @@ public enum CBv2AttentionQKVMMA8V1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// H1-ATTN arm. Default ON. Applies to the Q/K/V host and the o_proj host
-    /// in `AttentionOQMVV1.swift`; both read the same env so a submission runs
-    /// one policy.
-    /// `DARKBLOOM_GEMMA4_MMA8_FP16_DEQUANT=0` restores the promoted
-    /// integer-convert A-side fill byte for byte in the same executables: in
-    /// the off state the header text and every registration name are the
-    /// incumbent's, so the off arm is the incumbent kernel, not a twin of it.
-    public static let fp16DequantEnabled: Bool = {
+    /// MMA-RSP-CARRY-036. Restores the two-deep weight-operand register carry
+    /// to the run-sum-prepass bodies, which lost it when they were written
+    /// fresh instead of derived from the carrying multi-tile body. The two
+    /// fused dispatches still CLAIM it in their registration keys --
+    /// `..._carry2_qk6144_rsp_v1`, `..._carry2_qk9216_rsp_v1` -- over a body
+    /// that reads `wv`, `s` and `b` in place with nothing in flight ahead of
+    /// the dependent extract_bits -> A -> simdgroup_multiply_accumulate chain.
+    ///
+    /// `=0` selects `mma8KernelHeader` and the un-suffixed names, restoring
+    /// the promoted bodies byte for byte in the same executable.
+    public static let rspCarryEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_MMA8_FP16_DEQUANT"]
-        else { return true }
+            "DARKBLOOM_GEMMA4_MMA8_RSP_CARRY"]
+        else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// Registration-key suffix for the H1 arm, empty in the off state, so a
-    /// registered name never outlives the body it was compiled from.
-    static let fp16DequantKeySuffix = fp16DequantEnabled ? "_h1" : ""
+    /// A changed body takes a changed name: `CustomKernel::eval_gpu` caches
+    /// compiled pipelines by name and calls `clear_library(name_)` on a
+    /// name/source mismatch, so the two emissions must never share a name.
+    /// Cumulative-append convention, as `tbSuffix` uses in the glue family.
+    public static let rspCarryKey: String = rspCarryEnabled ? "_rc2" : ""
 
-    /// H1-ATTN: the A-side fill of the 4-bit MMA8 step, shared verbatim by the
-    /// Q/K/V bodies here and the o_proj bodies in `AttentionOQMVV1.swift` (the
-    /// two files carried byte-identical copies of this macro; they now carry
-    /// one).
-    ///
-    /// `float(n)` for a nibble `n` is an integer-to-float convert.
-    /// `0x6400 | n` is the half bit pattern of `1024 + n` for every `n` in
-    /// 0...15: the exponent field is 25 and the bias is 15, so the value is
-    /// `2^10 * (1 + n / 1024)` and the four nibble bits land in the low
-    /// mantissa. `(1024 + n) - 1024` is then exact in half, because both
-    /// operands and the result are exactly representable there. So
-    /// `A.thread_elements()` receives the same float it received before, in
-    /// the same order, into the same unchanged
-    /// `simdgroup_multiply_accumulate` chain -- built in the fp16 pipe instead
-    /// of the integer one. No address is formed, no load moves, no barrier is
-    /// added and no accumulation is reordered.
-    ///
-    /// Only this SUBTRACTION form is exact. Folding the 1024 into the affine
-    /// bias (`b2 = fma(s, -1024, b)`) rounds twice -- `1024 * s + n * s` is
-    /// not `n * s` -- and is a different number. It is also the cheaper of the
-    /// two in AIR, which is exactly what makes it dangerous.
-    ///
-    /// The constant carries its own surrounding blank lines so that the two
-    /// halves of each header rejoin byte for byte.
-    static let mma8StepMacro = fp16DequantEnabled ? """
-
-
-#define MMA8_STEP(BB, J) A.thread_elements()[0] = float(as_type<half>(ushort(0x6400u | extract_bits(wv.x, 4 * (J), 4))) - 1024.0h); A.thread_elements()[1] = float(as_type<half>(ushort(0x6400u | extract_bits(wv.y, 4 * (J), 4))) - 1024.0h); simdgroup_multiply_accumulate(C, A, BB, C);
-
-
-""" : """
-
-
-#define MMA8_STEP(BB, J) A.thread_elements()[0] = float(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = float(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, BB, C);
-
-
-"""
 
     private static let batch = 8
     private static let sequence = 1
@@ -114,10 +82,7 @@ public enum CBv2AttentionQKVMMA8V1 {
     private static let simdGroups = 2
     private static let outputsPerGroup = 8
 
-    private static let mma8KernelHeader =
-        mma8KernelHeaderPrefix + mma8StepMacro + mma8KernelHeaderSuffix
-
-    private static let mma8KernelHeaderPrefix = """
+    private static let mma8KernelHeader = """
 #include <metal_simdgroup_matrix>
 
 #ifndef METAL_FUNC
@@ -178,9 +143,9 @@ inline float mma8_runsum4(uint4 r) {
 }
 
 #define MMA8_SETB(BB, W, HI) BB.thread_elements()[0] = mma8_##HI<T>(r0.W); BB.thread_elements()[1] = mma8_##HI<T>(r1.W);
-"""
 
-    private static let mma8KernelHeaderSuffix = """
+#define MMA8_STEP(BB, J) A.thread_elements()[0] = float(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = float(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, BB, C);
+
 template <typename T, int KS, int KFIX>
 METAL_FUNC void qkv_mma8_affine4_g64_impl(
     const device uint32_t* w,
@@ -707,9 +672,184 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     /// where the amortisation stops paying for the extra live registers.
     private static let tilesPerGroup = 2
 
+    // MARK: - QKV-V-TILES1-040 --- the registered single-tile body decode never takes
+
+    /// `false` only when `DARKBLOOM_GEMMA4_QKV_V_SINGLE_TILE` is an explicit
+    /// off value. Off restores the multi-tile routing and its dispatch
+    /// geometry exactly; no kernel source or name moves in either arm.
+    private static let vSingleTileEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_V_SINGLE_TILE"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
+    /// QKV-V-TILES1-040. `mma8RspKernel`
+    /// (`..._tight_k2816_rsp_v1`) is registered, compiled and reached on
+    /// NOTHING: its only route is the `else` of `yTiles % tilesPerGroup == 0`,
+    /// and every live output width here (1024, 2048, 4096, 8192) divides by 8
+    /// into an EVEN `yTiles`, so the multi-tile branch always wins. This ships
+    /// **zero new kernel text** --- both bodies are already in the metallib.
+    ///
+    /// The V projection is the plane that wants it. At N = 2048 the multi-tile
+    /// route launches `2048 / 8 / 2 = 128` threadgroups, against Q|K's 384 for
+    /// the same per-threadgroup work, and `GOLD-PROFILE` puts it at **208 GB/s,
+    /// 51 % of this part's read roof --- the worst kernel on the plane**, with
+    /// achieved bandwidth tracking threadgroup count almost monotonically
+    /// across the whole table. Single-tile launches **256**.
+    ///
+    /// Occupancy therefore moves the RIGHT way here, which is the exact
+    /// inverse of `ROUTER-QUAD` (killed for halving active threadgroups on an
+    /// occupancy-bound plane). Naming the sign is the point: a register table
+    /// cannot show it.
+    ///
+    /// Exactness, by construction and per output element. Multi-tile tile `t`
+    /// of the threadgroup based at `n0` addresses column `n0 + t * 8`; with
+    /// `outputsPerGroup = 8` the threadgroup based at `j * 16` therefore covers
+    /// columns `j * 16` and `j * 16 + 8` --- precisely the columns single-tile
+    /// threadgroups `2j` and `2j + 1` cover. Both bodies then derive `g0`,
+    /// `nGroups`, `x0`, `x1` and `rs` by identical expressions, walk `g` in the
+    /// same ascending order over the same range, and close `KS == 2` through
+    /// the same `red` reduction. **No sum is repartitioned; only which
+    /// threadgroup owns which output tile changes.** No float is touched, no
+    /// tolerance budget is spent, and the dispatch COUNT is unchanged --- this
+    /// is a launch-geometry change, not a deletion.
+    private static let vSingleTileWidth = 2048
+
+    // MARK: - SINGLETILE-CARRY-041 --- the carry, on the body V-TILES1 routes to
+
+    /// `false` only when `DARKBLOOM_GEMMA4_QKV_SINGLETILE_CARRY` is an
+    /// explicit off value. Off restores `mma8KernelHeader`, the incumbent
+    /// `..._tight_k2816_rsp_v1` body and its name byte for byte.
+    private static let singleTileCarryEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_SINGLETILE_CARRY"]
+        else { return false }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
+    /// SINGLETILE-CARRY-041. `QKV-V-TILES1-040` routes the V plane to the
+    /// single-tile `qkv_mma8_affine4_g64_rsp` body for its 256 threadgroups.
+    /// `MMA-RSP-CARRY-036` puts the two-deep
+    /// weight/scale/bias carry into `qkv_mma8_affine4_g64_mt_rsp` --- and its
+    /// anchor is the `wrow[t]` TILES form, which exists ONLY in the multi-tile
+    /// body. Composed, the two collide: the V plane takes the single-tile body
+    /// and the carry stops reaching it, so the carry's reach falls from 7.2 %
+    /// of the decode round to 5.4 % and the plane's 1.8 % is claimed once
+    /// instead of twice. Measured on a composed tape, not argued.
+    ///
+    /// The two are not actually exclusive. The single-tile body reads
+    /// `wrow`/`srow`/`brow` as SCALARS where `_mt_rsp` reads `wrow[t]`, so the
+    /// same carry transplants by the same route with the tile loop dropped.
+    /// This is that transplant: the V plane gets 256 threadgroups **and** the
+    /// carry, and the shelf stops having to choose.
+    ///
+    /// Exactness, identical to the multi-tile argument it is derived from. The
+    /// carry moves WHEN a weight, scale or bias is read, never which value, in
+    /// what order, or where it rounds. By induction on `gi`: the prologue
+    /// primes `wv_next = W(g0)` and `wv_next2 = W(g0 + min(1, nGroups - 1))`,
+    /// and each trip consumes `wv_next` then rotates `wv_next2` into it, so
+    /// trip `k` consumes exactly `W(g0 + k)` --- the value the in-place read
+    /// produced. `min(gi + 1, ...)` and `min(gi + 2, ...)` clamp the last two
+    /// look-aheads onto `g0 + nGroups - 1`, a group already read, whose value
+    /// is discarded at loop exit; at `K = 2816`, `G = 44` and `gh = 22`, so the
+    /// clamp lands on 21 or 43 and never leaves the simdgroup's own range.
+    /// `r0`, `r1`, `rs`, the eight `MMA8_SETB`/`MMA8_STEP` pairs, the
+    /// `acc0 += s * C + rs.x * b` close and the `KS == 2` reduction are the
+    /// incumbent's statements, unmoved. **No float is reassociated and no
+    /// tolerance budget is spent.**
+    ///
+    /// The read stays at the statement the incumbent load already occupied ---
+    /// the same discipline `MMA-HEAD-CARRY-013` documents, where moving it to
+    /// the top of the body instead perturbed the close's floating-point
+    /// contraction.
+    private static let mma8SingleTileCarryHeader: String? = {
+        var result = mma8KernelHeader
+        func replaceOnce(_ old: String, with new: String) -> Bool {
+            guard result.components(separatedBy: old).count == 2 else { return false }
+            result = result.replacingOccurrences(of: old, with: new)
+            return true
+        }
+        guard replaceOnce(
+            """
+              float acc0 = 0.0f;
+              float acc1 = 0.0f;
+              simdgroup_float8x8 A;
+              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+            #pragma unroll
+              for (int gi = 0; gi < nGroups; ++gi) {
+                const int g = g0 + gi;
+                const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+                const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+                const float2 rs = float2(
+                    rs_table[c.fn * G + g], rs_table[(c.fn + 1) * G + g]);
+            """,
+            with: """
+              float acc0 = 0.0f;
+              float acc1 = 0.0f;
+              simdgroup_float8x8 A;
+              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+              // SINGLETILE-CARRY: weight, scale and bias carried two groups
+              // ahead. Every address is a function of the group index alone.
+              uint2 wv_next = *((const device uint2*)(wrow + 32 * g0));
+              uint2 wv_next2 =
+                  *((const device uint2*)(wrow + 32 * (g0 + min(1, nGroups - 1))));
+              T s_next = srow[g0];
+              T b_next = brow[g0];
+
+            #pragma unroll
+              for (int gi = 0; gi < nGroups; ++gi) {
+                const int g = g0 + gi;
+                const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+                const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+                const float2 rs = float2(
+                    rs_table[c.fn * G + g], rs_table[(c.fn + 1) * G + g]);
+            """
+        ) else { return nil }
+        guard replaceOnce(
+            """
+                const uint2 wv = *((const device uint2*)(wrow + 32 * g));
+                const float s = float(srow[g]);
+                const float b = float(brow[g]);
+            """,
+            with: """
+                const uint2 wv = wv_next;
+                const float s = float(s_next);
+                const float b = float(b_next);
+                const int g_next = g0 + min(gi + 1, nGroups - 1);
+                const int g_next2 = g0 + min(gi + 2, nGroups - 1);
+                wv_next = wv_next2;
+                wv_next2 = *((const device uint2*)(wrow + 32 * g_next2));
+                s_next = srow[g_next];
+                b_next = brow[g_next];
+            """
+        ) else { return nil }
+        return result
+    }()
+
+    /// The header `mma8RspKernel` actually compiles: the carried one when the
+    /// switch is on and the derivation matched, the promoted one otherwise.
+    private static let mma8ActiveSingleTileHeader: String =
+        (singleTileCarryEnabled ? mma8SingleTileCarryHeader : nil) ?? mma8KernelHeader
+
+    /// Cumulative append: MLX caches pipelines by name and fires
+    /// `clear_library` on a name/source mismatch, so a changed body takes a
+    /// changed name. Empty whenever the promoted body is what compiles.
+    private static let singleTileCarryKey: String =
+        (singleTileCarryEnabled && mma8SingleTileCarryHeader != nil) ? "_sc2" : ""
+
     private static let multiTileKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_v4"
-            + fp16DequantKeySuffix,
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_v4",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -735,8 +875,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     }()
 
     private static let fusedSlidingKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_v1"
-            + fp16DequantKeySuffix,
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_v1",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y", "y2"],
         source: """
@@ -753,8 +892,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let fusedFullKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_v1"
-            + fp16DequantKeySuffix,
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_v1",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y", "y2"],
         source: """
@@ -776,8 +914,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     // entries the separate Q and K rsp dispatches would; the SPLIT store
     // keeps QKFUSE-001's two-buffer layout.
     private static let fusedSlidingRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_v1"
-            + fp16DequantKeySuffix,
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_v1\(rspCarryKey)",
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y", "y2"],
         source: """
@@ -790,12 +927,11 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
                 thread_index_in_simdgroup, y2);
             return;
             """,
-        header: mma8KernelHeader,
+        header: mma8ActiveRspHeader,
         ensureRowContiguous: true)
 
     private static let fusedFullRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_v1"
-            + fp16DequantKeySuffix,
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_v1\(rspCarryKey)",
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y", "y2"],
         source: """
@@ -808,12 +944,136 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
                 thread_index_in_simdgroup, y2);
             return;
             """,
-        header: mma8KernelHeader,
+        header: mma8ActiveRspHeader,
         ensureRowContiguous: true)
 
+    /// MMA-RSP-CARRY-036 body, built by checked string surgery over the
+    /// promoted header so that donor drift fails construction rather than
+    /// silently transforming -- the same discipline `mma8DownStaticKHeader`
+    /// uses in the dense-MLP file.
+    ///
+    /// The transform is the carry block of `qkv_mma8_affine4_g64_mt`
+    /// (MMA-CARRY2) transplanted verbatim onto `qkv_mma8_affine4_g64_mt_rsp`.
+    /// It is anchored on the `wrow[t]` form of the weight read, which occurs
+    /// exactly once in the header and only inside the multi-tile prepass body,
+    /// so the single-tile prepass body and both non-prepass bodies are left
+    /// untouched.
+    ///
+    /// Exactness: the addresses are functions of the group index alone, so the
+    /// value each trip consumes is the value the in-place read produced; the
+    /// clamps on `g_next`/`g_next2` keep the last trips inside the simdgroup's
+    /// group range and the values they re-read are discarded at loop exit.
+    /// Only the ISSUE POINT of a load moves -- no operand, no accumulation
+    /// order and no rounding point changes -- so every output word is
+    /// bit-for-bit what the promoted body produced.
+    ///
+    /// The prepass made the carry CHEAPER than when MMA-CARRY2 first measured
+    /// it, not dearer: retiring `mma8_runsum4`'s two temporaries and the three
+    /// butterfly steps freed the registers the carry wants.
+    private static let mma8RspCarryHeader: String = {
+        var result = mma8KernelHeader
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(
+            """
+              simdgroup_float8x8 A;
+              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+            #pragma unroll
+              for (int gi = 0; gi < nGroups; ++gi) {
+                const int g = g0 + gi;
+                const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+                const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+                const float2 rs = float2(
+                    rs_table[c.fn * G + g], rs_table[(c.fn + 1) * G + g]);
+
+                MMA8_SETB(B0, x, lo)
+                MMA8_SETB(B1, x, hi)
+                MMA8_SETB(B2, y, lo)
+                MMA8_SETB(B3, y, hi)
+                MMA8_SETB(B4, z, lo)
+                MMA8_SETB(B5, z, hi)
+                MMA8_SETB(B6, w, lo)
+                MMA8_SETB(B7, w, hi)
+
+            #pragma clang loop unroll(full)
+                for (int t = 0; t < TILES; ++t) {
+                  const uint2 wv = *((const device uint2*)(wrow[t] + 32 * g));
+                  const float s = float(srow[t][g]);
+                  const float b = float(brow[t][g]);
+            """,
+            with: """
+              simdgroup_float8x8 A;
+              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+              uint2 wv_next[TILES];
+              uint2 wv_next2[TILES];
+              T s_next[TILES];
+              T b_next[TILES];
+            #pragma clang loop unroll(full)
+              for (int t = 0; t < TILES; ++t) {
+                wv_next[t] = *((const device uint2*)(wrow[t] + 32 * g0));
+                wv_next2[t] =
+                    *((const device uint2*)(wrow[t] + 32 * (g0 + min(1, nGroups - 1))));
+                s_next[t] = srow[t][g0];
+                b_next[t] = brow[t][g0];
+              }
+
+            #pragma unroll
+              for (int gi = 0; gi < nGroups; ++gi) {
+                const int g = g0 + gi;
+
+                uint2 wv_cur[TILES];
+                float s_cur[TILES];
+                float b_cur[TILES];
+            #pragma clang loop unroll(full)
+                for (int t = 0; t < TILES; ++t) {
+                  wv_cur[t] = wv_next[t];
+                  s_cur[t] = float(s_next[t]);
+                  b_cur[t] = float(b_next[t]);
+                }
+                const int g_next = g0 + min(gi + 1, nGroups - 1);
+                const int g_next2 = g0 + min(gi + 2, nGroups - 1);
+            #pragma clang loop unroll(full)
+                for (int t = 0; t < TILES; ++t) {
+                  wv_next[t] = wv_next2[t];
+                  wv_next2[t] = *((const device uint2*)(wrow[t] + 32 * g_next2));
+                  s_next[t] = srow[t][g_next];
+                  b_next[t] = brow[t][g_next];
+                }
+
+                const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+                const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+                const float2 rs = float2(
+                    rs_table[c.fn * G + g], rs_table[(c.fn + 1) * G + g]);
+
+                MMA8_SETB(B0, x, lo)
+                MMA8_SETB(B1, x, hi)
+                MMA8_SETB(B2, y, lo)
+                MMA8_SETB(B3, y, hi)
+                MMA8_SETB(B4, z, lo)
+                MMA8_SETB(B5, z, hi)
+                MMA8_SETB(B6, w, lo)
+                MMA8_SETB(B7, w, hi)
+
+            #pragma clang loop unroll(full)
+                for (int t = 0; t < TILES; ++t) {
+                  const uint2 wv = wv_cur[t];
+                  const float s = s_cur[t];
+                  const float b = b_cur[t];
+            """)
+        return result
+    }()
+
+    private static let mma8ActiveRspHeader: String =
+        rspCarryEnabled ? mma8RspCarryHeader : mma8KernelHeader
+
     private static let mma8Kernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_bfill_v4"
-            + fp16DequantKeySuffix,
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_bfill_v4",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -844,8 +1104,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     // `rs` component the incumbent computes, and the rsp bodies consume the
     // identical float in the identical accumulator step.
     private static let runsumTableKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_rs_table_k2816_v1"
-            + fp16DequantKeySuffix,
+        name: "cbv2_b8_rs_table_k2816_v1",
         inputNames: ["x"],
         outputNames: ["rs"],
         source: """
@@ -871,8 +1130,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let multiTileRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_v1"
-            + fp16DequantKeySuffix,
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_v1\(rspCarryKey)",
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -885,12 +1143,12 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: mma8KernelHeader,
+        header: mma8ActiveRspHeader,
         ensureRowContiguous: true)
 
     private static let mma8RspKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_rsp_v1"
-            + fp16DequantKeySuffix,
+            + singleTileCarryKey,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -903,7 +1161,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: mma8KernelHeader,
+        header: mma8ActiveSingleTileHeader,
         ensureRowContiguous: true)
 
     /// MMA-RS-001 table for one activation tensor. Returns nil unless the
@@ -1115,7 +1373,13 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             && rsTable!.shape == [batch, inputWidth / Self.groupSize]
 
         let yTiles = outputWidth / outputsPerGroup
-        if multiTileEnabled, yTiles % tilesPerGroup == 0 {
+        // QKV-V-TILES1-040: route the V plane to the registered single-tile
+        // body, doubling its threadgroups. Every other width keeps multi-tile.
+        let takeSingleTile = vSingleTileEnabled && outputWidth == vSingleTileWidth
+        if takeSingleTile {
+            CBv2EngageMark.once("qkv-v-tiles1")
+        }
+        if multiTileEnabled, !takeSingleTile, yTiles % tilesPerGroup == 0 {
             if tableReady {
                 return multiTileRspKernel(
                     [x, weight, scales, biases, rsTable!],

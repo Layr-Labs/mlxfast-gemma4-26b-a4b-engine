@@ -81,6 +81,68 @@ public enum Gemma4PrefillGlueV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// PGLUE-TB1: `DARKBLOOM_GEMMA4_PREFILL_GLUE_TB1=0` restores the incumbent
+    /// three-barrier reduction. Every helper below returns the incumbent text
+    /// AND the incumbent kernel name when the switch is off, so the off state
+    /// is the incumbent emission verbatim.
+    ///
+    /// The mechanism is the prefill twin of two the tree already ships
+    /// default-ON on the DECODE glue in `Gemma4Text.swift`:
+    ///
+    ///   NOBLANK (`_nb1`, `Gemma4Text.rmsReduce`) - the incumbent zeroes all
+    ///     32 cross-simd slots, fences to order the blank against the
+    ///     producing store, then publishes 22. A row is 704 threads = 22
+    ///     simdgroups, so slots 22..31 are written by nobody. Supplying their
+    ///     constant at the READ (`simd_lane_id < GLUE_NSIMD ? ... : 0.0f`)
+    ///     deletes the blank and the fence that existed only to order it.
+    ///
+    ///   NORM-TB1 (`_tb1`, `DARKBLOOM_GEMMA4_NORM_TG_BARRIER_HALVE`) - the
+    ///     incumbent has simdgroup 0 run the cross-simd combine, lane 0 store
+    ///     the normalizer to threadgroup memory, and a third fence so the
+    ///     other 21 simdgroups can read it back. Having every simdgroup run
+    ///     that same combine over the same published plane and keep the result
+    ///     in a register deletes the store, the fence and 704 threadgroup
+    ///     loads.
+    ///
+    /// Three barriers per reduction become one. Bit-identity, not
+    /// approximation: `simd_sum` is a fixed 32-lane network and a
+    /// deterministic function of its lane vector; the vector it consumes is
+    /// unchanged (22 partials on lanes 0..21, an exact `+0.0f` above, the same
+    /// zero the blank wrote); and every simdgroup runs it after the publish
+    /// barrier over byte-identical slots, so `metal::precise::rsqrt` sees the
+    /// same float. Nothing is reassociated, which matters because MLX compiles
+    /// these with `setFastMathEnabled(false)`.
+    ///
+    /// Ordering. Dropping the third fence means reduction k's READERS of the
+    /// plane are no longer ordered against reduction k+1's WRITERS of it, so a
+    /// kernel with more than one reduction alternates planes. Reduction k+2
+    /// may reuse reduction k's plane: every thread's read in k precedes its
+    /// arrival at k+1's publish barrier, and every thread's write in k+2
+    /// follows its departure from that same barrier.
+    static let tb1Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_GLUE_TB1"]
+        else { return false }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// PGLUE-TB1 rekey. `CustomKernel::eval_gpu` caches compiled pipelines by
+    /// NAME and only builds the source on a miss, so the two emissions must
+    /// never share a name.
+    private static let tb1Suffix: String = tb1Enabled ? "_nb1_tb1" : ""
+
+    /// An alternate scratch plane, declared only by the kernels that run more
+    /// than one reduction and only when the switch is on.
+    private static func tbPlaneDecl(_ name: String, _ indent: String) -> String {
+        tb1Enabled ? "\n" + indent + "threadgroup float " + name + "[32];" : ""
+    }
+
+    /// The plane a kernel's k-th reduction publishes into. With the switch off
+    /// every reduction keeps the incumbent plane.
+    private static func tbPlane(_ alternate: String, _ incumbent: String) -> String {
+        tb1Enabled ? alternate : incumbent
+    }
+
     /// This checkpoint's hidden size, and the `rms_single_row` launch geometry
     /// the stock host derives from it (`RMS_N_READS` 4, so 2816 / 4 = 704
     /// threads, 22 simdgroups, one threadgroup per row).
@@ -92,11 +154,18 @@ public enum Gemma4PrefillGlueV1 {
     /// `rms_single_row`'s reduction, reproduced so the fused kernels see the
     /// same accumulation order, the same cross-simd combine and the same
     /// `precise::rsqrt` the stock kernel uses.
-    static let kernelHeader = """
+    static let kernelHeader =
+        headerPreamble + (tb1Enabled ? tb1Reductions : incumbentReductions)
+
+    private static let headerPreamble = """
         constant constexpr const int GLUE_AXIS = 2816;
         constant constexpr const int GLUE_NREADS = 4;
         // Pinned; `planeRows` refuses any other eps.
         constant constexpr const float GLUE_EPS = 1e-6f;
+        """
+
+    private static let incumbentReductions = """
+
 
         inline float glue_inv_rms(
             thread const float* xv,
@@ -175,10 +244,79 @@ public enum Gemma4PrefillGlueV1 {
         }
         """
 
+    /// PGLUE-TB1. Same signatures, same reduction tree, same rounding sites;
+    /// one threadgroup barrier instead of three. `local_inv` / `local_inv2`
+    /// are kept in the signature so no call site moves, and are unused.
+    private static let tb1Reductions = """
+
+
+        // 2816 / 4 = 704 threads per row = 22 simdgroups. Slots 22..31 of the
+        // 32-slot cross-simd plane are written by no simdgroup, so their value
+        // is the constant the incumbent blank wrote.
+        constant constexpr const int GLUE_NSIMD = GLUE_AXIS / GLUE_NREADS / 32;
+
+        inline float glue_inv_rms(
+            thread const float* xv,
+            threadgroup float* local_sums,
+            threadgroup float* local_inv,
+            uint simd_lane_id,
+            uint simd_group_id,
+            float eps) {
+          float acc = 0;
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < GLUE_NREADS; i++) {
+            acc += xv[i] * xv[i];
+          }
+          acc = simd_sum(acc);
+          if (simd_lane_id == 0) {
+            local_sums[simd_group_id] = acc;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          acc = simd_sum(
+              simd_lane_id < GLUE_NSIMD ? local_sums[simd_lane_id] : 0.0f);
+          (void)local_inv;
+          return metal::precise::rsqrt(acc / GLUE_AXIS + eps);
+        }
+
+        inline void glue_inv_rms2(
+            thread const float* av,
+            thread const float* bv,
+            threadgroup float* local_sums_a,
+            threadgroup float* local_sums_b,
+            threadgroup float* local_inv2,
+            uint simd_lane_id,
+            uint simd_group_id,
+            float eps,
+            thread float& inv_a,
+            thread float& inv_b) {
+          float acc_a = 0;
+          float acc_b = 0;
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < GLUE_NREADS; i++) {
+            acc_a += av[i] * av[i];
+            acc_b += bv[i] * bv[i];
+          }
+          acc_a = simd_sum(acc_a);
+          acc_b = simd_sum(acc_b);
+          if (simd_lane_id == 0) {
+            local_sums_a[simd_group_id] = acc_a;
+            local_sums_b[simd_group_id] = acc_b;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          acc_a = simd_sum(
+              simd_lane_id < GLUE_NSIMD ? local_sums_a[simd_lane_id] : 0.0f);
+          acc_b = simd_sum(
+              simd_lane_id < GLUE_NSIMD ? local_sums_b[simd_lane_id] : 0.0f);
+          (void)local_inv2;
+          inv_a = metal::precise::rsqrt(acc_a / GLUE_AXIS + eps);
+          inv_b = metal::precise::rsqrt(acc_b / GLUE_AXIS + eps);
+        }
+        """
+
     // MARK: - norm + residual (2 dispatches -> 1)
 
     private static let normResidualKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_norm_residual_2816_unroll_v2",
+        name: "gemma4_prefill_glue_norm_residual_2816_unroll_v2" + tb1Suffix,
         inputNames: ["x", "w", "res"],
         outputNames: ["out"],
         source: """
@@ -275,11 +413,11 @@ public enum Gemma4PrefillGlueV1 {
 
     private static let attentionBranchPrefixKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_prefill_glue_attention_branch_prefix_2816_unroll_v2",
+            name: "gemma4_prefill_glue_attention_branch_prefix_2816_unroll_v2" + tb1Suffix,
             inputNames: ["x", "w", "res", "wd", "wr"],
             outputNames: ["out", "dense", "router"],
             source: """
-                threadgroup float local_sums[32];
+                threadgroup float local_sums[32];\(tbPlaneDecl("local_sums_tb", "                "))
                 threadgroup float local_inv[1];
 
                 const uint row = threadgroup_position_in_grid.y;
@@ -319,7 +457,7 @@ public enum Gemma4PrefillGlueV1 {
                 // the dense weight and the router weight: the two stock
                 // kernels reduce the identical array.
                 const float inv2 = glue_inv_rms(
-                    ov, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+                    ov, \(tbPlane("local_sums_tb", "local_sums")), local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
 
                 #pragma clang loop unroll(full)
                 for (int i = 0; i < GLUE_NREADS; i++) {
@@ -372,7 +510,7 @@ public enum Gemma4PrefillGlueV1 {
     // MARK: - dual pre-norm (2 dispatches -> 1)
 
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_dual_prenorm_2816_unroll_v2",
+        name: "gemma4_prefill_glue_dual_prenorm_2816_unroll_v2" + tb1Suffix,
         inputNames: ["x", "w1", "w2"],
         outputNames: ["out1", "out2"],
         source: """
@@ -461,7 +599,7 @@ public enum Gemma4PrefillGlueV1 {
     /// `dualPreNorm` with its second output removed: the same reduction, the
     /// same `w * T(x * inv)` store, one weight.
     private static let preNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_prenorm_2816_unroll_v2",
+        name: "gemma4_prefill_glue_prenorm_2816_unroll_v2" + tb1Suffix,
         inputNames: ["x", "w"],
         outputNames: ["out"],
         source: """
@@ -500,7 +638,7 @@ public enum Gemma4PrefillGlueV1 {
     /// values are computed once into registers and stored to each of the
     /// row's K sorted positions.
     private static let preNormScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_prenorm_scatter_2816_unroll_v2",
+        name: "gemma4_prefill_glue_prenorm_scatter_2816_unroll_v2" + tb1Suffix,
         inputNames: ["x", "w", "inverse"],
         outputNames: ["out"],
         source: """
@@ -601,12 +739,12 @@ public enum Gemma4PrefillGlueV1 {
     // MARK: - branch tail (5 dispatches -> 1)
 
     private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_tail_2816_unroll_v2",
+        name: "gemma4_prefill_glue_tail_2816_unroll_v2" + tb1Suffix,
         inputNames: ["h1", "h2", "w1", "w2", "w3", "res2"],
         outputNames: ["out"],
         source: """
             threadgroup float local_sums_a[32];
-            threadgroup float local_sums_b[32];
+            threadgroup float local_sums_b[32];\(tbPlaneDecl("local_sums_c", "            "))
             threadgroup float local_inv2[2];
 
             const uint row = threadgroup_position_in_grid.y;
@@ -642,7 +780,7 @@ public enum Gemma4PrefillGlueV1 {
             }
 
             const float inv_t = glue_inv_rms(
-                tv, local_sums_a, local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
+                tv, \(tbPlane("local_sums_c", "local_sums_a")), local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
 
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
@@ -691,12 +829,12 @@ public enum Gemma4PrefillGlueV1 {
     /// stores `out`, so both cost one extra in-kernel reduction rather than a
     /// re-read of the row plus two launches.
     private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_tail_chain_2816_unroll_v2",
+        name: "gemma4_prefill_glue_tail_chain_2816_unroll_v2" + tb1Suffix,
         inputNames: ["h1", "h2", "w1", "w2", "w3", "res2", "s", "wn"],
         outputNames: ["out", "normed"],
         source: """
             threadgroup float local_sums_a[32];
-            threadgroup float local_sums_b[32];
+            threadgroup float local_sums_b[32];\(tbPlaneDecl("local_sums_c", "            "))
             threadgroup float local_inv2[2];
 
             const uint row = threadgroup_position_in_grid.y;
@@ -730,7 +868,7 @@ public enum Gemma4PrefillGlueV1 {
             }
 
             const float inv_t = glue_inv_rms(
-                tv, local_sums_a, local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
+                tv, \(tbPlane("local_sums_c", "local_sums_a")), local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
 
             // The stock graph stores the residual sum to bf16, then the scalar
             // multiply reads it back and stores again. Both roundings are
@@ -796,7 +934,7 @@ public enum Gemma4PrefillGlueV1 {
     /// same `[tokens, hidden]` expert result. Produce each reduced expert value
     /// in the tail thread that consumes it, removing the intermediate tensor.
     private static let expertTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_expert_unsort_tail_chain_2816_unroll_v2",
+        name: "gemma4_prefill_expert_unsort_tail_chain_2816_unroll_v2" + tb1Suffix,
         inputNames: [
             "sorted", "inverse_order", "route_weights", "h1",
             "w1", "w2", "w3", "res2", "s", "wn",
@@ -804,7 +942,7 @@ public enum Gemma4PrefillGlueV1 {
         outputNames: ["out", "normed"],
         source: """
             threadgroup float local_sums_a[32];
-            threadgroup float local_sums_b[32];
+            threadgroup float local_sums_b[32];\(tbPlaneDecl("local_sums_c", "            "))
             threadgroup float local_inv2[2];
 
             const uint row = threadgroup_position_in_grid.y;
@@ -850,7 +988,7 @@ public enum Gemma4PrefillGlueV1 {
             }
 
             const float inv_t = glue_inv_rms(
-                tv, local_sums_a, local_inv2,
+                tv, \(tbPlane("local_sums_c", "local_sums_a")), local_inv2,
                 simd_lane_id, simd_group_id, GLUE_EPS);
 
             const T scalar = s[0];

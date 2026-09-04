@@ -67,6 +67,20 @@ public enum CBv2AttentionQKVMMA8V1 {
     /// registered name never outlives the body it was compiled from.
     static let fp16DequantKeySuffix = fp16DequantEnabled ? "_h1" : ""
 
+    /// QKV-MTRSP-U2: the live two-tile run-sum body has K=2816 and splits its
+    /// 44 groups evenly across two simdgroups, so its per-simdgroup trip count
+    /// is the compile-time constant 22. Factor two divides that walk exactly.
+    /// The off arm restores the promoted loop directive and registration keys.
+    private static let mtRspUnroll2Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_MTRSP_U2"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let mtRspUnroll2KeySuffix =
+        mtRspUnroll2Enabled ? "_u2" : ""
+
     /// H1-ATTN: the A-side fill of the 4-bit MMA8 step, shared verbatim by the
     /// Q/K/V bodies here and the o_proj bodies in `AttentionOQMVV1.swift` (the
     /// two files carried byte-identical copies of this macro; they now carry
@@ -609,7 +623,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
   simdgroup_float8x8 A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
 
-#pragma unroll
+\(mtRspUnroll2Enabled ? "#pragma clang loop unroll_count(2)" : "#pragma unroll")
   for (int gi = 0; gi < nGroups; ++gi) {
     const int g = g0 + gi;
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
@@ -777,7 +791,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     // keeps QKFUSE-001's two-buffer layout.
     private static let fusedSlidingRspKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_v1"
-            + fp16DequantKeySuffix,
+            + fp16DequantKeySuffix + mtRspUnroll2KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y", "y2"],
         source: """
@@ -795,7 +809,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
 
     private static let fusedFullRspKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_v1"
-            + fp16DequantKeySuffix,
+            + fp16DequantKeySuffix + mtRspUnroll2KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y", "y2"],
         source: """
@@ -872,7 +886,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
 
     private static let multiTileRspKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_v1"
-            + fp16DequantKeySuffix,
+            + fp16DequantKeySuffix + mtRspUnroll2KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """

@@ -829,6 +829,22 @@ enum CBv2PrefillAttnTrafficV1 {
     /// softmax.cpp's SOFTMAX_LOOPED_LIMIT: the transcribed block kernel.
     private static let maxKeyLength = 4096
 
+    /// ATTNTRAFFIC-KL-058. The fused pair replaces two dispatches over the
+    /// `[.., L, kL]` rectangle with a statistics pre-pass plus a loader
+    /// transform, so what it saves is one read and one write of that
+    /// rectangle while what it costs is fixed per dispatch. Under the prompt
+    /// cohort's q-block ladder kL climbs 128, 256, ... 1024, so the saving
+    /// scales with kL while the cost does not, and the short blocks at the
+    /// head of the ladder pay more than they take back. Blocks below this
+    /// key length keep the incumbent softmax + matmul pair.
+    static let minKeyLength: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_ATTN_TRAFFIC_MIN_KL"],
+            let parsed = Int(raw), parsed >= 0
+        else { return 256 }
+        return parsed
+    }()
+
     /// The out-source `beta` the steel GEMM twins recognize: fp32 negative
     /// zero (bits 0x80000000). It makes MLX select the `do_axpby` epilogue
     /// (`beta != 1`), which the twins replace by the loader transform on this
@@ -891,6 +907,7 @@ enum CBv2PrefillAttnTrafficV1 {
         guard scores.ndim >= 2, values.ndim == scores.ndim else { return nil }
         let axisSize = scores.dim(scores.ndim - 1)
         guard axisSize > 0, axisSize % 4 == 0, axisSize <= maxKeyLength else { return nil }
+        guard axisSize >= minKeyLength else { return nil }
         let L = scores.dim(scores.ndim - 2)
         let D = values.dim(values.ndim - 1)
         guard values.dim(values.ndim - 2) == axisSize else { return nil }

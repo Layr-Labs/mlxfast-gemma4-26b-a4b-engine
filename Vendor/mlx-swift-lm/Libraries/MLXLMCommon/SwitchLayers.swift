@@ -311,6 +311,13 @@ private func geGLUClaimsPinnedDecode(_ gate: MLXArray, _ up: MLXArray) -> Bool {
     let s = gate.shape
     if s.count == 3, s[0] == 64, s[1] == 1 { return true }
     if s.count == 2, s[0] == 64 { return true }
+    // GATEUP-FUSE-DECODE: the decode cohort's gate and up halves are the two
+    // 16-column members of each paired block of the fused storage, so the
+    // rectangle arrives as [64, 44, 16] rather than [64, 1, 704]. Same 45056
+    // elements in the same order once flattened; admitting it keeps the
+    // product on the shape-specialised compile, which is the difference
+    // between one Metal kernel and two.
+    if s.count == 3, s[0] == 64, s[1] == 44, s[2] == 16 { return true }
     return false
 }
 
@@ -1255,6 +1262,34 @@ public let switchGateUpFusePrefillEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// GATEUP-FUSE-DECODE. The eight-row sorted decode cohort reads its gathered
+/// expert activations through TWO quantized gathers per routed layer -- one
+/// over the gate plane, one over the up plane. This arm reads them through ONE
+/// gather over the paired gate|up storage the load already builds for the
+/// prefill road, and takes the two halves as stride rebinds of the result.
+///
+/// Same kernel pipeline, same weights, same per-column K-chain, same
+/// accumulation order, same group scales and biases: output column `32j + i`
+/// of the paired plane IS gate row `16j + i`, and column `32j + 16 + i` IS up
+/// row `16j + i`, so every output element accumulates the identical terms in
+/// the identical order and only the row address moves. Bit-identical by
+/// construction, and no tolerance budget is spent.
+///
+/// The two halves cost nothing to take: MLX's `Slice` primitive is a
+/// `shared_buffer_slice` -- a strides-and-offset rebind that never launches a
+/// kernel -- and the GeGLU product's own output is contiguous in exactly the
+/// incumbent row order, so its trailing reshape is a view too.
+///
+/// Kill switch, runtime, same executable: `DARKBLOOM_GEMMA4_GATEUP_FUSE_DECODE`
+/// set to `0`/`false`/`no`/`off` restores the two split gathers. Engage mark:
+/// `decode-gateup-fuse`.
+public let switchGateUpFuseDecodeEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_GATEUP_FUSE_DECODE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// The fused gate/up affine 4-bit right-hand side of one expert layer plus the
 /// split projection arrays used outside the large sorted prefill path. A
 /// plain final class (not a `Module`, not an `MLXArray` tuple) so the module
@@ -1616,6 +1651,46 @@ public class SwitchGLU: Module {
                 x = downProj(
                     activated, idx, lhsIndices: downLhs, sortedIndices: true)
                 return (x, inverseOrder, true)
+            } else if switchGateUpFuseDecodeEnabled,
+                doSort, useLhsIndices, let lhs = lhsIndices,
+                inputDims == 2816, hiddenDims == 704, numExperts == 128,
+                activationProduct == nil, isGeluActivation,
+                x.ndim == 3, x.dim(0) == 8, x.dim(-2) == 1,
+                x.dim(-1) == inputDims, x.dtype == .bfloat16,
+                idx.ndim == 1, idx.size == 64,
+                let fused = fusedGateUpDispatch()
+            {
+                // GATEUP-FUSE-DECODE: one gather over the paired storage in
+                // place of one over each split plane. The admission pins the
+                // exact production geometry and pins the incumbent product to
+                // `geGLUProduct`, so the arm can only ever replace the two
+                // gathers it is named for.
+                CBv2EngageMark.once("decode-gateup-fuse")
+                let xGateUp = MLX.gatherQuantizedMM(
+                    x,
+                    fused.storage.weight,
+                    scales: fused.storage.scales,
+                    biases: fused.storage.biases,
+                    lhsIndices: lhs,
+                    rhsIndices: idx,
+                    transpose: true,
+                    groupSize: fused.groupSize,
+                    bits: fused.bits,
+                    mode: fused.mode,
+                    sortedIndices: true
+                )
+                // [64, 1, 1408] -> [64, 44, 2, 16]: 44 blocks of one 16-column
+                // gate run followed by its matching up run, which is exactly
+                // how the load built the storage. Both takes are views.
+                let pairs = xGateUp.reshaped(64, hiddenDims / 16, 2, 16)
+                xGate = pairs[.ellipsis, 0, 0...]
+                xUp = pairs[.ellipsis, 1, 0...]
+                // The product of the two [64, 44, 16] views is contiguous and
+                // its flat order is the incumbent 0 ..< 704 hidden order, so
+                // the reshape back is a view and the down projection sees the
+                // identical operand it sees today.
+                promptActivated = geGLUProduct(xGate, xUp)
+                    .reshaped(64, 1, hiddenDims)
             } else {
                 xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
                 xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)

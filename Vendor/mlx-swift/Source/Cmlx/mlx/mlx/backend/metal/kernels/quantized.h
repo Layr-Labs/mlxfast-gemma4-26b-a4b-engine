@@ -4044,10 +4044,20 @@ template <typename T, int group_size, int bits>
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   int M = x_shape[x_batch_ndims];
+  // GATEUP-FUSE-DECODE: the paired gate|up right-hand side presents the same
+  // 2816-wide K with a 1408-wide N. No branch below this predicate reads
+  // out_vec_size -- the down-tile arm tests in_vec_size, RUN-QUAD tests the
+  // route word, and the singles arm tests in_vec_size -- so admitting the
+  // width reaches the identical impl set the 704 width reaches. 1408 is an
+  // exact multiple of the eight-row threadgroup group, so it changes only
+  // which rows a threadgroup owns, not a K-chain, an accumulator or an add
+  // order.
+  constexpr int kGemma4GateUpFusedN = 1408;
   const bool gemma4_pair_geometry =
       group_size == 64 && bits == 4 && M == 1 && batch_ndims == 1 &&
       batch_shape[0] == 64 && x_batch_ndims == 1 && w_batch_ndims == 1 &&
-      ((in_vec_size == 2816 && out_vec_size == 704) ||
+      ((in_vec_size == 2816 &&
+        (out_vec_size == 704 || out_vec_size == kGemma4GateUpFusedN)) ||
        (in_vec_size == 704 && out_vec_size == 2816));
   if (gemma4_pair_geometry) {
     // KERN-DOWN-TILE gate (strip-walk pattern): compile-time flip; ON

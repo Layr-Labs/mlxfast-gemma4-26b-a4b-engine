@@ -4767,6 +4767,194 @@ private enum Gemma4FusedLayerGlue {
     }
 }
 
+/// ROUTER-QMV-QUAD-001. Exact-order four-row sharing for the pinned decode
+/// router projection. The stock affine QMV launches one pair-sized group for
+/// each of the four input-row pairs, so its `[8, 1, 2816] -> [8, 1, 128]`
+/// router repeats the same 128-row weight stream four times. This arm gives
+/// each output tile one group and walks four independent input rows through
+/// that tile. The weight, scale, bias, and output-column loads are shared; each
+/// row keeps the stock affine-4/g64 qdot expression, K-block order, and
+/// `simd_sum` close unchanged.
+///
+/// The router's scores feed a discrete stable top-8 selection, so this is
+/// deliberately not an MMA or reassociated reduction. Its only numerical
+/// change is none: every output element has the same scalar accumulation
+/// sequence as `qmv_affine4_g64_pair_impl`. The launch drops from four active
+/// row-pair groups to two four-row groups for each of the 16 output tiles.
+/// Every other projection shape falls through to the existing MLX dispatch.
+/// Kill switch: `DARKBLOOM_GEMMA4_ROUTER_QMV_QUAD=0`.
+private enum Gemma4RouterQMVQuadV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTER_QMV_QUAD"
+        ]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }()
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "gemma4_router_qmv_quad_affine4_g64_k2816_n128_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            constexpr int K = 2816;
+            constexpr int N = 128;
+            constexpr int BLOCK = 256;
+            constexpr int OUTPUT_TILE = 8;
+            constexpr int OUTPUT_TILES = N / OUTPUT_TILE;
+            constexpr int ROWS_PER_GROUP = 4;
+
+            const int tg = int(threadgroup_position_in_grid.x);
+            const int tile = tg % OUTPUT_TILES;
+            const int firstRow = (tg / OUTPUT_TILES) * ROWS_PER_GROUP;
+            const int lane = int(thread_index_in_simdgroup);
+            const int simd = int(simdgroup_index_in_threadgroup);
+            const int firstOutput = tile * OUTPUT_TILE + simd * 4;
+
+            thread uint packed[4];
+            thread float scalesLocal[4];
+            thread float biasesLocal[4];
+            thread float results0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            thread float results1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            thread float results2[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            thread float results3[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            thread float xValues[8];
+
+            for (int k = 0; k < K; k += BLOCK) {
+                for (int r = 0; r < 4; r++) {
+                    const int output = firstOutput + r;
+                    packed[r] =
+                        w[output * (K / 8) + k / 8 + lane];
+                    const int group =
+                        output * (K / 64) + k / 64 + lane / 8;
+                    scalesLocal[r] = float(scales[group]);
+                    biasesLocal[r] = float(biases[group]);
+                }
+
+                const device T* x0 =
+                    x + (firstRow + 0) * K + k + lane * 8;
+                const float sum0 = gemma4_router_load<T>(x0, xValues);
+                for (int r = 0; r < 4; r++) {
+                    results0[r] += gemma4_router_dot(
+                        packed[r], xValues, scalesLocal[r],
+                        biasesLocal[r], sum0);
+                }
+
+                const device T* x1 =
+                    x + (firstRow + 1) * K + k + lane * 8;
+                const float sum1 = gemma4_router_load<T>(x1, xValues);
+                for (int r = 0; r < 4; r++) {
+                    results1[r] += gemma4_router_dot(
+                        packed[r], xValues, scalesLocal[r],
+                        biasesLocal[r], sum1);
+                }
+
+                const device T* x2 =
+                    x + (firstRow + 2) * K + k + lane * 8;
+                const float sum2 = gemma4_router_load<T>(x2, xValues);
+                for (int r = 0; r < 4; r++) {
+                    results2[r] += gemma4_router_dot(
+                        packed[r], xValues, scalesLocal[r],
+                        biasesLocal[r], sum2);
+                }
+
+                const device T* x3 =
+                    x + (firstRow + 3) * K + k + lane * 8;
+                const float sum3 = gemma4_router_load<T>(x3, xValues);
+                for (int r = 0; r < 4; r++) {
+                    results3[r] += gemma4_router_dot(
+                        packed[r], xValues, scalesLocal[r],
+                        biasesLocal[r], sum3);
+                }
+            }
+
+            for (int r = 0; r < 4; r++) {
+                results0[r] = simd_sum(results0[r]);
+                results1[r] = simd_sum(results1[r]);
+                results2[r] = simd_sum(results2[r]);
+                results3[r] = simd_sum(results3[r]);
+                if (lane == 0) {
+                    y[(firstRow + 0) * N + firstOutput + r] =
+                        static_cast<T>(results0[r]);
+                    y[(firstRow + 1) * N + firstOutput + r] =
+                        static_cast<T>(results1[r]);
+                    y[(firstRow + 2) * N + firstOutput + r] =
+                        static_cast<T>(results2[r]);
+                    y[(firstRow + 3) * N + firstOutput + r] =
+                        static_cast<T>(results3[r]);
+                }
+            }
+        """,
+        header: """
+            template <typename T>
+            inline float gemma4_router_load(
+                const device T* x, thread float* values) {
+                float sum = 0.0f;
+                sum += x[0] + x[1] + x[2] + x[3];
+                sum += x[4] + x[5] + x[6] + x[7];
+                values[0] = x[0];
+                values[1] = x[1] / 16.0f;
+                values[2] = x[2] / 256.0f;
+                values[3] = x[3] / 4096.0f;
+                values[4] = x[4];
+                values[5] = x[5] / 16.0f;
+                values[6] = x[6] / 256.0f;
+                values[7] = x[7] / 4096.0f;
+                return sum;
+            }
+
+            inline float gemma4_router_dot(
+                uint packed, const thread float* values,
+                float scale, float bias, float sum) {
+                const uint low = packed & 0xffffu;
+                const uint high = packed >> 16;
+                float accum =
+                    values[0] * (low & 0x000fu) +
+                    values[1] * (low & 0x00f0u) +
+                    values[2] * (low & 0x0f00u) +
+                    values[3] * (low & 0xf000u);
+                accum +=
+                    values[4] * (high & 0x000fu) +
+                    values[5] * (high & 0x00f0u) +
+                    values[6] * (high & 0x0f00u) +
+                    values[7] * (high & 0xf000u);
+                return scale * accum + sum * bias;
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    @inline(__always)
+    static func apply(_ x: MLXArray, projection: Linear) -> MLXArray? {
+        guard enabled,
+            x.dtype == .bfloat16,
+            x.shape == [8, 1, 2816],
+            let quantized = projection as? QuantizedLinear,
+            quantized.bias == nil,
+            quantized.groupSize == 64,
+            quantized.bits == 4,
+            quantized.mode == .affine,
+            quantized.weight.dtype == .uint32,
+            quantized.weight.shape == [128, 352],
+            quantized.scales.dtype == .bfloat16,
+            quantized.scales.shape == [128, 44],
+            quantized.biases.dtype == .bfloat16,
+            quantized.biases.shape == [128, 44]
+        else { return nil }
+
+        CBv2EngageMark.once("router-qmv-quad")
+        return kernel(
+            [x, quantized.weight, quantized.scales, quantized.biases],
+            template: [("T", x.dtype)],
+            grid: (2 * 16 * 64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[8, 1, 128]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+}
+
 /// Expert router. Norms `x` with a learnable scale, projects to expert
 /// scores, and returns top-K (indices, weights) where weights are
 /// softmax-normalized and scaled by a per-expert scalar.
@@ -4892,12 +5080,21 @@ private class Gemma4Router: Module {
     }
 
     fileprivate func zipScores(_ normed: MLXArray) -> MLXArray {
+        // ROUTER-QMV-QUAD-001: the exact-order decode router road shares
+        // each 128-row weight tile across four input rows and retires the
+        // unused row-pair groups. Prompt rectangles stay on the existing
+        // dequantized-plane or stock quantized road.
+        if let projected = Gemma4RouterQMVQuadV1.apply(
+            normed, projection: proj)
+        {
+            return projected
+        }
+
         // ROUTER-PREFILL-DEQ-CACHE: at prompt width the router projection
         // reuses the same dequantize-once transposed plane cache the dense
-        // projections use (its own admission floor keeps decode rows on the
-        // incumbent quantized dispatch). Unquantized or off-contract routers
-        // fall through untouched.
-        Gemma4PrefillDeqGEMMV1.apply(proj, normed) ?? proj(normed)
+        // projections use. Unquantized or off-contract routers fall through
+        // untouched.
+        return Gemma4PrefillDeqGEMMV1.apply(proj, normed) ?? proj(normed)
     }
 
     fileprivate func zipPartition(_ expertScores: MLXArray) -> MLXArray {

@@ -424,6 +424,24 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
 
     private static let carry2KeySuffix = oprojCarry2Enabled ? "_carry2" : ""
 
+    /// OPROJ-UR4 (re-land of delordemm1 `32422446` / Accept `1045c62`, erased
+    /// by the carry2 Accept `3f1efe5`): `#pragma clang loop unroll_count(4)`
+    /// on the two run-sum group loops. Schedule-only; addresses, accumulation
+    /// order, types, grids unchanged. Rides INSIDE the carry2 replacement
+    /// output (the carry2 anchor matches the literal `#pragma unroll`
+    /// template text, so the template bodies keep that literal untouched).
+    /// `DARKBLOOM_GEMMA4_OPROJ_UNROLL4=0` restores carry2-only names/bodies.
+    /// With carry2 OFF the switch is a documented no-op (the promoted-body
+    /// restore promise is preserved: suffix and header both key off carry2).
+    public static let unroll4Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_OPROJ_UNROLL4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let ur4KeySuffix = (oprojCarry2Enabled && unroll4Enabled) ? "_ur4" : ""
+
     private static func applyOprojCarry2(to header: String, occurrences: Int) -> String {
         var result = header
         func replace(_ old: String, with new: String) {
@@ -434,7 +452,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         }
         replace(
             "#pragma unroll\n  for (int gi = 0; gi < nGroups; ++gi) {\n    const int g = g0 + gi;\n    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));",
-            with: "  uint2 wv_next = *((const device uint2*)(wrow + 32 * g0));\n  uint2 wv_next2 = *((const device uint2*)(wrow + 32 * (g0 + min(1, nGroups - 1))));\n  float s_next = float(srow[g0]);\n  float b_next = float(brow[g0]);\n#pragma unroll\n  for (int gi = 0; gi < nGroups; ++gi) {\n    const int g = g0 + gi;\n    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));")
+            with: "  uint2 wv_next = *((const device uint2*)(wrow + 32 * g0));\n  uint2 wv_next2 = *((const device uint2*)(wrow + 32 * (g0 + min(1, nGroups - 1))));\n  float s_next = float(srow[g0]);\n  float b_next = float(brow[g0]);\n\(unroll4Enabled ? "#pragma clang loop unroll_count(4)" : "#pragma unroll")\n  for (int gi = 0; gi < nGroups; ++gi) {\n    const int g = g0 + gi;\n    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));")
         replace(
             "    const uint2 wv = *((const device uint2*)(wrow + 32 * g));\n    const float s = float(srow[g]);\n    const float b = float(brow[g]);",
             with: "    const uint2 wv = wv_next;\n    const float s = s_next;\n    const float b = b_next;\n    const int g_next = g0 + min(gi + 1, nGroups - 1);\n    const int g_next2 = g0 + min(gi + 2, nGroups - 1);\n    wv_next = wv_next2;\n    wv_next2 = *((const device uint2*)(wrow + 32 * g_next2));\n    s_next = float(srow[g_next]);\n    b_next = float(brow[g_next]);")
@@ -602,7 +620,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
 
     private static let mma8RspKernelK4096 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_rsp_v1"
-            + carry2KeySuffix,
+            + carry2KeySuffix + ur4KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -620,7 +638,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
 
     private static let mma8RspKernelK8192 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp_v1"
-            + carry2KeySuffix,
+            + carry2KeySuffix + ur4KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -735,7 +753,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
 
     private static let mma8Rsp2KernelK8192 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp2_v1"
-            + carry2KeySuffix,
+            + carry2KeySuffix + ur4KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_pairs"],
         outputNames: ["y"],
         source: """
@@ -810,6 +828,9 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
             if pairsReady {
                 if oprojCarry2Enabled {
                     CBv2EngageMark.once("oproj-carry2")
+                    if unroll4Enabled {
+                        CBv2EngageMark.once("oproj-ur4")
+                    }
                 }
                 CBv2EngageMark.once("d512-ors-oproj-pairs")
                 return mma8Rsp2KernelK8192(
@@ -824,6 +845,9 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
             if tableReady {
                 if oprojCarry2Enabled {
                     CBv2EngageMark.once("oproj-carry2")
+                    if unroll4Enabled {
+                        CBv2EngageMark.once("oproj-ur4")
+                    }
                 }
                 let kernel = inDim == 8192 ? mma8RspKernelK8192 : mma8RspKernelK4096
                 return kernel(

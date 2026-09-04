@@ -32,6 +32,30 @@ public enum CBv2AttentionOQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// H1-ATTN arm, read from the Q/K/V host so one env var runs one policy
+    /// across both 4-bit MMA8 planes. `DARKBLOOM_GEMMA4_MMA8_FP16_DEQUANT=0`
+    /// restores the promoted integer-convert A-side fill, and the incumbent
+    /// registration names with it, byte for byte in the same executable.
+    public static let fp16DequantEnabled = CBv2AttentionQKVMMA8V1.fp16DequantEnabled
+
+    private static let fp16DequantKeySuffix =
+        CBv2AttentionQKVMMA8V1.fp16DequantKeySuffix
+
+    /// OPROJ-UR4. The two live run-sum bodies have group counts 32 and 64,
+    /// both divisible by four. H1 reduces their register use, and the donor's
+    /// machine-code ladder measured unroll four below the spill ceiling while
+    /// retaining most of unroll eight's local gain. The fallback `_impl` body
+    /// stays rolled because the scored host supplies a run-sum table.
+    public static let unroll4Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_OPROJ_UNROLL4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let mma8KeySuffix =
+        fp16DequantKeySuffix + (unroll4Enabled ? "_ur4" : "")
+
     private static let batch = 8
     private static let sequence = 1
     private static let outputWidth = 2816
@@ -148,7 +172,12 @@ METAL_FUNC void attention_o_qmv_fast_crossrow_affine4_g64_tight(
     /// the two C macros are joined to single lines; every load, lane
     /// assignment, MMA step, run-sum tree, and the KS=2 threadgroup close keep
     /// the donor's text, so the accumulation order is the tier's own.
-    private static let mma8KernelHeader = """
+    private static let mma8KernelHeader =
+        mma8KernelHeaderPrefix
+        + CBv2AttentionQKVMMA8V1.mma8StepMacro
+        + mma8KernelHeaderSuffix
+
+    private static let mma8KernelHeaderPrefix = """
 #include <metal_simdgroup_matrix>
 
 #ifndef METAL_FUNC
@@ -209,9 +238,9 @@ inline float mma8_runsum4(uint4 r) {
 }
 
 #define MMA8_SETB(BB, W, HI) BB.thread_elements()[0] = mma8_##HI<T>(r0.W); BB.thread_elements()[1] = mma8_##HI<T>(r1.W);
+"""
 
-#define MMA8_STEP(BB, J) A.thread_elements()[0] = float(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = float(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, BB, C);
-
+    private static let mma8KernelHeaderSuffix = """
 template <typename T, int KS, int KFIX>
 METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
     const device uint32_t* w,
@@ -241,7 +270,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
   float acc0 = 0.0f;
   float acc1 = 0.0f;
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
   // Same register carry as the Q/K/V tier: one group's weight operands stay
   // resident while the next group's are read. Addresses are functions of the
@@ -273,22 +302,22 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
     // across the run, so every fill yields the value it yielded before and
     // the eight steps keep their order into `C`.
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_SETB(B0, x, lo)
-    MMA8_STEP(B0, 0)
-    MMA8_SETB(B1, x, hi)
-    MMA8_STEP(B1, 1)
-    MMA8_SETB(B2, y, lo)
-    MMA8_STEP(B2, 2)
-    MMA8_SETB(B3, y, hi)
-    MMA8_STEP(B3, 3)
-    MMA8_SETB(B4, z, lo)
-    MMA8_STEP(B4, 4)
-    MMA8_SETB(B5, z, hi)
-    MMA8_STEP(B5, 5)
-    MMA8_SETB(B6, w, lo)
-    MMA8_STEP(B6, 6)
-    MMA8_SETB(B7, w, hi)
-    MMA8_STEP(B7, 7)
+    MMA8_SETB(B, x, lo)
+    MMA8_STEP(B, 0)
+    MMA8_SETB(B, x, hi)
+    MMA8_STEP(B, 1)
+    MMA8_SETB(B, y, lo)
+    MMA8_STEP(B, 2)
+    MMA8_SETB(B, y, hi)
+    MMA8_STEP(B, 3)
+    MMA8_SETB(B, z, lo)
+    MMA8_STEP(B, 4)
+    MMA8_SETB(B, z, hi)
+    MMA8_STEP(B, 5)
+    MMA8_SETB(B, w, lo)
+    MMA8_STEP(B, 6)
+    MMA8_SETB(B, w, hi)
+    MMA8_STEP(B, 7)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
     acc1 += s * C.thread_elements()[1] + rs.y * b;
@@ -347,9 +376,9 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
   float acc0 = 0.0f;
   float acc1 = 0.0f;
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
-#pragma unroll
+\(unroll4Enabled ? "#pragma clang loop unroll_count(4)" : "#pragma unroll")
   for (int gi = 0; gi < nGroups; ++gi) {
     const int g = g0 + gi;
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
@@ -358,28 +387,27 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
     const float2 rs = float2(
         rs_table[c.fn * G + g], rs_table[(c.fn + 1) * G + g]);
 
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
-
     const uint2 wv = *((const device uint2*)(wrow + 32 * g));
     const float s = float(srow[g]);
     const float b = float(brow[g]);
 
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_STEP(B0, 0)
-    MMA8_STEP(B1, 1)
-    MMA8_STEP(B2, 2)
-    MMA8_STEP(B3, 3)
-    MMA8_STEP(B4, 4)
-    MMA8_STEP(B5, 5)
-    MMA8_STEP(B6, 6)
-    MMA8_STEP(B7, 7)
+    MMA8_SETB(B, x, lo)
+    MMA8_STEP(B, 0)
+    MMA8_SETB(B, x, hi)
+    MMA8_STEP(B, 1)
+    MMA8_SETB(B, y, lo)
+    MMA8_STEP(B, 2)
+    MMA8_SETB(B, y, hi)
+    MMA8_STEP(B, 3)
+    MMA8_SETB(B, z, lo)
+    MMA8_STEP(B, 4)
+    MMA8_SETB(B, z, hi)
+    MMA8_STEP(B, 5)
+    MMA8_SETB(B, w, lo)
+    MMA8_STEP(B, 6)
+    MMA8_SETB(B, w, hi)
+    MMA8_STEP(B, 7)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
     acc1 += s * C.thread_elements()[1] + rs.y * b;
@@ -404,7 +432,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
 """
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_bfill_v4",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_bfill_v4"
+            + mma8KeySuffix,
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -421,7 +450,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         ensureRowContiguous: true)
 
     private static let mma8KernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_bfill_v4",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_bfill_v4"
+            + mma8KeySuffix,
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -465,7 +495,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
     // masks 2, 4, 16 walk the same fm bits in ITS lane layout), storing the
     // lane-independent balanced fp32 tree every incumbent lane holds.
     private static let runsumTableKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_rs_table_dyn_v1",
+        name: "cbv2_b8_rs_table_dyn_v1"
+            + mma8KeySuffix,
         inputNames: ["x"],
         outputNames: ["rs"],
         source: """
@@ -556,7 +587,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
     }
 
     private static let mma8RspKernelK4096 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_rsp_v1",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_rsp_v1"
+            + mma8KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -573,7 +605,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         ensureRowContiguous: true)
 
     private static let mma8RspKernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp_v1",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp_v1"
+            + mma8KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -630,9 +663,9 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
   float acc0 = 0.0f;
   float acc1 = 0.0f;
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
-#pragma unroll
+\(unroll4Enabled ? "#pragma clang loop unroll_count(4)" : "#pragma unroll")
   for (int gi = 0; gi < nGroups; ++gi) {
     const int g = g0 + gi;
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
@@ -641,28 +674,27 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
     const float2 rs = float2(
         p0[2 * g] + p0[2 * g + 1], p1[2 * g] + p1[2 * g + 1]);
 
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
-
     const uint2 wv = *((const device uint2*)(wrow + 32 * g));
     const float s = float(srow[g]);
     const float b = float(brow[g]);
 
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_STEP(B0, 0)
-    MMA8_STEP(B1, 1)
-    MMA8_STEP(B2, 2)
-    MMA8_STEP(B3, 3)
-    MMA8_STEP(B4, 4)
-    MMA8_STEP(B5, 5)
-    MMA8_STEP(B6, 6)
-    MMA8_STEP(B7, 7)
+    MMA8_SETB(B, x, lo)
+    MMA8_STEP(B, 0)
+    MMA8_SETB(B, x, hi)
+    MMA8_STEP(B, 1)
+    MMA8_SETB(B, y, lo)
+    MMA8_STEP(B, 2)
+    MMA8_SETB(B, y, hi)
+    MMA8_STEP(B, 3)
+    MMA8_SETB(B, z, lo)
+    MMA8_STEP(B, 4)
+    MMA8_SETB(B, z, hi)
+    MMA8_STEP(B, 5)
+    MMA8_SETB(B, w, lo)
+    MMA8_STEP(B, 6)
+    MMA8_SETB(B, w, hi)
+    MMA8_STEP(B, 7)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
     acc1 += s * C.thread_elements()[1] + rs.y * b;
@@ -687,7 +719,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
 """
 
     private static let mma8Rsp2KernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp2_v1",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp2_v1"
+            + mma8KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_pairs"],
         outputNames: ["y"],
         source: """

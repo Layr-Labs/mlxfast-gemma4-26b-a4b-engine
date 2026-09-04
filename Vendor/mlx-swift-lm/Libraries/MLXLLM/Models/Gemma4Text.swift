@@ -10,6 +10,7 @@ import MLXLMCommon
 import MLXNN
 
 // Yukon executable-equivalent frontier sample: delordemm1 / e8f / de1.
+// Yukon bounded redraw: a9f26610 preserved 4/4 parity and reached 1.649436375 s decode.
 
 // MARK: - vMLX decode hot-path helpers (ported from osaurus/main Gemma4Text)
 //
@@ -82,7 +83,7 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     // The empty-set row is the control that matters: this is not "fewer is
     // always better", it is "the early pair carries all of the overlap".
     switch layerIndex {
-    case 0, 1, 2, 3:
+    case 0, 1:
         return true
     default:
         return false
@@ -138,7 +139,7 @@ private let gemma4LongPrefillChunkEvalLayers: Int = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL_LONG"],
         let value = Int(raw), value >= 0
-    else { return 3 }
+    else { return 6 }
     return value
 }()
 
@@ -1079,6 +1080,7 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
     source: """
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
+        constexpr uint row_simds = row_threads / 32;
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
         const uint lid = tid - slot * row_threads;
@@ -1087,7 +1089,6 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
         const uint row_simd = lid / 32;
 
         threadgroup float partials[RPT][32];
-        threadgroup float inv_rms[RPT];
         threadgroup T rounded[RPT][D];
         threadgroup uint row_position[RPT];
 
@@ -1138,22 +1139,22 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        // Slots 2..31 stay exactly zero, so the 32-lane combine returns the
-        // two simdgroup partials' sum whatever order the tree adds them in.
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Lanes at or above row_simds contribute exactly zero, so the 32-lane
+        // combine returns the simdgroup partials' sum whatever order the tree
+        // adds them in.
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
-            if (lane == 0) {
-                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // pg2's combine. Every simdgroup of the row reduces the same
+        // thirty-two operands the incumbent's first simdgroup reduced: the
+        // partials below row_simds, and the zero-fill's 0.0f from a register
+        // above it. Each therefore holds the bit-identical inverse rms with
+        // no zero-fill pass and no publish-back barrier.
+        sum = simd_sum(lane < row_simds ? partials[slot][lane] : 0.0f);
+        const float row_inverse_rms =
+            metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
 
         if (row >= TOTAL_ROWS) return;
-        const float inverse_rms = inv_rms[slot];
+        const float inverse_rms = row_inverse_rms;
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
             if (APPLY_ROPE) {
@@ -1279,6 +1280,7 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
     source: """
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
+        constexpr uint row_simds = row_threads / 32;
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
         const uint lid = tid - slot * row_threads;
@@ -1287,7 +1289,6 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
         const uint row_simd = lid / 32;
 
         threadgroup float partials[RPT][32];
-        threadgroup float inv_rms[RPT];
         threadgroup T rounded[RPT][D];
         threadgroup uint row_position[RPT];
 
@@ -1342,20 +1343,19 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
-            if (lane == 0) {
-                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // pg2's combine. Every simdgroup of the row reduces the same
+        // thirty-two operands the incumbent's first simdgroup reduced: the
+        // partials below row_simds, and the zero-fill's 0.0f from a register
+        // above it. Each therefore holds the bit-identical inverse rms with
+        // no zero-fill pass and no publish-back barrier.
+        sum = simd_sum(lane < row_simds ? partials[slot][lane] : 0.0f);
+        const float row_inverse_rms =
+            metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
 
         if (row >= TOTAL_ROWS) return;
-        const float inverse_rms = inv_rms[slot];
+        const float inverse_rms = row_inverse_rms;
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
             if (APPLY_ROPE && weighted) {
@@ -1419,6 +1419,7 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
     source: """
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
+        constexpr uint row_simds = row_threads / 32;
         constexpr uint mirror_row_words = D / 8 + D / 64;
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
@@ -1428,7 +1429,6 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
         const uint row_simd = lid / 32;
 
         threadgroup float partials[RPT][32];
-        threadgroup float inv_rms[RPT];
         threadgroup T rounded[RPT][D];
         threadgroup uint row_position[RPT];
         threadgroup T final_vals[RPT][D];
@@ -1491,20 +1491,19 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
-            if (lane == 0) {
-                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // pg2's combine. Every simdgroup of the row reduces the same
+        // thirty-two operands the incumbent's first simdgroup reduced: the
+        // partials below row_simds, and the zero-fill's 0.0f from a register
+        // above it. Each therefore holds the bit-identical inverse rms with
+        // no zero-fill pass and no publish-back barrier.
+        sum = simd_sum(lane < row_simds ? partials[slot][lane] : 0.0f);
+        const float row_inverse_rms =
+            metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
 
         if (valid) {
-            const float inverse_rms = inv_rms[slot];
+            const float inverse_rms = row_inverse_rms;
             for (uint i = 0; i < reads; ++i) {
                 const T normalized = T(float(input[i]) * inverse_rms);
                 if (APPLY_ROPE && weighted) {
@@ -5190,7 +5189,8 @@ private class Gemma4MLP: Module {
     /// Swift admission mirrors the kernel-side uniform predicate exactly;
     /// a nil keeps the incumbent split road untouched.
     fileprivate func zipPrefillGateUpGeGLU(_ x: MLXArray) -> MLXArray? {
-        guard gemma4DenseGeGLUEpilogueEnabled,
+        guard x.ndim >= 2, x.dim(-2) >= 512, x.dim(-1) == 2816,
+            gemma4DenseGeGLUEpilogueEnabled,
             Gemma4PrefillDeqGEMMV1.enabled,
             let gate = gateProj as? QuantizedLinear,
             let up = upProj as? QuantizedLinear,
@@ -5254,7 +5254,7 @@ private class Gemma4MLP: Module {
     ) -> MLXArray {
         // DENSE-GEGLU-EPILOGUE: the exact prefill geometry closes GeGLU inside
         // the single paired GEMM; every other rectangle falls through.
-        if let activated = zipPrefillGateUpGeGLU(x) {
+        if x.ndim >= 2 && x.dim(-2) >= 512, let activated = zipPrefillGateUpGeGLU(x) {
             return denseProjection(downProj, activated)
         }
         // DMLP-002: one exact activation-sum prepass feeds both fallback
@@ -6671,29 +6671,49 @@ public class Gemma4TextModelInner: Module {
         }
 
         // Extend cache array for shared layers (which get nil caches)
-        var fullCache: [KVCache?]
-        if let cache {
-            fullCache = cache.map { Optional($0) }
-            while fullCache.count < config.numHiddenLayers {
-                fullCache.append(nil)
+        // CBV2-DIRECT-CACHE-ACCESS: CBv2 supplies one cache per model layer,
+        // so its already-typed cache set does not need an optional wrapper or
+        // a padding traversal. Keep the boxed compatibility representation
+        // only for legacy cache providers, where shared layers are nil.
+        let cacheIsCBv2 = (cache?.first as? (any CBv2AttendingLayerCache)) != nil
+        let useDirectCBv2Cache =
+            cacheIsCBv2 && (cache?.count ?? 0) >= config.numHiddenLayers
+        if useDirectCBv2Cache {
+            CBv2EngageMark.once("gemma4-cbv2-direct-cache")
+        }
+        let isCBv2 = cacheIsCBv2
+        let directCache: [KVCache]? = useDirectCBv2Cache ? cache : nil
+        var fullCache: [KVCache?] = []
+        if directCache == nil {
+            if let cache {
+                fullCache = cache.map { Optional($0) }
+                while fullCache.count < config.numHiddenLayers {
+                    fullCache.append(nil)
+                }
+            } else {
+                fullCache = Array(repeating: nil, count: config.numHiddenLayers)
             }
-        } else {
-            fullCache = Array(repeating: nil, count: config.numHiddenLayers)
         }
 
-        // ContinuousBatchingV2 detection: v2 layer caches own attention AND
-        // masking, so the trunk builds no masks at all on that path (there is
-        // no padding and no shared frontier to mask). In v2 mode every layer
-        // (including KV-shared ones) has a cache object.
-        let isCBv2 = fullCache.contains { ($0 as? (any CBv2AttendingLayerCache)) != nil }
         // All-contiguous banks expose one position chain. Snapshot it before
         // the first layer advances the chain, then reuse that same lazy array
         // for every Q/K RoPE call in this forward.
         let unifiedCBv2PositionOffset: Gemma4.PositionOffset? = {
             guard isCBv2 else { return nil }
-            for case let entry? in fullCache {
-                if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
-                    return .batch(offsets + 0)
+            if let directCache {
+                if let offsets = (directCache.first as? CBv2LayerCache)?.unifiedPositionOffsets {
+                    return schedulePrefill ? .batch(offsets + 0) : .batch(offsets)
+                }
+                for entry in directCache {
+                    if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
+                        return schedulePrefill ? .batch(offsets + 0) : .batch(offsets)
+                    }
+                }
+            } else {
+                for case let entry? in fullCache {
+                    if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
+                        return schedulePrefill ? .batch(offsets + 0) : .batch(offsets)
+                    }
                 }
             }
             return nil
@@ -6753,9 +6773,12 @@ public class Gemma4TextModelInner: Module {
             // cache object (attendBorrowing) instead of consuming raw K/V
             // tensors. Thread the source cache alongside the source's
             // captured (pre-update) position offsets.
+            let layerCache: KVCache? =
+                directCache != nil ? directCache![idx] : fullCache[idx]
             let v2SharedSource: (any CBv2AttendingLayerCache)? =
                 isCBv2 && prevIdx != idx
-                ? fullCache[prevIdx] as? (any CBv2AttendingLayerCache) : nil
+                ? (directCache != nil ? directCache![prevIdx] : fullCache[prevIdx])
+                    as? (any CBv2AttendingLayerCache) : nil
 
             let mask = maskByType[layer.layerType]
             // Prompt-path specializations, final layer only. Every earlier
@@ -6773,11 +6796,11 @@ public class Gemma4TextModelInner: Module {
                 batchSize: h.dim(0),
                 sequenceLength: h.dim(1),
                 outputTailRows: outputTailRows,
-                hasCapableCache: fullCache[idx] is any CBv2LastQueryPrefillLayerCache)
+                hasCapableCache: layerCache is any CBv2LastQueryPrefillLayerCache)
             let (out, kvPair, positionOffset) = layer(
                 h,
                 mask: mask,
-                cache: fullCache[idx],
+                cache: layerCache,
                 perLayerInput: perLayerInputs[idx],
                 sharedKV: sharedKV,
                 positionOffset: unifiedCBv2PositionOffset ?? sharedPositionOffset,

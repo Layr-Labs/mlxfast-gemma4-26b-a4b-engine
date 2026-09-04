@@ -1,7 +1,40 @@
+// GI040 -- runtime arm selection for the JIT'd quantized family.
+// See gi040/apply040.py for the full argument.  Summary: `affine_gather_qmv`
+// is compiled from the string below at RUN TIME, so a build flag cannot reach
+// it, but the host can prepend a line to the string.  The name is on the
+// harness's DARKBLOOM_ allowlist, so it reaches the runtime worker on a
+// developer box, and the ranked workflow sets no DARKBLOOM_ variable, so the
+// ranked box always takes the default (ON).
+#include <cstdlib>
+#include <cstring>
+#include <string>
+
 namespace mlx::core::metal {
 
+namespace {
+
+const char* gemma4_gather_intra_prologue() {
+  const char* v = std::getenv("DARKBLOOM_GEMMA4_GATHER_INTRA");
+  if (v != nullptr) {
+    if (std::strcmp(v, "0") == 0 || std::strcmp(v, "off") == 0 ||
+        std::strcmp(v, "false") == 0) {
+      return "#define GEMMA4_GATHER_INTRA 0\n";
+    }
+    if (std::strcmp(v, "2") == 0 || std::strcmp(v, "poison") == 0) {
+      return "#define GEMMA4_GATHER_INTRA 2\n";
+    }
+    if (std::strcmp(v, "3") == 0 || std::strcmp(v, "kpoison") == 0) {
+      return "#define GEMMA4_GATHER_INTRA 3\n";
+    }
+  }
+  return "#define GEMMA4_GATHER_INTRA 1\n";
+}
+
+} // namespace
+
 const char* quantized() {
-  return R"preamble(
+  static const std::string source =
+      std::string(gemma4_gather_intra_prologue()) + R"preamble(
 // Copyright © 2025 Apple Inc.
 
 // Auto generated source for mlx/backend/metal/kernels/quantized.h
@@ -1605,7 +1638,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     const device T* x1,
     device T* y0,
     device T* y1,
-    const constant int& in_vec_size,
+    const int in_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -3927,6 +3960,276 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 // per-assignment quantized_matmul oracle and vs the untiled arm at
 // K = 704, N = 2816, 64 assignments over 128 experts, M = 8, spans 4 and
 // 2, 3 seeds, NaN-filled outputs (parity-down-tile, 2026-08-28).
+// GI040 arm macro.  The host injects `#define GEMMA4_GATHER_INTRA <0|1|2|3>` on
+// the first line of the JIT source string from the process environment
+// (`DARKBLOOM_GEMMA4_GATHER_INTRA`), so the `#ifndef` below only fires for a
+// translation unit compiled WITHOUT that prologue -- the ahead-of-time
+// metallib copy of `quantized.h` -- which keeps the shipped ON behaviour.
+#ifndef GEMMA4_GATHER_INTRA
+#define GEMMA4_GATHER_INTRA 1
+#endif
+// R22 reach probe.  ON in arm 2 only.  Scales the tilewalk impls' reduced
+// results, and nothing else in the kernel, so a token that moves under it is
+// proof those impls executed at production geometry.  Compile-time false in
+// arms 0 and 1: the branch is dead-code-eliminated and the ON arm's machine
+// code is byte-identical to the same tree built without this probe (screened).
+constant constexpr bool gemma4_gather_intra_poison = (GEMMA4_GATHER_INTRA == 2);
+// The companion probe for the gate/up half of the mechanism.  ON in arm 3 only.
+constant constexpr bool gemma4_gather_intra_kpoison = (GEMMA4_GATHER_INTRA == 3);
+
+// GATHER-INTRA-040 -- the activation rows the down-tile walk re-reads.
+//
+// `gather_qmv_gemma4_down_tile` walks its span consecutive 8-row y-tiles by
+// CALLING the pair impl (or the stock qmv_impl) once per tile.  Neither `x0`
+// nor `x1` depends on tid.y, so every one of those calls re-loads the SAME
+// activation row(s) from device memory and re-runs the SAME `load_vector`
+// transform on them.  The two impls below interchange the loops -- K block
+// outside, tile inside -- so each activation row is loaded ONCE per K block
+// and reused across the tiles of one walk.  Everything else about the walk
+// is unchanged: same grid, same survivors, same tiles, same weight / scale /
+// bias stream, same dispatch count.
+//
+// LOADS-ONLY RESCHEDULING, bit-identical by construction.  Tile t serves
+// out_row + t * 8, exactly as `tile_tid.y = tid.y + t` does; every
+// (tile, output row, input stream) keeps its own accumulator, visits the same
+// K blocks in the same order with the same `packed`, `s`, `b`, `x_thread` and
+// `sum`, and closes with the same `simd_sum` and the same store.  Every output
+// element's add sequence is the one the untiled arm produces for it.
+//
+// SPAN is the number of tiles whose accumulators are held at once, NOT the
+// walk's span: the walk stays at `gemma4_down_tile_span`, taken in
+// SPAN-sized passes.  SPAN = 2 holds 16 accumulators, which is what
+// `qmv_affine4_g64_quad_stream_impl` already holds, so this adds no new
+// maximum to the kernel's register footprint -- measured: on
+// `applegpu_g17s` the whole kernel is 102 temporary registers before and
+// after, and on `applegpu_g16s` 96 with the same 16 B entry spill.
+template <typename T, int group_size, int bits, int SPAN>
+METAL_FUNC void qmv_affine4_g64_pair_tilewalk_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    device T* y0,
+    device T* y1,
+    const int in_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 8;
+  constexpr int tile_rows = num_simdgroups * results_per_simdgroup;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x0_thread[values_per_thread];
+  thread float x1_thread[values_per_thread];
+  thread float result0[SPAN][results_per_simdgroup];
+  thread float result1[SPAN][results_per_simdgroup];
+  for (int t = 0; t < SPAN; t++) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[t][row] = 0.0f;
+      result1[t][row] = 0.0f;
+    }
+  }
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * tile_rows + simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  y0 += out_row;
+  y1 += out_row;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+    float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+    for (int t = 0; t < SPAN; t++) {
+      const device uint8_t* wst = ws + t * tile_rows * in_vec_size_w;
+      const device T* sst = scales + t * tile_rows * in_vec_size_g;
+      const device T* bst = biases + t * tile_rows * in_vec_size_g;
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        const uint packed = *((const device uint*)(wst + row * in_vec_size_w));
+        const float s = sst[row * in_vec_size_g];
+        const float b = bst[row * in_vec_size_g];
+        float dot0;
+        float dot1;
+        qdot_affine4_pair_word<float, values_per_thread>(
+            packed, x0_thread, x1_thread, s, b, sum0, sum1, dot0, dot1);
+        result0[t][row] += dot0;
+        result1[t][row] += dot1;
+      }
+    }
+    ws += block_size / 2;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+  }
+
+  // Same tail rule the pair impl states: every Gemma 4 caller entering this
+  // g64 path has K aligned to 64, so the final block is a whole number of
+  // eight-value lane packets (24 for the expert down_proj K = 704).
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+    float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+    for (int t = 0; t < SPAN; t++) {
+      const device uint8_t* wst = ws + t * tile_rows * in_vec_size_w;
+      const device T* sst = scales + t * tile_rows * in_vec_size_g;
+      const device T* bst = biases + t * tile_rows * in_vec_size_g;
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        const uint packed = *((const device uint*)(wst + row * in_vec_size_w));
+        const float s = sst[row * in_vec_size_g];
+        const float b = bst[row * in_vec_size_g];
+        float dot0;
+        float dot1;
+        qdot_affine4_pair_word<float, values_per_thread>(
+            packed, x0_thread, x1_thread, s, b, sum0, sum1, dot0, dot1);
+        result0[t][row] += dot0;
+        result1[t][row] += dot1;
+      }
+    }
+  }
+
+  for (int t = 0; t < SPAN; t++) {
+    device T* yt0 = y0 + t * tile_rows;
+    device T* yt1 = y1 + t * tile_rows;
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const float r0raw = simd_sum(result0[t][row]);
+      const float r1raw = simd_sum(result1[t][row]);
+      const float r0 = gemma4_gather_intra_poison ? r0raw * 1.0009f : r0raw;
+      const float r1 = gemma4_gather_intra_poison ? r1raw * 1.0009f : r1raw;
+      if (simd_lid == 0) {
+        yt0[row] = static_cast<T>(r0);
+        yt1[row] = static_cast<T>(r1);
+      }
+    }
+  }
+}
+
+// The pairless twin: the `else` arm of stock `qmv_impl` (out_vec_size >= 8,
+// K a whole number of eight-value lane packets) with the same interchange.
+// `qdot` is called with the identical (wl, x_thread, s, b, sum) it receives
+// today, so the add sequence per output element is unchanged.
+template <typename T, int group_size, int bits, int SPAN>
+METAL_FUNC void qmv_affine4_g64_single_tilewalk_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int in_vec_size,
+    const int out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 8;
+  constexpr int tile_rows = num_simdgroups * results_per_simdgroup;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x_thread[values_per_thread];
+  thread float result[SPAN][results_per_simdgroup];
+  for (int t = 0; t < SPAN; t++) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[t][row] = 0.0f;
+    }
+  }
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * tile_rows + simd_gid * results_per_simdgroup;
+  const int used_out_row = min(out_vec_size - results_per_simdgroup, out_row);
+
+  ws += used_out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += used_out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += used_out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x += tid.x * in_vec_size + simd_lid * values_per_thread;
+  y += tid.x * out_vec_size + used_out_row;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    float sum = load_vector<T, float, values_per_thread, 4>(x, x_thread);
+    for (int t = 0; t < SPAN; t++) {
+      const device uint8_t* wst = ws + t * tile_rows * in_vec_size_w;
+      const device T* sst = scales + t * tile_rows * in_vec_size_g;
+      const device T* bst = biases + t * tile_rows * in_vec_size_g;
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        auto wl = (const device uint8_t*)(wst + row * in_vec_size_w);
+        const float s = sst[row * in_vec_size_g];
+        const float b = bst[row * in_vec_size_g];
+        result[t][row] +=
+            qdot<float, values_per_thread, 4>(wl, x_thread, s, b, sum);
+      }
+    }
+    ws += block_size / 2;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    x += block_size;
+  }
+
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    float sum = load_vector<T, float, values_per_thread, 4>(x, x_thread);
+    for (int t = 0; t < SPAN; t++) {
+      const device uint8_t* wst = ws + t * tile_rows * in_vec_size_w;
+      const device T* sst = scales + t * tile_rows * in_vec_size_g;
+      const device T* bst = biases + t * tile_rows * in_vec_size_g;
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        auto wl = (const device uint8_t*)(wst + row * in_vec_size_w);
+        const float s = sst[row * in_vec_size_g];
+        const float b = bst[row * in_vec_size_g];
+        result[t][row] +=
+            qdot<float, values_per_thread, 4>(wl, x_thread, s, b, sum);
+      }
+    }
+  }
+
+  for (int t = 0; t < SPAN; t++) {
+    device T* yt = y + t * tile_rows;
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const float rraw = simd_sum(result[t][row]);
+      const float r = gemma4_gather_intra_poison ? rraw * 1.0009f : rraw;
+      if (simd_lid == 0) {
+        yt[row] = static_cast<T>(r);
+      }
+    }
+  }
+}
+
+// GATHER-INTRA gate -- GI040 RUNTIME OFF ARM.
+//
+// This value is NOT fixed at build time.  `GEMMA4_GATHER_INTRA` is injected as
+// a `#define` on the first line of the JIT source string by
+// `mlx::core::metal::quantized()`, which reads the process environment
+// variable `DARKBLOOM_GEMMA4_GATHER_INTRA` once and selects the line.  One
+// built binary reaches both arms; no rebuild, no build flag, no source edit.
+// The `#ifndef` below is the default for any translation unit that compiles
+// this text WITHOUT the host prologue -- the ahead-of-time metallib copy of
+// `quantized.h` -- so that path keeps the shipped ON behaviour.
+//
+// `false` restores the incumbent tile-call walk and the runtime-K leader
+// calls; the only residue is `qmv_affine4_g64_pair_impl` taking `in_vec_size`
+// BY VALUE instead of by `constant` reference, which was screened
+// byte-identical on both architectures (canonical-name inner-Mach-O `__text`
+// diff, negative control clean).
+constant constexpr bool gemma4_gather_intra = (GEMMA4_GATHER_INTRA != 0);
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device uint32_t* w,
@@ -3948,6 +4251,13 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint simd_gid,
     uint simd_lid) {
   constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  // GATHER-INTRA: the single caller is guarded by `in_vec_size == 704`, and
+  // the pair geometry then forces `out_vec_size == 2816`, so both fold.  The
+  // folds ride the same flip as the walk so a revert cannot leave them behind.
+  const int tile_in_vec_size = gemma4_gather_intra ? 704 : in_vec_size;
+  const int tile_out_vec_size = gemma4_gather_intra ? 2816 : out_vec_size;
+  // Tiles whose accumulators are held at once. The walk is unchanged.
+  constexpr int gemma4_gather_intra_hold = 2;
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }
@@ -3985,6 +4295,27 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device T* tile_x1 =
         x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
     device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+    if (gemma4_gather_intra) {
+      for (int h = 0; h < gemma4_down_tile_span / gemma4_gather_intra_hold;
+           h++) {
+        uint3 walk_tid = tid;
+        walk_tid.y = tid.y + uint(h * gemma4_gather_intra_hold);
+        qmv_affine4_g64_pair_tilewalk_impl<
+            T, group_size, bits, gemma4_gather_intra_hold>(
+            tile_w,
+            tile_scales,
+            tile_biases,
+            tile_x0,
+            tile_x1,
+            tile_y0,
+            tile_y1,
+            tile_in_vec_size,
+            walk_tid,
+            simd_gid,
+            simd_lid);
+      }
+      return;
+    }
     for (int t = 0; t < gemma4_down_tile_span; t++) {
       uint3 tile_tid = tid;
       tile_tid.y = tid.y + uint(t);
@@ -3998,6 +4329,26 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
           tile_y1,
           in_vec_size,
           tile_tid,
+          simd_gid,
+          simd_lid);
+    }
+    return;
+  }
+  if (gemma4_gather_intra) {
+    for (int h = 0; h < gemma4_down_tile_span / gemma4_gather_intra_hold;
+         h++) {
+      uint3 walk_tid = tid;
+      walk_tid.y = tid.y + uint(h * gemma4_gather_intra_hold);
+      qmv_affine4_g64_single_tilewalk_impl<
+          T, group_size, bits, gemma4_gather_intra_hold>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_y0,
+          tile_in_vec_size,
+          tile_out_vec_size,
+          walk_tid,
           simd_gid,
           simd_lid);
     }
@@ -4119,6 +4470,13 @@ template <typename T, int group_size, int bits>
       }
     }
     if (run_len > 1) {
+      // GATHER-INTRA: the `in_vec_size == 704` leg returned above and the pair
+      // geometry admits only 2816 or 704, so K is provably 2816 here.  The fold
+      // is tied to `gemma4_down_tile` as well: without that early return this
+      // block would also see K = 704.
+      const int run_in_vec_size = (gemma4_gather_intra && gemma4_down_tile)
+          ? (gemma4_gather_intra_kpoison ? 2560 : 2816)
+          : in_vec_size;
       const device uint32_t* run_w = w + expert * w_strides[0];
       const device T* run_scales = scales + expert * s_strides[0];
       const device T* run_biases = biases + expert * b_strides[0];
@@ -4137,7 +4495,7 @@ template <typename T, int group_size, int bits>
             run_x1,
             run_y0,
             run_y1,
-            in_vec_size,
+            run_in_vec_size,
             tid,
             simd_gid,
             simd_lid);
@@ -4157,7 +4515,7 @@ template <typename T, int group_size, int bits>
             run_y0,
             run_y1,
             run_y2,
-            in_vec_size,
+            run_in_vec_size,
             tid,
             simd_gid,
             simd_lid);
@@ -4178,7 +4536,7 @@ template <typename T, int group_size, int bits>
           run_y1,
           run_y2,
           run_y3,
-          in_vec_size,
+          run_in_vec_size,
           tid,
           simd_gid,
           simd_lid);
@@ -4909,6 +5267,7 @@ template <typename T, const int group_size, const int bits>
 
 ///////////////////////////////////////////////////////////////////////////////
 )preamble";
+  return source.c_str();
 }
 
 } // namespace mlx::core::metal

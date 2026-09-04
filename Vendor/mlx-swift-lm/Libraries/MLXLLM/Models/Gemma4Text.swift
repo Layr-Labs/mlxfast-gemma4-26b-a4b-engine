@@ -2494,6 +2494,34 @@ private class Gemma4Attention: Module {
             rsTable: rsTable)
     }
 
+    /// QKVFUSE-001. A sliding layer's Q, K and V read the same activation at
+    /// decode and share every quantization parameter, so all three planes
+    /// concatenate into one dispatch. V has no epilogue in this tier — q/k
+    /// RMSNorm and RoPE run downstream in the resident attention kernel,
+    /// which takes V raw — so the fused store only routes columns, never
+    /// arithmetic. Nil whenever the shapes, the quantization parameters or
+    /// `DARKBLOOM_GEMMA4_QKV_FUSE_V=0` say otherwise, which leaves the
+    /// QKFUSE-001 Q|K dispatch plus the standalone V dispatch in place.
+    @inline(__always)
+    private func fusedQKVProjection(
+        _ x: MLXArray, rsTable: MLXArray? = nil
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard let q = qProj as? QuantizedLinear, q.bias == nil,
+            let kProj, let k = kProj as? QuantizedLinear, k.bias == nil,
+            let vProj, let v = vProj as? QuantizedLinear, v.bias == nil,
+            q.groupSize == k.groupSize, q.bits == k.bits, q.mode == k.mode,
+            q.groupSize == v.groupSize, q.bits == v.bits, q.mode == v.mode
+        else { return nil }
+        return CBv2AttentionQKVMMA8V1.fusedQKVMatmul(
+            x: x,
+            qWeight: q.weight, qScales: q.scales, qBiases: q.biases,
+            kWeight: k.weight, kScales: k.scales, kBiases: k.biases,
+            vWeight: v.weight, vScales: v.scales, vBiases: v.biases,
+            groupSize: q.groupSize, bits: q.bits, mode: q.mode,
+            cacheKey: ObjectIdentifier(q),
+            rsTable: rsTable)
+    }
+
     /// Exact B8/L1 attention output projection. Sliding/full K widths select
     /// the tight affine4 fast-QMV replica; every other path keeps the layer.
     /// MMA-RS-001: the projection input's run-sum table is computed here (the
@@ -2733,7 +2761,8 @@ private class Gemma4Attention: Module {
         // QKFUSE-001: `queryInput === x` unless last-query prefill narrowed it,
         // which is the only case where Q and K cannot share a dispatch.
         // QKFUSE-SLIDING: sliding layers (vProj != nil) take the fused Q|K
-        // dispatch too; V keeps its separate tierProjection below, and the
+        // dispatch too; V joins that dispatch under QKVFUSE-001 below (or
+        // keeps its separate tierProjection when that arm is off), and the
         // K-eq-V structure is untouched (keyValueShared stays vProj == nil).
         // `DARKBLOOM_GEMMA4_QKFUSE_SLIDING=0` restores the vProj == nil gate.
         // The relaxation is only reachable here; fusedQKProjection's own
@@ -2744,12 +2773,25 @@ private class Gemma4Attention: Module {
         // table — the table is per activation row and per 64-group of K,
         // independent of N, so the concatenated-N dispatch reads the same
         // entries the separate Q and K dispatches would.
-        let fusedQK: (MLXArray, MLXArray)? =
-            (lastQueryCache == nil && !usesSharedKV
-                && (vProj == nil || gemma4QKFuseSlidingEnabled))
-            ? fusedQKProjection(x, rsTable: qkvRunsumTable) : nil
+        // QKVFUSE-001: on a sliding layer the private V plane joins the same
+        // dispatch (Q 4096 || K 2048 || V 2048). The fused entry point fails
+        // closed on every shape but that one, and on
+        // `DARKBLOOM_GEMMA4_QKV_FUSE_V=0`, in which case the Q|K fuse below
+        // and the standalone V projection run exactly as they do today.
+        let fusedQKV: (MLXArray, MLXArray, MLXArray)? =
+            (lastQueryCache == nil && !usesSharedKV && vProj != nil
+                && gemma4QKFuseSlidingEnabled)
+            ? fusedQKVProjection(x, rsTable: qkvRunsumTable) : nil
+        var fusedQK: (MLXArray, MLXArray)? = nil
+        if fusedQKV == nil,
+            lastQueryCache == nil, !usesSharedKV,
+            vProj == nil || gemma4QKFuseSlidingEnabled
+        {
+            fusedQK = fusedQKProjection(x, rsTable: qkvRunsumTable)
+        }
         let queryRaw = (
-            fusedQK?.0 ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
+            fusedQKV?.0 ?? fusedQK?.0
+                ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
         ).reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
@@ -2813,10 +2855,13 @@ private class Gemma4Attention: Module {
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
         let kRaw = (
-            fusedQK?.1 ?? tierProjection(kProj, x, rsTable: qkvRunsumTable)
+            fusedQKV?.1 ?? fusedQK?.1
+                ?? tierProjection(kProj, x, rsTable: qkvRunsumTable)
         ).reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
-        if let vProj {
+        if let fusedV = fusedQKV?.2 {
+            vRaw = fusedV.reshaped(B, L, nKvHeads, effectiveHeadDim)
+        } else if let vProj {
             vRaw = tierProjection(vProj, x, rsTable: qkvRunsumTable)
                 .reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
@@ -6686,14 +6731,25 @@ public class Gemma4TextModelInner: Module {
         // no padding and no shared frontier to mask). In v2 mode every layer
         // (including KV-shared ones) has a cache object.
         let isCBv2 = fullCache.contains { ($0 as? (any CBv2AttendingLayerCache)) != nil }
-        // All-contiguous banks expose one position chain. Snapshot it before
+        // All-contiguous banks expose one position chain. Capture it before
         // the first layer advances the chain, then reuse that same lazy array
         // for every Q/K RoPE call in this forward.
+        //
+        // No defensive `+ 0` copy is needed on this chain: the handle read
+        // here is already an immutable snapshot. The bank's shared position
+        // state only ever REBINDS its stored array
+        // (`positionOffsetsState.value = positionOffsetsState.value + L`,
+        // CBv2LayerCache.updateAndAttend) and never mutates one in place, and
+        // the bank elects exactly one owning cache to advance it. A `+ 0` here
+        // would be a whole int32 `[8]` add dispatch at the head of every
+        // forward for a value that cannot shift. The standalone / paged-cache
+        // capture keeps its own `+ 0`: that is a different chain, advanced by
+        // the same layer that reads it.
         let unifiedCBv2PositionOffset: Gemma4.PositionOffset? = {
             guard isCBv2 else { return nil }
             for case let entry? in fullCache {
                 if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
-                    return .batch(offsets + 0)
+                    return .batch(offsets)
                 }
             }
             return nil
@@ -6757,7 +6813,12 @@ public class Gemma4TextModelInner: Module {
                 isCBv2 && prevIdx != idx
                 ? fullCache[prevIdx] as? (any CBv2AttendingLayerCache) : nil
 
-            let mask = maskByType[layer.layerType]
+            // HA5: `maskByType` is only ever written inside the `if !isCBv2`
+            // block above, so on the CBv2 path it is still empty here and the
+            // lookup can only return nil. Skipping it drops one heap-backed
+            // String hash + retain/release per layer per step.
+            let mask: MLXFast.ScaledDotProductAttentionMaskMode? =
+                isCBv2 ? nil : maskByType[layer.layerType]
             // Prompt-path specializations, final layer only. Every earlier
             // layer runs the full chunk unchanged because later positions'
             // K/V depend on it.
@@ -6773,7 +6834,13 @@ public class Gemma4TextModelInner: Module {
                 batchSize: h.dim(0),
                 sequenceLength: h.dim(1),
                 outputTailRows: outputTailRows,
-                hasCapableCache: fullCache[idx] is any CBv2LastQueryPrefillLayerCache)
+                // HA5: `gemma4UseLastQueryPrefill` ANDs `outputTailRows == 1`
+                // into its result, so when that is false the probe's value
+                // cannot change the answer. Guarding it keeps the existential
+                // conformance check off the decode path (outputTailRows is nil
+                // there, because `isFinalPromptLayer` requires schedulePrefill).
+                hasCapableCache: outputTailRows == 1
+                    && (fullCache[idx] is any CBv2LastQueryPrefillLayerCache))
             let (out, kvPair, positionOffset) = layer(
                 h,
                 mask: mask,

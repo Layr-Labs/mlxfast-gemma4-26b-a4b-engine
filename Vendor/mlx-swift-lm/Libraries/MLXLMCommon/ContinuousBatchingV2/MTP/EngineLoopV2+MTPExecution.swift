@@ -30,6 +30,46 @@ struct CBv2MTPGraphBuild {
 
 extension EngineLoopV2 {
 
+    /// Return the decode sampler's host vectors from the engine-owned cache.
+    /// `CBv2ScheduledRequest.request` is immutable for a live row, but ids can
+    /// be reused after finish, so compare the complete sampling value before
+    /// reusing a vector. This method runs only on `engineQueue`.
+    private func mtpDecodeRowVectors(
+        for rows: [CBv2MTPRowWork]
+    ) -> (sampling: [CBv2SamplingParams], requestIDs: [CBv2RequestID]) {
+        guard mtpDecodeCachedRowIDs.count == rows.count,
+            mtpDecodeCachedSampling.count == rows.count,
+            zip(rows.indices, rows).allSatisfy({ index, row in
+                mtpDecodeCachedRowIDs[index] == row.rec.id
+                    && mtpSamplingParamsEqual(
+                        mtpDecodeCachedSampling[index], row.rec.request.sampling)
+            })
+        else {
+            let ids = rows.map(\.rec.id)
+            let sampling = rows.map(\.rec.request.sampling)
+            mtpDecodeCachedRowIDs = ids
+            mtpDecodeCachedSampling = sampling
+            return (sampling, ids)
+        }
+        return (mtpDecodeCachedSampling, mtpDecodeCachedRowIDs)
+    }
+
+    private func mtpSamplingParamsEqual(
+        _ lhs: CBv2SamplingParams, _ rhs: CBv2SamplingParams
+    ) -> Bool {
+        lhs.temperature == rhs.temperature
+            && lhs.topP == rhs.topP
+            && lhs.topK == rhs.topK
+            && lhs.minP == rhs.minP
+            && lhs.repetitionPenalty == rhs.repetitionPenalty
+            && lhs.repetitionContextSize == rhs.repetitionContextSize
+            && lhs.frequencyPenalty == rhs.frequencyPenalty
+            && lhs.presencePenalty == rhs.presencePenalty
+            && lhs.seed == rhs.seed
+            && lhs.logitBias == rhs.logitBias
+            && lhs.topLogprobs == rhs.topLogprobs
+    }
+
     func mtpPrepareRoundWork(
         _ plan: CBv2StepPlan,
         driver mtp: CBv2MTPRoundDriver,
@@ -102,10 +142,11 @@ extension EngineLoopV2 {
             let caches = eagerCaches(rowStates: decodeRows.map { kvStates[$0.rec.id]! })
             let (logits, hidden) = mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
+            let rowVectors = mtpDecodeRowVectors(for: decodeRows)
             decodeSampled = sampler.sample(
                 logits: logits[0..., -1, 0...],
-                params: decodeRows.map(\.rec.request.sampling),
-                requestIDs: decodeRows.map(\.rec.id),
+                params: rowVectors.sampling,
+                requestIDs: rowVectors.requestIDs,
                 stepIndex: stepCount,
                 pendingSampledTokens: nil,
                 rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })

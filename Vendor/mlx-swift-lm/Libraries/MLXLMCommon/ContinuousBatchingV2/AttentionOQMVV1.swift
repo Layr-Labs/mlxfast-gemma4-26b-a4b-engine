@@ -32,6 +32,21 @@ public enum CBv2AttentionOQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// CARRY-RSP. The run-sum-prefix o_proj bodies are the only bodies this
+    /// plane dispatches on a scored decode step -- `_rsp` 25 times (the
+    /// sliding layers), `_rsp2` 5 times (the full layers), `_impl` never --
+    /// and both of them read the group's packed weight word, scale and bias
+    /// immediately before the matrix-unit steps that consume them. This
+    /// carries those operands two groups ahead, exactly as the tip's own
+    /// `qkv_mma8_affine4_g64_impl` does one file over. Kill switch restores
+    /// the inherited bodies, whose source strings do not move.
+    public static let carryRspEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ATTN_O_CARRY_RSP"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let sequence = 1
     private static let outputWidth = 2816
@@ -703,6 +718,283 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
         header: mma8Rsp2KernelHeader,
         ensureRowContiguous: true)
 
+
+    // CARRY-RSP bodies. Held in headers of their own rather than appended to
+    // `mma8KernelHeader`, so no inherited kernel's source string moves and
+    // none can serve a different body under an unchanged name.
+    private static let mma8RspCarryKernelHeader = mma8KernelHeader + """
+template <typename T, int KS, int KFIX>
+METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp_carry2(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    const device float* rs_table,
+    device T* y,
+    const int N,
+    const int n0,
+    threadgroup float2* red,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int K = KFIX;
+  constexpr int G = K / 64;
+  constexpr int gh = (G + 1) / 2;
+  constexpr int nGroups = (KS == 2) ? gh : G;
+  const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const mma8_coord c = mma8_lane(simd_lid);
+
+  const device uint8_t* wrow =
+      (const device uint8_t*)w + (n0 + c.fm) * (K / 2) + 4 * c.fn;
+  const device T* srow = scales + (n0 + c.fm) * G;
+  const device T* brow = biases + (n0 + c.fm) * G;
+  const device T* x0 = x + c.fn * K + 8 * c.fm;
+  const device T* x1 = x0 + K;
+
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+  simdgroup_float8x8 A;
+  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+  // CARRY-RSP. The tip's own two-deep weight-operand carry, as it stands in
+  // `qkv_mma8_affine4_g64_impl` one file over, applied to the run-sum-prefix
+  // o_proj bodies that dropped it. A group's packed weight word, scale and
+  // bias are read two groups ahead of the arithmetic that consumes them, so
+  // the read is issued while the previous group's fragment build and eight
+  // matrix-unit steps are still running. Every address is a function of the
+  // group index alone, and `g_next` / `g_next2` are clamped to the
+  // simdgroup's last group, so no new address is formed and the values
+  // re-read on the final trips are discarded at loop exit. The activation
+  // reads, the run-sum table reads, the fragment build, the eight matrix-unit
+  // steps, the accumulation order into C and the affine close are unchanged.
+  uint2 wv_next = *((const device uint2*)(wrow + 32 * g0));
+  uint2 wv_next2 =
+      *((const device uint2*)(wrow + 32 * (g0 + min(1, nGroups - 1))));
+  T s_next = srow[g0];
+  T b_next = brow[g0];
+
+#pragma unroll
+  for (int gi = 0; gi < nGroups; ++gi) {
+    const int g = g0 + gi;
+    const uint2 wv = wv_next;
+    const float s = float(s_next);
+    const float b = float(b_next);
+    const int g_next = g0 + min(gi + 1, nGroups - 1);
+    const int g_next2 = g0 + min(gi + 2, nGroups - 1);
+    wv_next = wv_next2;
+    wv_next2 = *((const device uint2*)(wrow + 32 * g_next2));
+    s_next = srow[g_next];
+    b_next = brow[g_next];
+
+    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+    const float2 rs = float2(
+        rs_table[c.fn * G + g], rs_table[(c.fn + 1) * G + g]);
+
+    MMA8_SETB(B0, x, lo)
+    MMA8_SETB(B1, x, hi)
+    MMA8_SETB(B2, y, lo)
+    MMA8_SETB(B3, y, hi)
+    MMA8_SETB(B4, z, lo)
+    MMA8_SETB(B5, z, hi)
+    MMA8_SETB(B6, w, lo)
+    MMA8_SETB(B7, w, hi)
+
+    simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+    MMA8_STEP(B0, 0)
+    MMA8_STEP(B1, 1)
+    MMA8_STEP(B2, 2)
+    MMA8_STEP(B3, 3)
+    MMA8_STEP(B4, 4)
+    MMA8_STEP(B5, 5)
+    MMA8_STEP(B6, 6)
+    MMA8_STEP(B7, 7)
+
+    acc0 += s * C.thread_elements()[0] + rs.x * b;
+    acc1 += s * C.thread_elements()[1] + rs.y * b;
+  }
+
+  if (KS == 2) {
+    if (simd_gid == 1) {
+      red[simd_lid] = float2(acc0, acc1);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 1) {
+      return;
+    }
+    const float2 other = red[simd_lid];
+    acc0 = acc0 + other.x;
+    acc1 = acc1 + other.y;
+  }
+
+  y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
+  y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
+}
+"""
+
+    private static let mma8Rsp2CarryKernelHeader = mma8KernelHeader + """
+template <typename T, int KS, int KFIX>
+METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2_carry2(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    const device float* rs_pairs,
+    device T* y,
+    const int N,
+    const int n0,
+    threadgroup float2* red,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int K = KFIX;
+  constexpr int G = K / 64;
+  constexpr int gh = (G + 1) / 2;
+  constexpr int nGroups = (KS == 2) ? gh : G;
+  const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const mma8_coord c = mma8_lane(simd_lid);
+
+  const device uint8_t* wrow =
+      (const device uint8_t*)w + (n0 + c.fm) * (K / 2) + 4 * c.fn;
+  const device T* srow = scales + (n0 + c.fm) * G;
+  const device T* brow = biases + (n0 + c.fm) * G;
+  const device T* x0 = x + c.fn * K + 8 * c.fm;
+  const device T* x1 = x0 + K;
+  const device float* p0 = rs_pairs + c.fn * (2 * G);
+  const device float* p1 = p0 + 2 * G;
+
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+  simdgroup_float8x8 A;
+  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+  // CARRY-RSP. The tip's own two-deep weight-operand carry, as it stands in
+  // `qkv_mma8_affine4_g64_impl` one file over, applied to the run-sum-prefix
+  // o_proj bodies that dropped it. A group's packed weight word, scale and
+  // bias are read two groups ahead of the arithmetic that consumes them, so
+  // the read is issued while the previous group's fragment build and eight
+  // matrix-unit steps are still running. Every address is a function of the
+  // group index alone, and `g_next` / `g_next2` are clamped to the
+  // simdgroup's last group, so no new address is formed and the values
+  // re-read on the final trips are discarded at loop exit. The activation
+  // reads, the run-sum table reads, the fragment build, the eight matrix-unit
+  // steps, the accumulation order into C and the affine close are unchanged.
+  uint2 wv_next = *((const device uint2*)(wrow + 32 * g0));
+  uint2 wv_next2 =
+      *((const device uint2*)(wrow + 32 * (g0 + min(1, nGroups - 1))));
+  T s_next = srow[g0];
+  T b_next = brow[g0];
+
+#pragma unroll
+  for (int gi = 0; gi < nGroups; ++gi) {
+    const int g = g0 + gi;
+    const uint2 wv = wv_next;
+    const float s = float(s_next);
+    const float b = float(b_next);
+    const int g_next = g0 + min(gi + 1, nGroups - 1);
+    const int g_next2 = g0 + min(gi + 2, nGroups - 1);
+    wv_next = wv_next2;
+    wv_next2 = *((const device uint2*)(wrow + 32 * g_next2));
+    s_next = srow[g_next];
+    b_next = brow[g_next];
+
+    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+    const float2 rs = float2(
+        p0[2 * g] + p0[2 * g + 1], p1[2 * g] + p1[2 * g + 1]);
+
+    MMA8_SETB(B0, x, lo)
+    MMA8_SETB(B1, x, hi)
+    MMA8_SETB(B2, y, lo)
+    MMA8_SETB(B3, y, hi)
+    MMA8_SETB(B4, z, lo)
+    MMA8_SETB(B5, z, hi)
+    MMA8_SETB(B6, w, lo)
+    MMA8_SETB(B7, w, hi)
+
+    simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+    MMA8_STEP(B0, 0)
+    MMA8_STEP(B1, 1)
+    MMA8_STEP(B2, 2)
+    MMA8_STEP(B3, 3)
+    MMA8_STEP(B4, 4)
+    MMA8_STEP(B5, 5)
+    MMA8_STEP(B6, 6)
+    MMA8_STEP(B7, 7)
+
+    acc0 += s * C.thread_elements()[0] + rs.x * b;
+    acc1 += s * C.thread_elements()[1] + rs.y * b;
+  }
+
+  if (KS == 2) {
+    if (simd_gid == 1) {
+      red[simd_lid] = float2(acc0, acc1);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 1) {
+      return;
+    }
+    const float2 other = red[simd_lid];
+    acc0 = acc0 + other.x;
+    acc1 = acc1 + other.y;
+  }
+
+  y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
+  y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
+}
+"""
+
+    private static let mma8RspCarryKernelK4096 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_rsp_v1_carry2",
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            attention_o_qmv_mma8_affine4_g64_rsp_carry2<T, 2, 4096>(
+                w, scales, biases, x, rs_table, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8RspCarryKernelHeader,
+        ensureRowContiguous: true)
+
+    private static let mma8RspCarryKernelK8192 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp_v1_carry2",
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            attention_o_qmv_mma8_affine4_g64_rsp_carry2<T, 2, 8192>(
+                w, scales, biases, x, rs_table, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8RspCarryKernelHeader,
+        ensureRowContiguous: true)
+
+    private static let mma8Rsp2CarryKernelK8192 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp2_v1_carry2",
+        inputNames: ["x", "w", "scales", "biases", "rs_pairs"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            attention_o_qmv_mma8_affine4_g64_rsp2_carry2<T, 2, 8192>(
+                w, scales, biases, x, rs_pairs, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8Rsp2CarryKernelHeader,
+        ensureRowContiguous: true)
+
     @inline(__always)
     private static func liveInputWidth(_ width: Int) -> Bool {
         width == 4096 || width == 8192
@@ -761,7 +1053,9 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
             let yTiles = outputWidth / outputsPerGroup
             if pairsReady {
                 CBv2EngageMark.once("d512-ors-oproj-pairs")
-                return mma8Rsp2KernelK8192(
+                let rsp2Kernel =
+                    carryRspEnabled ? mma8Rsp2CarryKernelK8192 : mma8Rsp2KernelK8192
+                return rsp2Kernel(
                     [x, weight, scales, biases, rsPairTable!],
                     template: [("T", x.dtype)],
                     grid: (simdWidth, yTiles * simdGroups, 1),
@@ -771,7 +1065,11 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
                 )[0]
             }
             if tableReady {
-                let kernel = inDim == 8192 ? mma8RspKernelK8192 : mma8RspKernelK4096
+                let kernel =
+                    carryRspEnabled
+                    ? (inDim == 8192
+                        ? mma8RspCarryKernelK8192 : mma8RspCarryKernelK4096)
+                    : (inDim == 8192 ? mma8RspKernelK8192 : mma8RspKernelK4096)
                 return kernel(
                     [x, weight, scales, biases, rsTable!],
                     template: [("T", x.dtype)],

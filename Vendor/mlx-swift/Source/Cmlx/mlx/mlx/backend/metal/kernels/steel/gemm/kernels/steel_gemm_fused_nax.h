@@ -38,7 +38,7 @@ constant bool align_K [[function_constant(202)]];
 // Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_SKIP_EMPTY=0 and both guards
 // fold to the incumbent unconditional form.
 #ifndef DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY
-#define DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY 1
+#define DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY 0
 #endif
 
 // clang-format off

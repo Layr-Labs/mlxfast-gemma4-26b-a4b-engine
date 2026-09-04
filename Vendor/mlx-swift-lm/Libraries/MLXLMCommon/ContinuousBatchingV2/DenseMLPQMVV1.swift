@@ -886,11 +886,48 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
               for (int gi = 0; gi < nGroups; ++gi) {
                 const int g = g0 + gi;
             """)
+        // GATEUP-CARRY2: transplant DMLP-DOWN-CARRY2-021 onto the gate/up
+        // MMA8 body. This plane runs 60 times per decode step (vs 30 down)
+        // and still reads w/s/b at the point of use. Codes go two groups
+        // deep; scale and bias stay one group ahead. `g` is monotone and
+        // nGroups is a compile-time constant (22), so the hand-off is
+        // register renaming in the unrolled body. The final look-ahead
+        // re-reads G-1 and is discarded. Arithmetic into C and the affine
+        // close is unchanged — the read stays at the statement it occupied.
+        replaceOnce(
+            """
+              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+            """,
+            with: """
+              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+              uint4 wv_next = *((const device uint4*)(wrow + 64 * g0));
+              uint4 wv_next2 =
+                  *((const device uint4*)(wrow + 64 * min(g0 + 1, G - 1)));
+              T s_next = srow[g0];
+              T b_next = brow[g0];
+            """)
+        replaceOnce(
+            """
+                const uint4 wv = *((const device uint4*)(wrow + 64 * g));
+                const float s = float(srow[g]);
+                const float b = float(brow[g]);
+            """,
+            with: """
+                const uint4 wv = wv_next;
+                const float s = float(s_next);
+                const float b = float(b_next);
+                const int g_next = min(g + 1, G - 1);
+                wv_next = wv_next2;
+                wv_next2 = *((const device uint4*)(wrow + 64 * min(g + 2, G - 1)));
+                s_next = srow[g_next];
+                b_next = brow[g_next];
+            """)
         return result
     }()
 
     private static let mma8GateUpStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_k2816_u2_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_k2816_u2_carry2_v1",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -1359,6 +1396,7 @@ inline U qdot_affine8_registered_v4(
             if isGateUp {
                 if mma8GateUpStaticKEnabled {
                     CBv2EngageMark.once("mlp-gateup-k2816-u2")
+                    CBv2EngageMark.once("mlp-gateup-k2816-u2-carry2")
                 }
                 selectedMMA = mma8GateUpStaticKEnabled
                     ? mma8GateUpStaticKKernel : mma8Kernel

@@ -696,7 +696,7 @@ enum CBv2PrefillSoftmaxVecV1 {
     }()
 
     @inline(__always)
-    private static func getParams(axisSize: Int, numSimdgroups: Int) -> MLXArray {
+    fileprivate static func getParams(axisSize: Int, numSimdgroups: Int) -> MLXArray {
         if let hit = precomputedParams[axisSize] {
             return hit
         }
@@ -826,6 +826,15 @@ enum CBv2PrefillAttnTrafficV1 {
         ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_PREFILL_ATTN_TRAFFIC_XCHECK"]
         == "1"
 
+    /// Memoized parameter buffer reuse for the statistics pre-pass.
+    /// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_STATS_PARAMS_MEMO=0` restores dynamic allocation.
+    static let paramsMemoEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_STATS_PARAMS_MEMO"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// softmax.cpp's SOFTMAX_LOOPED_LIMIT: the transcribed block kernel.
     private static let maxKeyLength = 4096
 
@@ -908,7 +917,14 @@ enum CBv2PrefillAttnTrafficV1 {
         let rows = CBv2PrefillSoftmaxVecV1.rowsPerThreadgroup(
             axisSize: axisSize, threadgroupSize: threadgroupSize)
         guard rows >= 1, rows * threadgroupSize <= 1024 else { return nil }
-        let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        let paramsArray: MLXArray
+        if paramsMemoEnabled {
+            CBv2EngageMark.once("prefill-stats-params-memo")
+            paramsArray = CBv2PrefillSoftmaxVecV1.getParams(
+                axisSize: axisSize, numSimdgroups: numSimdgroups)
+        } else {
+            paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        }
         var statsShape = scores.shape
         statsShape[statsShape.count - 1] = 4
 

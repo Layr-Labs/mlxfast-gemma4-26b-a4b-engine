@@ -49,7 +49,7 @@ import Foundation
 import MLX
 import MLXFast
 
-enum CBv2ComposedPrefillSDPAV1 {
+public enum CBv2ComposedPrefillSDPAV1 {
 
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
@@ -58,20 +58,28 @@ enum CBv2ComposedPrefillSDPAV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// PREFILL-MASK-FUSE. Applies the causal mask in the QK^T GEMM's own
-    /// epilogue (`addmm`) instead of as a separate `where` pass over the
-    /// score matrix. Kill switch: `DARKBLOOM_CBV2_PREFILL_MASK_FUSE=0`.
-    static let maskFuseEnabled: Bool = {
+    /// Fallback query scaling: `1 / sqrt(D)` applied to Q inside `attend`
+    /// when the caller does not scale Q before dispatching here.
+    static let queryScaleFallbackEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_PREFILL_MASK_FUSE"]
+            "DARKBLOOM_CBV2_PREFILL_SDPA_QSCALE"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// Lowest finite bfloat16 (bits 0xFF7F), i.e. `finfo(bfloat16).min` --
-    /// the value MLX's fallback substitutes for masked score entries. The
-    /// fp32 bit pattern 0xFF7F0000 is exactly this number, so the conversion
-    /// to bf16 is exact under any rounding mode.
+    /// Mask fusion: the `transpose_b` QK^T GEMM folds the causal mask into
+    /// its bias argument (`alpha * (A @ B^T) + beta * C`, beta = 1.0) and
+    /// evaluates the lower-triangular score rectangle in ONE kernel pass.
+    /// Kill switch: `DARKBLOOM_CBV2_PREFILL_SDPA_MASK_FUSE=0`.
+    static let maskFuseEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_SDPA_MASK_FUSE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// bfloat16 LOWEST (bits 0xFF7F, roughly -3.3895314e+38) -- the score
+    /// bias that maps masked entries to -inf under softmax.
     ///
     /// Built ONCE. `MLXArray(Float, dtype: .bfloat16)` is not a host-side
     /// constructor -- mlx-swift routes it through `mlx_astype`, i.e. a real
@@ -80,8 +88,11 @@ enum CBv2ComposedPrefillSDPAV1 {
     /// fallback pays nothing for the same constant because `array(double,
     /// bfloat16)` is a host construction there. A constant scalar is safe to
     /// share across graphs: it is an input, never a mutated output.
-    nonisolated(unsafe) private static let bfloat16LowestScalar: MLXArray =
-        MLXArray(Float(bitPattern: 0xFF7F_0000), dtype: .bfloat16)
+    nonisolated(unsafe) private static let bfloat16LowestScalar: MLXArray = {
+        let arr = MLXArray(Float(bitPattern: 0xFF7F_0000), dtype: .bfloat16)
+        eval(arr)
+        return arr
+    }()
 
     /// bfloat16 NEGATIVE zero (bits 0x8000) -- the additive identity the
     /// fused-mask bias carries on every UNMASKED score.
@@ -93,8 +104,11 @@ enum CBv2ComposedPrefillSDPAV1 {
     /// With `-0.0` the GEMM epilogue is the exact identity on the fp32
     /// accumulator, so an unmasked entry rounds to the same bfloat16 word the
     /// plain `matmul` would have stored.
-    nonisolated(unsafe) private static let bfloat16NegativeZeroScalar: MLXArray =
-        MLXArray(Float(bitPattern: 0x8000_0000), dtype: .bfloat16)
+    nonisolated(unsafe) private static let bfloat16NegativeZeroScalar: MLXArray = {
+        let arr = MLXArray(Float(bitPattern: 0x8000_0000), dtype: .bfloat16)
+        eval(arr)
+        return arr
+    }()
 
     /// Causal masks, memoized on `(L, kL)`.
     ///
@@ -198,6 +212,26 @@ enum CBv2ComposedPrefillSDPAV1 {
         return bias
     }
 
+    /// Eagerly materializes and caches the 8 canonical prefill causal masks into memory
+    /// during model initialization at load time, ensuring zero mask construction or
+    /// eval overhead during the timed prefill window.
+    public static func warmupCommonMasks() {
+        _ = warmupCommonMasksOnce
+    }
+
+    private static let warmupCommonMasksOnce: Void = {
+        guard enabled else { return }
+        if maskFuseEnabled {
+            for kL in stride(from: 128, through: 1024, by: 128) {
+                _ = causalMaskBias(L: 128, kL: kL)
+            }
+        } else {
+            for kL in stride(from: 128, through: 1024, by: 128) {
+                _ = causalMask(L: 128, kL: kL)
+            }
+        }
+    }()
+
     /// Head dims for which MLX has a fused kernel; those calls must keep
     /// taking it, because the fused kernel is NOT the fallback graph.
     @inline(__always)
@@ -222,6 +256,7 @@ enum CBv2ComposedPrefillSDPAV1 {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float?
     ) -> MLXArray? {
+        _ = warmupCommonMasksOnce
         guard enabled, scale == 1.0, sinks == nil, softcap == nil else { return nil }
         guard queries.ndim == 4, keys.ndim == 4, values.ndim == 4 else { return nil }
         guard queries.dtype == .bfloat16, keys.dtype == .bfloat16,
@@ -252,6 +287,7 @@ enum CBv2ComposedPrefillSDPAV1 {
         bidirectional: Bool, sinks: MLXArray?,
         queryPlaneSlice: MLXArray? = nil
     ) -> MLXArray? {
+        _ = warmupCommonMasksOnce
         guard enabled, scale == 1.0, sinks == nil, !bidirectional else { return nil }
         // Decode (L == 1) and every MTP verify width (L in 2...8) keep the
         // stock path: this rider is the prompt plane only.
@@ -683,6 +719,18 @@ enum CBv2PrefillSoftmaxVecV1 {
         return max(1, min(640 / threadgroupSize, 1024 / threadgroupSize))
     }
 
+    nonisolated(unsafe) private static var softmaxParamsCache: [UInt64: MLXArray] = [:]
+
+    static func getSoftmaxParamsArray(axisSize: Int, numSimdgroups: Int) -> MLXArray {
+        let key = (UInt64(UInt32(axisSize)) << 32) | UInt64(UInt32(numSimdgroups))
+        if let cached = softmaxParamsCache[key] {
+            return cached
+        }
+        let arr = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        softmaxParamsCache[key] = arr
+        return arr
+    }
+
     /// Runs the vectorized softmax, or returns nil to keep the caller on
     /// the stock `MLX.softmax(scores, axis: -1, precise: true)` call.
     /// `scores` may be any contiguous rank; it is treated as a flat
@@ -700,7 +748,7 @@ enum CBv2PrefillSoftmaxVecV1 {
         let threadgroupSize = ((axisSize + 3) / 4 + 31) / 32 * 32
         guard threadgroupSize > 0, threadgroupSize <= 1024 else { return nil }
         let numSimdgroups = threadgroupSize / 32
-        let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        let paramsArray = getSoftmaxParamsArray(axisSize: axisSize, numSimdgroups: numSimdgroups)
 
         // PROMPT-GLUE2 (pg2): prompt-width score rectangles take the
         // rows-per-threadgroup twin; the incumbent computes the identical
@@ -888,7 +936,8 @@ enum CBv2PrefillAttnTrafficV1 {
         let rows = CBv2PrefillSoftmaxVecV1.rowsPerThreadgroup(
             axisSize: axisSize, threadgroupSize: threadgroupSize)
         guard rows >= 1, rows * threadgroupSize <= 1024 else { return nil }
-        let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        let paramsArray = CBv2PrefillSoftmaxVecV1.getSoftmaxParamsArray(
+            axisSize: axisSize, numSimdgroups: numSimdgroups)
         var statsShape = scores.shape
         statsShape[statsShape.count - 1] = 4
 

@@ -28,6 +28,31 @@ struct CBv2MTPGraphBuild {
     let seedHidden: MLXArray?
 }
 
+private final class MTPDecodeCacheMemoizer: @unchecked Sendable {
+    nonisolated(unsafe) static var cachedRowIDs: [CBv2RequestID] = []
+    nonisolated(unsafe) static var cachedSampling: [CBv2SamplingParams] = []
+
+    static func sampling(for rows: [CBv2MTPRowWork]) -> [CBv2SamplingParams] {
+        if cachedRowIDs.count == rows.count && zip(cachedRowIDs, rows).allSatisfy({ $0 == $1.rec.id }) {
+            return cachedSampling
+        }
+        let ids = rows.map(\.rec.id)
+        let sampling = rows.map(\.rec.request.sampling)
+        cachedRowIDs = ids
+        cachedSampling = sampling
+        return sampling
+    }
+
+    static func requestIDs(for rows: [CBv2MTPRowWork]) -> [CBv2RequestID] {
+        if cachedRowIDs.count == rows.count && zip(cachedRowIDs, rows).allSatisfy({ $0 == $1.rec.id }) {
+            return cachedRowIDs
+        }
+        let ids = rows.map(\.rec.id)
+        cachedRowIDs = ids
+        return ids
+    }
+}
+
 extension EngineLoopV2 {
 
     func mtpPrepareRoundWork(
@@ -104,8 +129,8 @@ extension EngineLoopV2 {
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             decodeSampled = sampler.sample(
                 logits: logits[0..., -1, 0...],
-                params: decodeRows.map(\.rec.request.sampling),
-                requestIDs: decodeRows.map(\.rec.id),
+                params: MTPDecodeCacheMemoizer.sampling(for: decodeRows),
+                requestIDs: MTPDecodeCacheMemoizer.requestIDs(for: decodeRows),
                 stepIndex: stepCount,
                 pendingSampledTokens: nil,
                 rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })

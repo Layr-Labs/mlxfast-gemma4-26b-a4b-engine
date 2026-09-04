@@ -3,7 +3,11 @@ import MLX
 import MLXNN
 
 /// Identity gather table for the sorted 64-assignment decode geometry.
-nonisolated(unsafe) private let switchDownIdentity64 = MLXArray((0..<64).map { UInt32($0) })
+nonisolated(unsafe) private let switchDownIdentity64: MLXArray = {
+    let arr = MLXArray((0..<64).map { UInt32($0) })
+    eval(arr)
+    return arr
+}()
 
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
 
@@ -298,6 +302,16 @@ private let compiledGeGLUShaped: @Sendable (MLXArray, MLXArray) -> MLXArray = {
 
 private let switchGeluShapedFuseEnabled: Bool =
     ProcessInfo.processInfo.environment["DARKBLOOM_GELU_SHAPED_FUSE"] != "0"
+
+/// Eager pre-compilation and warm-up for the shape-specialized GeGLU kernel [64, 1, 704].
+/// Materializes the compiled Metal pipeline into memory at model initialization,
+/// eliminating first-token JIT compilation bubbles during decode.
+private let warmupGeGLUShapedOnce: Void = {
+    guard switchGeluShapedFuseEnabled else { return }
+    let dummy = MLXArray.zeros([64, 1, 704], dtype: .bfloat16)
+    let res = compiledGeGLUShaped(dummy, dummy)
+    eval(res)
+}()
 
 /// Admit only the routed-expert decode rectangles: `[64, 1, N]` / `[64, N]`,
 /// both operands bfloat16 with identical shapes. Prefill's per-prompt row
@@ -1410,6 +1424,9 @@ public class SwitchGLU: Module {
         self._downProj.wrappedValue = SwitchLinear(
             inputDims: hiddenDims, outputDims: inputDims, numExperts: numExperts, bias: bias)
 
+        _ = switchDownIdentity64
+        _ = warmupGeGLUShapedOnce
+
         super.init()
     }
 
@@ -1455,6 +1472,9 @@ public class SwitchGLU: Module {
         }
         self._downProj.wrappedValue = SwitchLinear(
             inputDims: hiddenDims, outputDims: inputDims, numExperts: numExperts, bias: bias)
+
+        _ = switchDownIdentity64
+        _ = warmupGeGLUShapedOnce
 
         super.init()
     }

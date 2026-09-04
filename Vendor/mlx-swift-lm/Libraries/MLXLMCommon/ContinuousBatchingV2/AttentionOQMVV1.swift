@@ -32,6 +32,19 @@ public enum CBv2AttentionOQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Compose the independently measured four-way outer-group schedule with
+    /// the single-register B lifetime. Both scored run-sum bodies have trip
+    /// counts divisible by four. Disabling this restores the donor's full
+    /// unroll request and donor registration names.
+    public static let unroll4Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_OPROJ_UNROLL4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let unroll4KeySuffix = unroll4Enabled ? "_ur4compose" : ""
+
     private static let batch = 8
     private static let sequence = 1
     private static let outputWidth = 2816
@@ -241,7 +254,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
   float acc0 = 0.0f;
   float acc1 = 0.0f;
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
   // Same register carry as the Q/K/V tier: one group's weight operands stay
   // resident while the next group's are read. Addresses are functions of the
@@ -250,7 +263,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
   T s_next = srow[g0];
   T b_next = brow[g0];
 
-#pragma unroll
+\(unroll4Enabled ? "#pragma clang loop unroll_count(4)" : "#pragma unroll")
   for (int gi = 0; gi < nGroups; ++gi) {
     const int g = g0 + gi;
     const uint2 wv = wv_next;
@@ -273,22 +286,22 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
     // across the run, so every fill yields the value it yielded before and
     // the eight steps keep their order into `C`.
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_SETB(B0, x, lo)
-    MMA8_STEP(B0, 0)
-    MMA8_SETB(B1, x, hi)
-    MMA8_STEP(B1, 1)
-    MMA8_SETB(B2, y, lo)
-    MMA8_STEP(B2, 2)
-    MMA8_SETB(B3, y, hi)
-    MMA8_STEP(B3, 3)
-    MMA8_SETB(B4, z, lo)
-    MMA8_STEP(B4, 4)
-    MMA8_SETB(B5, z, hi)
-    MMA8_STEP(B5, 5)
-    MMA8_SETB(B6, w, lo)
-    MMA8_STEP(B6, 6)
-    MMA8_SETB(B7, w, hi)
-    MMA8_STEP(B7, 7)
+    MMA8_SETB(B, x, lo)
+    MMA8_STEP(B, 0)
+    MMA8_SETB(B, x, hi)
+    MMA8_STEP(B, 1)
+    MMA8_SETB(B, y, lo)
+    MMA8_STEP(B, 2)
+    MMA8_SETB(B, y, hi)
+    MMA8_STEP(B, 3)
+    MMA8_SETB(B, z, lo)
+    MMA8_STEP(B, 4)
+    MMA8_SETB(B, z, hi)
+    MMA8_STEP(B, 5)
+    MMA8_SETB(B, w, lo)
+    MMA8_STEP(B, 6)
+    MMA8_SETB(B, w, hi)
+    MMA8_STEP(B, 7)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
     acc1 += s * C.thread_elements()[1] + rs.y * b;
@@ -347,7 +360,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
   float acc0 = 0.0f;
   float acc1 = 0.0f;
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
 #pragma unroll
   for (int gi = 0; gi < nGroups; ++gi) {
@@ -358,28 +371,27 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
     const float2 rs = float2(
         rs_table[c.fn * G + g], rs_table[(c.fn + 1) * G + g]);
 
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
-
     const uint2 wv = *((const device uint2*)(wrow + 32 * g));
     const float s = float(srow[g]);
     const float b = float(brow[g]);
 
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_STEP(B0, 0)
-    MMA8_STEP(B1, 1)
-    MMA8_STEP(B2, 2)
-    MMA8_STEP(B3, 3)
-    MMA8_STEP(B4, 4)
-    MMA8_STEP(B5, 5)
-    MMA8_STEP(B6, 6)
-    MMA8_STEP(B7, 7)
+    MMA8_SETB(B, x, lo)
+    MMA8_STEP(B, 0)
+    MMA8_SETB(B, x, hi)
+    MMA8_STEP(B, 1)
+    MMA8_SETB(B, y, lo)
+    MMA8_STEP(B, 2)
+    MMA8_SETB(B, y, hi)
+    MMA8_STEP(B, 3)
+    MMA8_SETB(B, z, lo)
+    MMA8_STEP(B, 4)
+    MMA8_SETB(B, z, hi)
+    MMA8_STEP(B, 5)
+    MMA8_SETB(B, w, lo)
+    MMA8_STEP(B, 6)
+    MMA8_SETB(B, w, hi)
+    MMA8_STEP(B, 7)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
     acc1 += s * C.thread_elements()[1] + rs.y * b;
@@ -404,7 +416,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
 """
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_bfill_v4",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_bfill_v5",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -421,7 +433,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         ensureRowContiguous: true)
 
     private static let mma8KernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_bfill_v4",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_bfill_v5",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -556,7 +568,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
     }
 
     private static let mma8RspKernelK4096 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_rsp_v1",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_rsp_v2"
+            + unroll4KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -573,7 +586,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         ensureRowContiguous: true)
 
     private static let mma8RspKernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp_v1",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp_v2"
+            + unroll4KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -630,9 +644,9 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
   float acc0 = 0.0f;
   float acc1 = 0.0f;
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
-#pragma unroll
+\(unroll4Enabled ? "#pragma clang loop unroll_count(4)" : "#pragma unroll")
   for (int gi = 0; gi < nGroups; ++gi) {
     const int g = g0 + gi;
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
@@ -641,28 +655,27 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
     const float2 rs = float2(
         p0[2 * g] + p0[2 * g + 1], p1[2 * g] + p1[2 * g + 1]);
 
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
-
     const uint2 wv = *((const device uint2*)(wrow + 32 * g));
     const float s = float(srow[g]);
     const float b = float(brow[g]);
 
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_STEP(B0, 0)
-    MMA8_STEP(B1, 1)
-    MMA8_STEP(B2, 2)
-    MMA8_STEP(B3, 3)
-    MMA8_STEP(B4, 4)
-    MMA8_STEP(B5, 5)
-    MMA8_STEP(B6, 6)
-    MMA8_STEP(B7, 7)
+    MMA8_SETB(B, x, lo)
+    MMA8_STEP(B, 0)
+    MMA8_SETB(B, x, hi)
+    MMA8_STEP(B, 1)
+    MMA8_SETB(B, y, lo)
+    MMA8_STEP(B, 2)
+    MMA8_SETB(B, y, hi)
+    MMA8_STEP(B, 3)
+    MMA8_SETB(B, z, lo)
+    MMA8_STEP(B, 4)
+    MMA8_SETB(B, z, hi)
+    MMA8_STEP(B, 5)
+    MMA8_SETB(B, w, lo)
+    MMA8_STEP(B, 6)
+    MMA8_SETB(B, w, hi)
+    MMA8_STEP(B, 7)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
     acc1 += s * C.thread_elements()[1] + rs.y * b;
@@ -687,7 +700,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
 """
 
     private static let mma8Rsp2KernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp2_v1",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp2_v2"
+            + unroll4KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_pairs"],
         outputNames: ["y"],
         source: """

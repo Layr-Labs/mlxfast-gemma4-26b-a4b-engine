@@ -239,6 +239,63 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         return (keys?.nbytes ?? 0) + (values?.nbytes ?? 0)
     }
 
+    /// VCOLBLOCK (C4): true while `values` holds the D512 dispatch-3 storage
+    /// permutation — `[1, kvHeads, tile, slot, 32]` flattened back into the
+    /// declared `[1, kvHeads, capacity, headDim]` shape — instead of the
+    /// row-major `[1, kvHeads, slot, headDim]` every other consumer assumes.
+    ///
+    /// The permutation is bit-preserving and address-only, and it is visible
+    /// to the D512 composed decode kernels alone: every generic exit from
+    /// this class (`update`, `snapshot`, cohort pooling, capacity growth)
+    /// calls `restoreValuesRowMajor()` first, so no MLX op and no other
+    /// backend can observe a permuted buffer. With
+    /// `DARKBLOOM_GEMMA4_D512_V_COLBLOCK=0` nothing ever calls
+    /// `columnBlockValues`, this stays false, and both converters are no-ops.
+    private(set) var valuesColumnBlocked = false
+
+    /// The block width the current permutation was built with, so the inverse
+    /// does not have to re-derive it.
+    private var valuesColumnBlockWidth = 0
+
+    /// Permute `values` into `[1, kvHeads, headDim / blockWidth, capacity,
+    /// blockWidth]`, i.e. tile-major then slot-major then column. Refuses (as
+    /// a no-op) on a pooled row, an unallocated plane, or a headDim the block
+    /// width does not divide — the caller then simply dispatches over the
+    /// row-major plane it already collected.
+    func columnBlockValues(blockWidth: Int) {
+        guard !valuesColumnBlocked, cohortPool == nil, blockWidth > 0,
+            let plane = values, plane.ndim == 4, plane.dim(3) % blockWidth == 0
+        else { return }
+        let tiles = plane.dim(3) / blockWidth
+        values = plane
+            .reshaped([plane.dim(0), plane.dim(1), plane.dim(2), tiles, blockWidth])
+            .transposed(0, 1, 3, 2, 4)
+            .reshaped(plane.shape)
+            .contiguous()
+        valuesColumnBlocked = true
+        valuesColumnBlockWidth = blockWidth
+    }
+
+    /// Undo `columnBlockValues`. The axis swap is its own inverse, so this is
+    /// the same two reshapes and the same transpose read the other way.
+    func restoreValuesRowMajor() {
+        guard valuesColumnBlocked, let plane = values else {
+            valuesColumnBlocked = false
+            return
+        }
+        let tiles = plane.dim(3) / valuesColumnBlockWidth
+        values = plane
+            .reshaped([
+                plane.dim(0), plane.dim(1), tiles, plane.dim(2),
+                valuesColumnBlockWidth,
+            ])
+            .transposed(0, 1, 3, 2, 4)
+            .reshaped(plane.shape)
+            .contiguous()
+        valuesColumnBlocked = false
+        valuesColumnBlockWidth = 0
+    }
+
     /// WRITE-016-D512: the `update()` bookkeeping advance without the two
     /// slice assignments, for a token whose K/V bytes were already stored in
     /// place by the fused QK dispatch. The caller (the fused wrapper) gates
@@ -278,6 +335,10 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
             return pool.rowViews(index: cohortIndex, upTo: absoluteOffset)
         }
 
+        // VCOLBLOCK: the slice append and the views returned below are
+        // row-major statements about the plane, and so is every growth
+        // reallocation `ensureCapacity` may do.
+        restoreValuesRowMajor()
         ensureCapacity(absoluteOffset + n, keyTemplate: newKeys, valueTemplate: newValues)
 
         keys![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newKeys
@@ -375,6 +436,9 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
                 index: cohortIndex, upTo: absoluteOffset)
             return (poolKeys, poolValues, absoluteOffset)
         }
+        // VCOLBLOCK: snapshots feed MLX SDPA, the prefix cache and MTP —
+        // all of which read the plane row-major.
+        restoreValuesRowMajor()
         guard let keys, let values else {
             return (
                 MLXArray.zeros([1, kvHeads, 0, headDim], dtype: .float16),
@@ -442,6 +506,12 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
             return pool
         }
 
+        // VCOLBLOCK: the pool's storage is row-major and its own append and
+        // view helpers say so, so a row that the D512 decode permuted has to
+        // come back before it can be concatenated into one.
+        for row in rows {
+            row.restoreValuesRowMajor()
+        }
         let head = rows[0]
         guard let headKeys = head.keys, let headValues = head.values else { return nil }
         // Pool growth allocates `[rowCount, kvHeads, growth, headDim]` blocks,
@@ -481,6 +551,12 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
     // MARK: - Private
 
     private func ensureCapacity(_ needed: Int, keyTemplate: MLXArray, valueTemplate: MLXArray) {
+        // VCOLBLOCK: growth concatenates along the slot axis, which only
+        // exists as an axis in the row-major form. `update` is the sole
+        // caller and restores first.
+        precondition(
+            !valuesColumnBlocked,
+            "CBv2FullSequenceKV: capacity growth on a column-blocked value plane")
         if keys == nil {
             capacity = min(maxLength, max(capacity, needed))
             keys = MLXArray.zeros(

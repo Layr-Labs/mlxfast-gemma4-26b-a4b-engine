@@ -760,6 +760,71 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
                 .lowercased())
     }()
 
+    /// KV-SPLIT (C2). The sliding q4 mirror keeps its `[2, kvHeads, window,
+    /// 36]` allocation and its bytes, but inside each `(plane, head)` block
+    /// the 36-word records are stored as TWO planes: `window * 32` payload
+    /// words first, then `window * 4` metadata words. A slot's 32-lane
+    /// payload run then starts at `slot * 128` bytes instead of
+    /// `slot * 144`, so every 128-byte request is 128-byte aligned and
+    /// touches two 64-byte lines instead of the two-or-three the 16-byte
+    /// phase rotation {0, 16, 32, 48} forced. Same words, same values, same
+    /// reduction order — only the address each word lives at changes.
+    ///
+    /// `DARKBLOOM_KV_SPLIT=0` restores the interleaved record layout in the
+    /// same binary; `DARKBLOOM_` is on the runtime worker's env allowlist
+    /// (`sanitizedRuntimeWorkerEnvironment`), so the switch reaches the
+    /// process that runs the kernels.
+    public static let mirrorSplitEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_KV_SPLIT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Name suffix for every kernel body whose mirror addressing the switch
+    /// rewrites. A Swift-hosted kernel that changes text without changing
+    /// name serves a stale cached body, so the text and the name move
+    /// together; the suffix is empty when the switch is off, leaving the
+    /// incumbent bodies under their incumbent names.
+    public static var mirrorSplitKey: String { mirrorSplitEnabled ? "_kvs1" : "" }
+
+    /// The three MSL constants every mirror-addressing body indexes with,
+    /// relative to the base of its `(plane, head)` block:
+    ///
+    ///     payload  word of (slot, lane) = slot * kvq_pay_stride + lane
+    ///     metadata word of (slot, lane) = kvq_meta_base + slot * kvq_meta_stride + lane / 8
+    ///
+    /// With the switch OFF they evaluate to the incumbent record arithmetic
+    /// (`slot * row_words + lane` and `slot * row_words + payload_words +
+    /// lane / 8`); with it ON, to the split planes. Block bases are
+    /// unchanged in both.
+    public static func mirrorLayoutDefs(
+        payloadWords: String, rowWords: String, slots: String,
+        indent: String, type: String = "int"
+    ) -> String {
+        let pay = mirrorSplitEnabled ? payloadWords : rowWords
+        let metaStride =
+            mirrorSplitEnabled ? "((\(rowWords)) - (\(payloadWords)))" : rowWords
+        let metaBase = mirrorSplitEnabled ? "((\(slots)) * (\(payloadWords)))" : payloadWords
+        return "constexpr \(type) kvq_pay_stride = \(pay);\n"
+            + "\(indent)constexpr \(type) kvq_meta_stride = \(metaStride);\n"
+            + "\(indent)constexpr \(type) kvq_meta_base = \(metaBase);"
+    }
+
+    /// Metadata word offset for a walk that carries its ring cursor already
+    /// scaled by `kvq_pay_stride` (RING-OFF). Split: rescale the cursor to
+    /// the metadata plane — both strides are powers of two, so the divide
+    /// and the multiply are shifts. Off: the cursor already addresses the
+    /// record, so the metadata word is a constant offset inside it, exactly
+    /// as the incumbent walk computed it.
+    public static func mirrorMetaOffsetExpression(
+        payloadOffset: String, laneGroup: String
+    ) -> String {
+        mirrorSplitEnabled
+            ? "uint(kvq_meta_base) + ((\(payloadOffset)) / uint(kvq_pay_stride))"
+                + " * uint(kvq_meta_stride) + \(laneGroup)"
+            : "(\(payloadOffset)) + uint(kvq_meta_base) + \(laneGroup)"
+    }
+
     /// One threadgroup (32 lanes) per (head, token) row: simd min/max over
     /// the 256 payload values, the SAME fp16-rounded (scale, bias) the host
     /// packer stores (`metal::rint` matches MLX `round`), quantized bytes
@@ -896,7 +961,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// separate for the same reason `quantPackPairKernel` is: a Swift-hosted
     /// kernel that changes text without changing name serves a stale body.
     private static let quantPackPairChunkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_kvq4g64_pack_pair_chunk_d256_v1_ld1",
+        name: "cbv2_kvq4g64_pack_pair_chunk_d256_v1_ld1\(mirrorSplitKey)",
         inputNames: ["keys", "values"],
         outputNames: ["packed_w"],
         source: """
@@ -906,13 +971,19 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             constexpr int group_size = 64;
             constexpr int payload_words = D / 8;          // 32
             constexpr int row_words = payload_words + D / group_size;
+            \(mirrorLayoutDefs(
+                payloadWords: "payload_words", rowWords: "row_words",
+                slots: "N", indent: "            "))
 
             const int row = int(threadgroup_position_in_grid.x);
             const int plane = row / (HEADS * N);
             const int local = row - plane * (HEADS * N);   // head * N + token
             const int lane = int(thread_position_in_threadgroup.x);
             const device T* src = (plane == 0 ? keys : values) + local * D;
-            device uint32_t* out = packed_w + row * row_words;
+            // KV-SPLIT: the (plane, head) block base is unchanged; only the
+            // word's place inside the block moves.
+            const int token = local - (local / N) * N;
+            device uint32_t* out = packed_w + (row - token) * row_words;
 
             // single load: the lane's eight values are read once and reused for
             // the range and the quantization (same values, same operations)
@@ -941,9 +1012,9 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
                 const float q = metal::rint((vals[i] - b) / s);
                 word |= uint32_t(clamp(q, 0.0f, 15.0f)) << (4 * i);
             }
-            out[lane] = word;
+            out[token * kvq_pay_stride + lane] = word;
             if (lane % 8 == 0) {
-                out[payload_words + lane / 8] =
+                out[kvq_meta_base + token * kvq_meta_stride + lane / 8] =
                     uint32_t(as_type<ushort>(hs)) | (uint32_t(as_type<ushort>(hb)) << 16);
             }
         """,
@@ -990,7 +1061,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// per-row mirror outputs; every value computed and every address it is
     /// stored to within that row's mirror is the per-row kernel's.
     private static let quantPackPairChunkBatchKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_kvq4g64_pack_pair_chunk_batch_d256_v1",
+        name: "cbv2_kvq4g64_pack_pair_chunk_batch_d256_v1\(mirrorSplitKey)",
         inputNames: ["keys", "values"],
         outputNames: ["m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7"],
         source: """
@@ -1000,6 +1071,9 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             constexpr int group_size = 64;
             constexpr int payload_words = D / 8;          // 32
             constexpr int row_words = payload_words + D / group_size;
+            \(mirrorLayoutDefs(
+                payloadWords: "payload_words", rowWords: "row_words",
+                slots: "N", indent: "            "))
 
             const int row = int(threadgroup_position_in_grid.x);
             const int plane_stride = HEADS * N;
@@ -1022,7 +1096,9 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
                 case 7: out = m7; break;
                 default: return;
             }
-            out += rem * row_words;
+            // KV-SPLIT: block base unchanged, word placed inside the block.
+            const int token = local - (local / N) * N;
+            out += (rem - token) * row_words;
 
             float vmin = 3.402823466e+38F;
             float vmax = -3.402823466e+38F;
@@ -1046,9 +1122,9 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
                 const float q = metal::rint((float(src[lane * per_lane + i]) - b) / s);
                 word |= uint32_t(clamp(q, 0.0f, 15.0f)) << (4 * i);
             }
-            out[lane] = word;
+            out[token * kvq_pay_stride + lane] = word;
             if (lane % 8 == 0) {
-                out[payload_words + lane / 8] =
+                out[kvq_meta_base + token * kvq_meta_stride + lane / 8] =
                     uint32_t(as_type<ushort>(hs)) | (uint32_t(as_type<ushort>(hb)) << 16);
             }
         """,
@@ -1754,6 +1830,48 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         )[0]
     }
 
+    /// KV-SPLIT: deposit `packed` — `[planes.count, kvHeads, count,
+    /// rowWords]` records, the shape every host-side packer emits — into
+    /// `mirror` at slots `[start, start + count)` of `planes`.
+    ///
+    /// Switch off: the incumbent single slice update of whole records.
+    /// Switch on: the SAME words, as two slice updates over a view that
+    /// flattens `(slot, word)` into the `(plane, head)` block the split
+    /// addresses — payload run first, metadata run second. The second
+    /// update costs one more full-ring copy than the incumbent; it lands
+    /// only on the non-fused write road (the fused decode pass and the
+    /// chunk packers write the mirror in place, in split order, themselves).
+    /// `_updateInternal` keeps the mirror's object identity, which every
+    /// holder of this allocation depends on.
+    private func depositMirrorRecords(
+        _ mirror: MLXArray, planes: Range<Int>, packed: MLXArray,
+        start: Int, count: Int
+    ) {
+        guard Self.mirrorSplitEnabled else {
+            mirror[planes.lowerBound ..< planes.upperBound, 0...,
+                start ..< (start + count), 0...] = packed
+            return
+        }
+        let payloadWords = headDim / 8
+        let metaWords = headDim / 64
+        let rowWords = payloadWords + metaWords
+        let metaBase = window * payloadWords
+        let flat = mirror.reshaped([2, kvHeads, window * rowWords])
+        flat[
+            planes.lowerBound ..< planes.upperBound, 0...,
+            (start * payloadWords) ..< ((start + count) * payloadWords)
+        ] =
+            packed[0..., 0..., 0..., 0 ..< payloadWords]
+            .reshaped([planes.count, kvHeads, count * payloadWords])
+        flat[
+            planes.lowerBound ..< planes.upperBound, 0...,
+            (metaBase + start * metaWords) ..< (metaBase + (start + count) * metaWords)
+        ] =
+            packed[0..., 0..., 0..., payloadWords ..< rowWords]
+            .reshaped([planes.count, kvHeads, count * metaWords])
+        mirror._updateInternal(flat.reshaped([2, kvHeads, window, rowWords]))
+    }
+
     /// KVQ-PAIRWRITE. Maintaining the mirror plane by plane builds TWO
     /// `SliceUpdate`s over the whole mirror allocation per decode token, and
     /// the second one takes the first one's output as its input. The mirror
@@ -1779,7 +1897,7 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         else { return false }
         let packed = Self.quantPackPairGPU(keys: newKeys, values: newValues)
         let slot = firstPosition % window
-        quantMirror[0..., 0..., slot ..< (slot + 1), 0...] = packed
+        depositMirrorRecords(quantMirror, planes: 0 ..< 2, packed: packed, start: slot, count: 1)
         return true
     }
 
@@ -1830,13 +1948,17 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
             }
         }
         if start + n <= window {
-            quantMirror[plane ..< (plane + 1), 0..., start ..< (start + n), 0...] = packed
+            depositMirrorRecords(
+                quantMirror, planes: plane ..< (plane + 1), packed: packed,
+                start: start, count: n)
         } else {
             let first = window - start
-            quantMirror[plane ..< (plane + 1), 0..., start ..< window, 0...] =
-                packed[.ellipsis, ..<first, 0...]
-            quantMirror[plane ..< (plane + 1), 0..., 0 ..< (n - first), 0...] =
-                packed[.ellipsis, first..., 0...]
+            depositMirrorRecords(
+                quantMirror, planes: plane ..< (plane + 1),
+                packed: packed[.ellipsis, ..<first, 0...], start: start, count: first)
+            depositMirrorRecords(
+                quantMirror, planes: plane ..< (plane + 1),
+                packed: packed[.ellipsis, first..., 0...], start: 0, count: n - first)
         }
     }
 
@@ -1919,6 +2041,9 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
             // KVQ-U32: the mirror is allocated and BOUND as uint32 words
             // (row = (headDim + 4) / 4 of them). Kernel bodies cast down to
             // uint8_t* internally; byte layout is unchanged.
+            // KV-SPLIT does not touch this allocation: the same words, the
+            // same count, the same per-(plane, head) blocks — only where a
+            // word sits inside its block moves (`mirrorLayoutDefs`).
             Self.selfTestKVQ4()
             quantMirror = MLXArray.zeros(
                 [2, kvHeads, window, headDim / 8 + headDim / 64], dtype: .uint32)

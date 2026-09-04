@@ -1043,17 +1043,20 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         let yTiles = total / outputsPerGroup
         guard yTiles % tilesPerGroup == 0 else { return nil }
 
-        fusedLock.lock()
         var plane = fusedPlanes[cacheKey]
         if plane == nil {
-            let w = concatenated([qWeight, kWeight], axis: 0)
-            let s = concatenated([qScales, kScales], axis: 0)
-            let b = concatenated([qBiases, kBiases], axis: 0)
-            eval(w, s, b)
-            plane = (w, s, b)
-            fusedPlanes[cacheKey] = plane
+            fusedLock.lock()
+            plane = fusedPlanes[cacheKey]
+            if plane == nil {
+                let w = concatenated([qWeight, kWeight], axis: 0)
+                let s = concatenated([qScales, kScales], axis: 0)
+                let b = concatenated([qBiases, kBiases], axis: 0)
+                eval(w, s, b)
+                plane = (w, s, b)
+                fusedPlanes[cacheKey] = plane
+            }
+            fusedLock.unlock()
         }
-        fusedLock.unlock()
         guard let (fw, fs, fb) = plane else { return nil }
 
         let outputs = kernel(

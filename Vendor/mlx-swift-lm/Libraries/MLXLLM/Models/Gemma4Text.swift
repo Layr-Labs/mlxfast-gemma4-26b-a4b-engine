@@ -83,7 +83,7 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     // The empty-set row is the control that matters: this is not "fewer is
     // always better", it is "the early pair carries all of the overlap".
     switch layerIndex {
-    case 0, 1, 2, 3:
+    case 0, 1, 2, 3, 4:
         return true
     default:
         return false
@@ -6990,6 +6990,8 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         if !config.tieWordEmbeddings {
             self._lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabSize, bias: false)
         }
+
+        CBv2ComposedPrefillSDPAV1.warmupCommonMasks()
     }
 
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws

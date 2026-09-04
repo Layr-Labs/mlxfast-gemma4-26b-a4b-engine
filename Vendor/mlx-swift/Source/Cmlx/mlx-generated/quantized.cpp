@@ -2327,9 +2327,28 @@ inline float mma8_runsum4(uint4 r) {
   BB.thread_elements()[0] = mma8_##HI<T>(r0.W);    \
   BB.thread_elements()[1] = mma8_##HI<T>(r1.W);
 
-#define MMA8_STEP(BB, J)                                          \
-  A.thread_elements()[0] = float(extract_bits(wv.x, 4 * (J), 4)); \
-  A.thread_elements()[1] = float(extract_bits(wv.y, 4 * (J), 4)); \
+// H1-TWIN: the 4-bit A-side fill, built in the fp16 pipe instead of the
+// integer one. `float(n)` is an integer-to-float convert; `0x6400 | n` is
+// the half bit pattern of `1024 + n` for every n in 0...15, and
+// `(1024 + n) - 1024` is exact in half (both operands and the result are
+// exactly representable), so A receives the same float as before, in the
+// same order, into the same unchanged simdgroup_multiply_accumulate chain.
+// No load moves, no accumulation reorders. KILL SWITCH: set
+// GEMMA4_MMA8_STEP_FP16_DEQUANT to 0 to restore the integer-pipe form.
+#ifndef GEMMA4_MMA8_STEP_FP16_DEQUANT
+#define GEMMA4_MMA8_STEP_FP16_DEQUANT 1
+#endif
+inline float mma8_dequant4(uint code) {
+#if GEMMA4_MMA8_STEP_FP16_DEQUANT
+  return float(as_type<half>(ushort(0x6400u | code)) - 1024.0h);
+#else
+  return float(code);
+#endif
+}
+
+#define MMA8_STEP(BB, J)                                                     \
+  A.thread_elements()[0] = mma8_dequant4(extract_bits(wv.x, 4 * (J), 4)); \
+  A.thread_elements()[1] = mma8_dequant4(extract_bits(wv.y, 4 * (J), 4)); \
   simdgroup_multiply_accumulate(C, A, BB, C);
 
 // x is [8, K] with K % 64 == 0, w is packed [N, K / 8] uint32, scales and

@@ -11,6 +11,7 @@ import MLXNN
 
 // Yukon executable-equivalent frontier sample: delordemm1 / e8f / de1.
 // Yukon bounded redraw: a9f26610 preserved 4/4 parity and reached 1.649436375 s decode.
+// Yukon bounded current-frontier reproducibility sample: delordemm1 / 75802 / one observation.
 
 // MARK: - vMLX decode hot-path helpers (ported from osaurus/main Gemma4Text)
 //

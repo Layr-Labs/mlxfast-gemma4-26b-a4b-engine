@@ -32,20 +32,6 @@ public enum CBv2AttentionOQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// OPROJ-UR4-58EF. The two scored run-sum bodies have exact trip counts
-    /// of 32 and 64, both divisible by four. Requesting a four-way unroll
-    /// changes only the compiler schedule; loop order and arithmetic remain
-    /// unchanged. The incumbent pragma and registration names remain
-    /// available through the kill switch.
-    public static let unroll4Enabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_OPROJ_UNROLL4"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    private static let unroll4KeySuffix = unroll4Enabled ? "_ur4_58ef" : ""
-
     private static let batch = 8
     private static let sequence = 1
     private static let outputWidth = 2816
@@ -363,7 +349,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
   simdgroup_float8x8 A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
 
-\(unroll4Enabled ? "#pragma clang loop unroll_count(4)" : "#pragma unroll")
+#pragma unroll
   for (int gi = 0; gi < nGroups; ++gi) {
     const int g = g0 + gi;
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
@@ -416,6 +402,51 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
   y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
 }
 """
+    /// OPROJ-CARRY2. The rsp/rsp2 run-sum bodies read each group's w/s/b at
+    /// the point of use (zero outstanding weight loads); the QKV tier and the
+    /// impl body above carry 1-deep, the QKV tier's MT body 2-deep. This
+    /// transplants the tier's 2-deep scalar carry (AttentionQKVMMA8V1.swift
+    /// 156-173, textually verbatim for the rotation; float s/b matching these
+    /// bodies' declarations where the donor uses T) onto rsp/rsp2, which never
+    /// had any carry: preload wv_next/wv_next2/s_next/b_next before the group
+    /// loop, rotate at loop top with min-clamped g_next/g_next2. Pure load
+    /// scheduling — addresses, order into C/acc, and types unchanged.
+    /// DISCLOSED PORT (donor-port hygiene): the donor pattern is verbatim but
+    /// its application site never carried before, and 2-deep exceeds the
+    /// impl body's 1-deep. `DARKBLOOM_GEMMA4_OPROJ_CARRY2=0` restores the
+    /// promoted bodies and names byte for byte.
+    public static let oprojCarry2Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_OPROJ_CARRY2"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let carry2KeySuffix = oprojCarry2Enabled ? "_carry2" : ""
+
+    private static func applyOprojCarry2(to header: String, occurrences: Int) -> String {
+        var result = header
+        func replace(_ old: String, with new: String) {
+            precondition(
+                result.components(separatedBy: old).count == occurrences + 1,
+                "carry2 anchor drift")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replace(
+            "#pragma unroll\n  for (int gi = 0; gi < nGroups; ++gi) {\n    const int g = g0 + gi;\n    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));",
+            with: "  uint2 wv_next = *((const device uint2*)(wrow + 32 * g0));\n  uint2 wv_next2 = *((const device uint2*)(wrow + 32 * (g0 + min(1, nGroups - 1))));\n  float s_next = float(srow[g0]);\n  float b_next = float(brow[g0]);\n#pragma unroll\n  for (int gi = 0; gi < nGroups; ++gi) {\n    const int g = g0 + gi;\n    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));")
+        replace(
+            "    const uint2 wv = *((const device uint2*)(wrow + 32 * g));\n    const float s = float(srow[g]);\n    const float b = float(brow[g]);",
+            with: "    const uint2 wv = wv_next;\n    const float s = s_next;\n    const float b = b_next;\n    const int g_next = g0 + min(gi + 1, nGroups - 1);\n    const int g_next2 = g0 + min(gi + 2, nGroups - 1);\n    wv_next = wv_next2;\n    wv_next2 = *((const device uint2*)(wrow + 32 * g_next2));\n    s_next = float(srow[g_next]);\n    b_next = float(brow[g_next]);")
+        return result
+    }
+
+    private static let mma8Carry2Header = applyOprojCarry2(
+        to: mma8KernelHeader, occurrences: 1)
+
+    private static let mma8Rsp2Carry2Header = applyOprojCarry2(
+        to: mma8Rsp2KernelHeader, occurrences: 2)
+
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_bfill_v4",
@@ -571,7 +602,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
 
     private static let mma8RspKernelK4096 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_rsp_v1"
-            + unroll4KeySuffix,
+            + carry2KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -584,12 +615,12 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: mma8KernelHeader,
+        header: oprojCarry2Enabled ? mma8Carry2Header : mma8KernelHeader,
         ensureRowContiguous: true)
 
     private static let mma8RspKernelK8192 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp_v1"
-            + unroll4KeySuffix,
+            + carry2KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -602,7 +633,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: mma8KernelHeader,
+        header: oprojCarry2Enabled ? mma8Carry2Header : mma8KernelHeader,
         ensureRowContiguous: true)
 
     /// ORS-D512: the `_rsp` body with the run sums read as PAIRS of
@@ -648,7 +679,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
   simdgroup_float8x8 A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
 
-\(unroll4Enabled ? "#pragma clang loop unroll_count(4)" : "#pragma unroll")
+#pragma unroll
   for (int gi = 0; gi < nGroups; ++gi) {
     const int g = g0 + gi;
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
@@ -704,7 +735,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
 
     private static let mma8Rsp2KernelK8192 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp2_v1"
-            + unroll4KeySuffix,
+            + carry2KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_pairs"],
         outputNames: ["y"],
         source: """
@@ -717,7 +748,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: mma8Rsp2KernelHeader,
+        header: oprojCarry2Enabled ? mma8Rsp2Carry2Header : mma8Rsp2KernelHeader,
         ensureRowContiguous: true)
 
     @inline(__always)
@@ -777,6 +808,9 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
             // threads: (32, 2, 1) threads per group, N/8 groups along y.
             let yTiles = outputWidth / outputsPerGroup
             if pairsReady {
+                if oprojCarry2Enabled {
+                    CBv2EngageMark.once("oproj-carry2")
+                }
                 CBv2EngageMark.once("d512-ors-oproj-pairs")
                 return mma8Rsp2KernelK8192(
                     [x, weight, scales, biases, rsPairTable!],
@@ -788,6 +822,9 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
                 )[0]
             }
             if tableReady {
+                if oprojCarry2Enabled {
+                    CBv2EngageMark.once("oproj-carry2")
+                }
                 let kernel = inDim == 8192 ? mma8RspKernelK8192 : mma8RspKernelK4096
                 return kernel(
                     [x, weight, scales, biases, rsTable!],

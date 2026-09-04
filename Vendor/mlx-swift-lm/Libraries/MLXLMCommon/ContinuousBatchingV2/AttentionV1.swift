@@ -464,7 +464,8 @@ enum CBv2AttentionV1 {
         spanContexts: [CBv2SpanChunkContext?]? = nil,
         serializeQueries: Bool = false,
         decodeRingWriteFence: CBv2DecodeRingWriteFence? = nil,
-        allowFusedRingWrite: Bool = false
+        allowFusedRingWrite: Bool = false,
+        cachedWindowedRows: [CBv2WindowedSequenceKV]? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -509,7 +510,9 @@ enum CBv2AttentionV1 {
                 var cachedValueRows: [MLXArray] = []
                 cachedKeyRows.reserveCapacity(B)
                 cachedValueRows.reserveCapacity(B)
-                let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
+                // HA2: same objects, same order; nil projects here as before.
+                let ringRows =
+                    cachedWindowedRows ?? rows.compactMap({ $0 as? CBv2WindowedSequenceKV })
                 if ringRows.count == B && ringRows.allSatisfy({ $0.decodeRingView != nil }) {
                     // Q4-LIVE-WRITE: admit all rows before any host state
                     // mutation. Pass A writes only the live q4 mirror slot;
@@ -919,7 +922,9 @@ enum CBv2AttentionV1 {
     /// `snapshot`/`rollback`/borrow views are counter- and view-exact. The
     /// only observable difference anywhere is WHEN the first capacity growth
     /// happens (first append after the prompt, not `initialSlack` appends
-    /// later) and the truthful `byteCount` in between — which the contiguous
+    /// later; KV1-FULLKV-PRESIZE sizes that growth to the same
+    /// `promptLength + initialSlack` the up-front allocation would have
+    /// taken) and the truthful `byteCount` in between — which the contiguous
     /// backend bills as `max(byteCount, reservation)`, so admission never
     /// sees headroom the row does not hold.
     ///

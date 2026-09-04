@@ -57,6 +57,19 @@ internal func resolveCBv2CompactDecodeRootsEnabled(_ raw: String?) -> Bool {
 private let cbv2CompactDecodeRootsEnabled = resolveCBv2CompactDecodeRootsEnabled(
     ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_COMPACT_DECODE_ROOTS"])
 
+/// LGH-COMPACT-ROOTS kill switch. The fused-greedy (LGH-001) chained-decode
+/// branch takes the same compact decode-evaluation roots the logits branch
+/// beside it already takes; `DARKBLOOM_CBV2_LGH_COMPACT_ROOTS` set to
+/// `0`/`false`/`no`/`off` restores the full cache-inner-state table on THAT
+/// branch alone, for attribution and emergency bisection. ON by default (the
+/// ranked runner sets no environment).
+private let cbv2LGHCompactRootsEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_CBV2_LGH_COMPACT_ROOTS"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Builds per-layer batch-facing cache views for a set of rows
 /// (`rowStates[b][layer]`, row order == batch row order). WS-A's
 /// `LayerCacheV2` conforms; see CONTRACT-ISSUES-B-scheduler.md §1.
@@ -320,6 +333,22 @@ public struct CBv2EngineLoopConfig: Sendable {
 private let cbv2CompactInflightParticipantsEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_CBV2_COMPACT_INFLIGHT_PARTICIPANTS"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let cbv2DetokBatchEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_DETOK_BATCH"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// CBV2-CHAINED-DECODE-SCRATCH kill switch. Reuse is ON by default (the ranked
+/// runner sets no environment); `DARKBLOOM_CBV2_CHAINED_DECODE_SCRATCH` set to
+/// `0`/`false`/`no`/`off` rebuilds the derived arrays every step (bisection).
+private let cbv2ChainedDecodeScratchEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_CBV2_CHAINED_DECODE_SCRATCH"]
     else { return true }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
@@ -588,7 +617,24 @@ public final class EngineLoopV2: @unchecked Sendable {
     // Engine-thread-confined state (internal, not private: the MTP round
     // driver in EngineLoopV2+MTP.swift is part of the loop).
     var detokenizers: [CBv2RequestID: CBv2IncrementalDetokenizer] = [:]
+    /// HA6: this step's deferred detokenization work (engine-thread confined,
+    /// exactly like `detokenizers`), drained by `flushPendingDetokBatch()`.
+    private var pendingDetokBatch:
+        [(
+            stream: CBv2OutputStream?, detokenizer: (any CBv2IncrementalDetokenizer)?,
+            token: Int, isStopToken: Bool, logprobs: [CBv2TokenLogprob]?
+        )] = []
     var kvStates: [CBv2RequestID: [CBv2SequenceKV?]] = [:]
+    /// CBV2-CHAINED-DECODE-SCRATCH. `launchChainedDecode`'s three derived arrays are
+    /// element-wise identical across steady-state token steps. INVARIANT: reusable only
+    /// while the plan's id sequence matches element-wise AND no `kvStates` entry was
+    /// inserted/removed since — `rowStates` snapshots the per-id row arrays, so every
+    /// `kvStates` mutation site in this file clears it. Holding elements is safe:
+    /// `CBv2SequenceKV` is class-bound (`CBv2Contracts.swift:256`), so a cached row holds
+    /// the objects a fresh lookup returns; `CBv2SamplingParams` is a value type read from
+    /// `rec.request`, a `let` that cannot drift.
+    private var chainedDecodeScratch:
+        (ids: [CBv2RequestID], rowStates: [[CBv2SequenceKV?]], params: [CBv2SamplingParams])?
     /// Tokens skipped via prefix-cache adoption, reported in usage.
     private var prefixHitTokens: [CBv2RequestID: Int] = [:]
     /// Lookup/adoption outcome carried to terminal usage.
@@ -1057,6 +1103,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 layerKinds: layerKinds,
                 maxLength: maxLength)
             kvStates[requestID] = state
+            chainedDecodeScratch = nil  // CBV2-CHAINED-DECODE-SCRATCH
             rec.numComputedTokens = adoption.plan.replayStart
             rec.prefixReusePlan = adoption.plan
             prefixHitTokens[requestID] = adoption.plan.prefillTokensSaved
@@ -1241,6 +1288,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 invalidateAdoptedPrefix(id)
                 mtp?.invalidateCarry(id)
                 guard let state = kvStates.removeValue(forKey: id) else { continue }
+                chainedDecodeScratch = nil  // CBV2-CHAINED-DECODE-SCRATCH
                 if previous.containsParticipant(id) {
                     previous.deferredReleases.append(
                         (
@@ -1580,17 +1628,46 @@ public final class EngineLoopV2: @unchecked Sendable {
         return scored.asArray(Int32.self).map(Int.init)
     }
 
+    /// Element-wise row-identity test for CBV2-CHAINED-DECODE-SCRATCH. `CBv2RequestID`
+    /// wraps a `UInt64`, so a steady-state batch costs eight integer compares.
+    private static func chainedScratchRowsMatch(
+        _ cached: [CBv2RequestID], _ assignments: [(id: CBv2RequestID, numTokens: Int)]
+    ) -> Bool {
+        guard cached.count == assignments.count else { return false }
+        for i in cached.indices where cached[i] != assignments[i].id { return false }
+        return true
+    }
+
     /// Pure-decode step fed by the previous step's still-lazy tokens.
     private func launchChainedDecode(
         _ plan: CBv2StepPlan, feeding lazyTokens: MLXArray
     ) -> CBv2InFlightStep {
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
         let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        let ids = plan.assignments.map(\.id)
-        let rowStates = ids.map { kvStates[$0]! }  // presence pre-checked
-        var params: [CBv2SamplingParams] = []
-        params.reserveCapacity(ids.count)
-        for id in ids { params.append(scheduler.record(for: id)!.request.sampling) }
+        // CBV2-CHAINED-DECODE-SCRATCH: reuse the previous chained step's derived
+        // arrays when this plan schedules the same rows in the same order. Any
+        // difference — count, order, one id — falls through to the build below.
+        let ids: [CBv2RequestID]
+        let rowStates: [[CBv2SequenceKV?]]
+        let params: [CBv2SamplingParams]
+        if cbv2ChainedDecodeScratchEnabled, let scratch = chainedDecodeScratch,
+            Self.chainedScratchRowsMatch(scratch.ids, plan.assignments)
+        {
+            CBv2EngageMark.once("chained-decode-scratch")
+            ids = scratch.ids
+            rowStates = scratch.rowStates
+            params = scratch.params
+        } else {
+            ids = plan.assignments.map(\.id)
+            rowStates = ids.map { kvStates[$0]! }  // presence pre-checked
+            var built: [CBv2SamplingParams] = []
+            built.reserveCapacity(ids.count)
+            for id in ids { built.append(scheduler.record(for: id)!.request.sampling) }
+            params = built
+            if cbv2ChainedDecodeScratchEnabled {
+                chainedDecodeScratch = (ids: ids, rowStates: rowStates, params: params)
+            }
+        }
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
@@ -1608,7 +1685,17 @@ public final class EngineLoopV2: @unchecked Sendable {
         {
             let caches = eagerCaches(rowStates: rowStates)
             sampled = fusedModel.decodeArgmax(tokens: inputs, caches: caches)
-            cacheInnerState = eagerCacheInnerState(caches)
+            // The fused token array is an argmax REDUCTION over the very same
+            // trunk hidden the logits branch hands to the LM head, so it roots
+            // exactly the K/V mutations `decodeLogits`' root does. Take the
+            // compact decode-root list that branch already takes (2 + one ring
+            // fence per layer) instead of the full inner-state table.
+            if cbv2LGHCompactRootsEnabled {
+                CBv2EngageMark.once("lgh-compact-roots")
+                cacheInnerState = eagerDecodeEvaluationRoots(caches, logitsRoot: sampled)
+            } else {
+                cacheInnerState = eagerCacheInnerState(caches)
+            }
             stepLogprobs = nil
             fusedSampler.noteFusedGreedySample()
             if CBv2StepProfiler.enabled {
@@ -2031,6 +2118,25 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Finalization (deferred stop detection)
 
+    /// HA6: ONE `detokQueue.async` per step instead of one per row. Slots were
+    /// reserved synchronously at append time and the batch replays in row order
+    /// on the same serial queue, so the reservation ledger and per-request FIFO
+    /// are exactly what the per-row enqueue produced.
+    private func flushPendingDetokBatch() {
+        if pendingDetokBatch.isEmpty { return }
+        let batch = pendingDetokBatch
+        pendingDetokBatch.removeAll(keepingCapacity: true)
+        detokQueue.async {
+            for entry in batch {
+                let text =
+                    entry.isStopToken ? "" : (entry.detokenizer?.push([entry.token]) ?? "")
+                entry.stream?.emit(
+                    .delta(text: text, tokens: [entry.token], logprobs: entry.logprobs),
+                    consumingReservation: true)
+            }
+        }
+    }
+
     private func finalize(_ step: CBv2InFlightStep, now: ContinuousClock.Instant) {
         // THE host sync — overlapped with the successor step's GPU work when
         // chained. All-prefill steps block on their eval targets instead so
@@ -2106,12 +2212,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             if rec.request.stopStrings.isEmpty {
                 let stream = stream(for: id)
                 stream?.reserveEmission()
-                detokQueue.async {
-                    let text = isStopToken ? "" : (detokenizer?.push([token]) ?? "")
-                    stream?.emit(
-                        .delta(text: text, tokens: [token], logprobs: logprobs),
-                        consumingReservation: true)
-                }
+                pendingDetokBatch.append(
+                    (stream: stream, detokenizer: detokenizer, token: token,
+                        isStopToken: isStopToken, logprobs: logprobs))
+                if !cbv2DetokBatchEnabled { flushPendingDetokBatch() }
             } else {
                 let detokStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
                 let text = isStopToken ? "" : (detokenizer?.push([token]) ?? "")
@@ -2142,6 +2246,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 finishRequest(id, reason: .length)
             }
         }
+        flushPendingDetokBatch()
 
         // MTP round steps: seed-carry capture + the verify accept-walk run
         // at this same host-sync boundary (their arrays rode the step's
@@ -2201,10 +2306,17 @@ public final class EngineLoopV2: @unchecked Sendable {
                     generatedTokens: rec.generatedTokenCount)
                 leasesByID[id] = lease
             }
-            // Publish the reconciled usage once tokens start flowing (prompt
-            // count with zero completion was already seeded at enqueue, so a
-            // still-prefilling row needs no lock traffic here).
-            if rec.generatedTokenCount > 0 {
+            // Publish the reconciled usage on a 16-token cadence once tokens
+            // start flowing (prompt count with zero completion was already
+            // seeded at enqueue, so a still-prefilling row needs no lock
+            // traffic here). The lease refresh above stays UNCONDITIONAL, so
+            // the watchdog's progress signal keeps full per-step resolution;
+            // only this reporting-side counter pair coarsens. `usageSnapshots`
+            // has exactly one reader -- the wedge terminal path, reached only
+            // after the engine thread has already blown the step timeout --
+            // while a normal finish reads `rec.generatedTokenCount` directly
+            // via `takePrefixUsage`, so no observable token count changes.
+            if rec.generatedTokenCount > 0 && rec.generatedTokenCount % 16 == 0 {
                 setUsageSnapshot(
                     id,
                     CBv2Usage(
@@ -2217,6 +2329,9 @@ public final class EngineLoopV2: @unchecked Sendable {
     // MARK: Request completion
 
     func finishRequest(_ id: CBv2RequestID, reason: CBv2FinishReason) {
+        // HA6: this request's terminal flush rides the same serial detokQueue,
+        // so any pending batched delta must be enqueued ahead of it.
+        flushPendingDetokBatch()
         // Ids are legally reusable after finish: drop the per-id capacity
         // requeue count on EVERY finish path (including the error-finish
         // that exhausted it), or a reused id inherits the previous
@@ -2248,6 +2363,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         sampler.requestDidFinish(id)
 
         if let state = kvStates.removeValue(forKey: id) {
+            chainedDecodeScratch = nil  // CBV2-CHAINED-DECODE-SCRATCH
             let donation = donationIntent(for: rec, reason: reason, state: state)
             if let inFlight, inFlight.containsParticipant(id) {
                 // The in-flight step still references this state — fence the
@@ -2656,6 +2772,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 leasesByID[id] = lease
             }
             if let state = kvStates.removeValue(forKey: id) {
+                chainedDecodeScratch = nil  // CBV2-CHAINED-DECODE-SCRATCH
                 backend.release(state)
             }
         }
@@ -2674,6 +2791,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             let state = try backend.makeSequenceState(
                 layerKinds: layerKinds, promptLength: rec.tokens.count, maxLength: maxLength)
             kvStates[rec.id] = state
+            chainedDecodeScratch = nil  // CBV2-CHAINED-DECODE-SCRATCH
             capacityRequeues.removeValue(forKey: rec.id)
             return state
         } catch let kvError as CBv2KVError {

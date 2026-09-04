@@ -175,7 +175,8 @@ final class CBv2FullDecodeCohortPool {
 ///
 /// Storage is one contiguous `[1, kvHeads, capacity, headDim]` buffer per
 /// K and V, grown by doubling (initial capacity = promptLength + 256, capped
-/// at `maxLength`). Appends are slice assignments — `mlx_slice_update`
+/// at `maxLength`; the one growth out of an ADOPTED prompt chunk takes that
+/// same `promptLength + 256` instead — see `presizeEnabled`). Appends are slice assignments — `mlx_slice_update`
 /// donates the input buffer when refcount permits, so an append is O(n), not
 /// O(cache). `update` returns temporal-order zero-copy strided views
 /// `[..., 0..<retained, :]`; MLX SDPA accepts strided K/V.
@@ -192,6 +193,38 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
     /// don't immediately grow the buffer.
     static let initialSlack = 256
 
+    /// KV1-FULLKV-PRESIZE. A row that ADOPTED its prompt chunk
+    /// (`adoptFreshChunk`) holds `capacity == absoluteOffset`, so its FIRST
+    /// decode append always takes `ensureCapacity`'s growth branch — inside
+    /// the timed decode window. The incumbent growth policy there is
+    /// `max(capacity * 2, needed)`, which for a 1024-token prompt asks for
+    /// 2048 slots when 1152 are ever used, so the step allocates and
+    /// zero-fills roughly twice the bytes it needs, per row, per K/V, per
+    /// full-attention layer.
+    ///
+    /// This one growth (and ONLY this one — see `adoptedStorage`) instead
+    /// takes `promptLength + initialSlack`, which is:
+    ///
+    ///   * exactly the capacity `init` would have chosen had the row
+    ///     allocated its own prompt buffer (`capacity` at the adoption
+    ///     point IS the prompt length), and
+    ///   * exactly the per-row byte reservation admission already charged
+    ///     (`ContiguousKVBackend.reservedBytes`: `promptLength +
+    ///     CBv2FullSequenceKV.initialSlack` slots) — so the row stops
+    ///     overshooting its own reservation.
+    ///
+    /// Every later growth keeps the doubling, so long generations keep the
+    /// amortized-O(1) append the doubling exists for.
+    ///
+    /// `DARKBLOOM_CBV2_FULLKV_PRESIZE=0/false/no/off` restores the
+    /// unconditional doubling byte for byte.
+    static let presizeEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_FULLKV_PRESIZE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     public private(set) var absoluteOffset: Int = 0
     public var retainedCount: Int { absoluteOffset }
 
@@ -205,6 +238,12 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
     private var keys: MLXArray?
     private var values: MLXArray?
     private var capacity: Int
+
+    /// KV1-FULLKV-PRESIZE: true exactly while `keys`/`values` are the
+    /// ADOPTED prompt chunk (`capacity == absoluteOffset`, storage aliased
+    /// and structurally read-only). Cleared by the growth that replaces the
+    /// adopted buffers with private ones.
+    private var adoptedStorage = false
 
     /// ATT-008 cohort pooling (nil until `cohortPool(binding:)` migrates this
     /// row). While bound, `keys`/`values` are nil and the pool's row
@@ -324,9 +363,11 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
     ///   and slice appends index into the real dims). The incumbent path's
     ///   `promptLength + initialSlack` headroom is gone, so the FIRST later
     ///   append — append `n'` makes `offset + n' > capacity == offset` always
-    ///   — grows by the same doubling reallocation `ensureCapacity` always
-    ///   performs, into a fresh PRIVATE buffer. The growth mechanism, policy
-    ///   and cap are unchanged; only its first firing moves earlier.
+    ///   — grows by the same `ensureCapacity` reallocation, into a fresh
+    ///   PRIVATE buffer. The growth mechanism and cap are unchanged and its
+    ///   first firing moves earlier; KV1-FULLKV-PRESIZE then sizes that one
+    ///   growth back to `promptLength + initialSlack` (`presizeEnabled`),
+    ///   which is the capacity this row would have allocated up front.
     /// - Because `capacity == absoluteOffset` for as long as the adopted
     ///   buffer lives, the adopted storage is read-only by construction:
     ///   every plain append takes the growth branch (write lands in the new
@@ -363,6 +404,7 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         values = newValues
         capacity = n
         absoluteOffset = n
+        adoptedStorage = true
         return (
             keys![.ellipsis, ..<absoluteOffset, 0...],
             values![.ellipsis, ..<absoluteOffset, 0...]
@@ -493,8 +535,22 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
 
         // Grow by doubling, capped at maxLength. The concat copies the old
         // buffer once per doubling — amortized O(1) per appended token.
-        let newCapacity = min(maxLength, max(capacity * 2, needed))
+        //
+        // KV1-FULLKV-PRESIZE: the ONE growth that replaces an adopted prompt
+        // chunk takes the initial-allocation policy's size instead
+        // (`promptLength + initialSlack`, `promptLength == capacity` here),
+        // so the first timed decode step allocates and zero-fills the slots
+        // the row was reserved rather than a full doubling. Same branch,
+        // same concat, same slots for every token that is actually written;
+        // only the trailing zero region is smaller. Every subsequent growth
+        // (`adoptedStorage` is false by then) doubles exactly as before.
+        let target =
+            (Self.presizeEnabled && adoptedStorage)
+            ? max(capacity + Self.initialSlack, needed)
+            : max(capacity * 2, needed)
+        let newCapacity = min(maxLength, target)
         let growth = newCapacity - capacity
+        adoptedStorage = false
         keys = concatenated(
             [keys!, MLXArray.zeros([1, kvHeads, growth, keys!.dim(3)], dtype: keys!.dtype)],
             axis: 2)

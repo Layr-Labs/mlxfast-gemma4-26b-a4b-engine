@@ -16,6 +16,13 @@
 import Foundation
 import MLX
 
+private let cbv2AttentionRowCacheEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_CBV2_ATTN_ROW_CACHE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Shared on-device position chain for one contiguous cache bank. The bank
 /// chooses one owning cache to rebuild/advance it; every cache reads the same
 /// value, so the model can snapshot it once before entering the layer loop.
@@ -93,6 +100,12 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     private var usesUnifiedPositionOffsets = false
     private var advancesPositionOffsets = true
     private let decodeRingWriteFence = CBv2DecodeRingWriteFence()
+
+    /// HA2: `rows` projected to its sliding-ring concrete type, plus the rows
+    /// it was built from. Validity = element-wise `===` against `rows`, so every
+    /// writer of `rows` invalidates it. Engine-thread confined, like `rows`.
+    private var windowedRowsSource: [CBv2SequenceKV] = []
+    private var windowedRowsProjection: [CBv2WindowedSequenceKV] = []
 
     /// Whether a KV-shared sibling may still be attending views of this
     /// layer's storage. `CBv2LayerCacheBank` clears it for every layer nothing
@@ -188,6 +201,10 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         precondition(
             kind.sharesKVWithLayer == nil,
             "CBv2LayerCache: KV-shared layer \(layerIndex) must use attendBorrowing")
+        // HA2: only L==1 sliding-window decode consumes it.
+        let cachedWindowedRows: [CBv2WindowedSequenceKV]? =
+            (cbv2AttentionRowCacheEnabled && queries.dim(2) == 1 && maxSize != nil)
+            ? windowedRowsForDecode() : nil
         let output = CBv2AttentionV1.updateAndAttend(
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
@@ -195,7 +212,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             spanContexts: boundSpanContexts,
             serializeQueries: mtpSerializesRectangularAttention,
             decodeRingWriteFence: decodeRingWriteFence,
-            allowFusedRingWrite: !retainsChunkForBorrowers)
+            allowFusedRingWrite: !retainsChunkForBorrowers,
+            cachedWindowedRows: cachedWindowedRows)
         // Advance offsets ON-DEVICE. A unified bank elects exactly one owning
         // cache; Gemma snapshots the shared pre-step value before this call.
         if advancesPositionOffsets {
@@ -247,6 +265,17 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     }
 
     // MARK: - Private
+
+    private func windowedRowsForDecode() -> [CBv2WindowedSequenceKV] {
+        if windowedRowsSource.count == rows.count,
+            !rows.indices.contains(where: { windowedRowsSource[$0] !== rows[$0] })
+        {
+            return windowedRowsProjection
+        }
+        windowedRowsSource = rows
+        windowedRowsProjection = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
+        return windowedRowsProjection
+    }
 
     private func rebuildPositionOffsets() {
         positionOffsetsHostRebuilds += 1

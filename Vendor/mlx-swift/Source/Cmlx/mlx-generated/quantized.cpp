@@ -3947,7 +3947,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  constexpr int gemma4_down_tile_span = 2; // sweep alternate: 4
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }
@@ -4006,7 +4006,11 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
+    // EXPERT-SINGLES on the pairless tile walk: same arm the K = 2816
+    // gate/up singleton already takes, now with KFIX = 704. Loads-only
+    // rescheduling of the identical qdot sequence (see the WVEC/KFIX
+    // contract above), so this tile's stored rows are unchanged.
+    qmv_affine4_g64_singles_impl<T, group_size, bits, 704, true, false>(
         tile_w,
         tile_scales,
         tile_biases,
@@ -4196,11 +4200,12 @@ template <typename T, int group_size, int bits>
     device T* single_y = y + assignment * (uint)out_vec_size;
     if (in_vec_size == 2816) {
       qmv_affine4_g64_singles_impl<
-          T, group_size, bits, 2816, true, false>(
+          T, group_size, bits, 2816, true, true>(
           single_w, single_scales, single_biases, single_x, single_y,
           in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
     } else {
-      qmv_impl<T, group_size, bits>(
+      qmv_affine4_g64_singles_impl<
+          T, group_size, bits, 704, true, false>(
           single_w, single_scales, single_biases, single_x, single_y,
           in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
     }

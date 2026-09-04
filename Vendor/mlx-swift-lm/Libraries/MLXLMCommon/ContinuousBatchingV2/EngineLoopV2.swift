@@ -1924,12 +1924,23 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         asyncEval(toEval)
 
-        let step = CBv2InFlightStep(
-            participants: Set(work.map(\.rec.id)),
-            sampledRows: sampledRows,
-            sampledTokens: sampledTokens,
-            evalTargets: evalTargets,
-            wallStartedNanos: wallStartedNanos)
+        let step: CBv2InFlightStep
+        if cbv2CompactInflightParticipantsEnabled {
+            CBv2EngageMark.once("compact-inflight-participants")
+            step = CBv2InFlightStep(
+                compactParticipants: work.map(\.rec.id),
+                sampledRows: sampledRows,
+                sampledTokens: sampledTokens,
+                evalTargets: evalTargets,
+                wallStartedNanos: wallStartedNanos)
+        } else {
+            step = CBv2InFlightStep(
+                participants: Set(work.map(\.rec.id)),
+                sampledRows: sampledRows,
+                sampledTokens: sampledTokens,
+                evalTargets: evalTargets,
+                wallStartedNanos: wallStartedNanos)
+        }
         step.logprobSegments = logprobSegments
         return step
     }

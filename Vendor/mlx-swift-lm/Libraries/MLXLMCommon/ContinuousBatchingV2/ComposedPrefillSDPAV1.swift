@@ -676,31 +676,49 @@ enum CBv2PrefillSoftmaxVecV1 {
     /// optimum of the ranked geometry (any value is exact); other lengths
     /// take about 640 threads per threadgroup.
     static func rowsPerThreadgroup(axisSize: Int, threadgroupSize: Int) -> Int {
-        let table: [Int: Int] = [
-            1024: 2, 896: 2, 768: 3, 640: 4, 512: 6, 384: 6, 256: 10, 128: 16,
-        ]
-        if let rows = table[axisSize] { return rows }
-        return max(1, min(640 / threadgroupSize, 1024 / threadgroupSize))
+        switch axisSize {
+        case 1024, 896: return 2
+        case 768: return 3
+        case 640: return 4
+        case 512, 384: return 6
+        case 256: return 10
+        case 128: return 16
+        default: return max(1, min(640 / threadgroupSize, 1024 / threadgroupSize))
+        }
     }
 
-    nonisolated(unsafe) private static let precomputedParams: [Int: MLXArray] = {
-        var table: [Int: MLXArray] = [:]
-        for axis in [128, 256, 384, 512, 640, 768, 896, 1024] {
-            let tg = ((axis + 3) / 4 + 31) / 32 * 32
-            let numSimdgroups = tg / 32
-            let arr = MLXArray([UInt32(axis), UInt32(numSimdgroups)])
-            eval(arr)
-            table[axis] = arr
-        }
-        return table
-    }()
+    /// Fixed, eagerly evaluated parameter carriers for every production
+    /// prefill axis. Named constants preserve the old dictionary's array
+    /// identity on repeated calls while removing the per-call hash lookup.
+    nonisolated(unsafe) private static let params128 = makeParams(axis: 128, simdgroups: 1)
+    nonisolated(unsafe) private static let params256 = makeParams(axis: 256, simdgroups: 2)
+    nonisolated(unsafe) private static let params384 = makeParams(axis: 384, simdgroups: 3)
+    nonisolated(unsafe) private static let params512 = makeParams(axis: 512, simdgroups: 4)
+    nonisolated(unsafe) private static let params640 = makeParams(axis: 640, simdgroups: 5)
+    nonisolated(unsafe) private static let params768 = makeParams(axis: 768, simdgroups: 6)
+    nonisolated(unsafe) private static let params896 = makeParams(axis: 896, simdgroups: 7)
+    nonisolated(unsafe) private static let params1024 = makeParams(axis: 1024, simdgroups: 8)
+
+    private static func makeParams(axis: Int, simdgroups: Int) -> MLXArray {
+        let arr = MLXArray([UInt32(axis), UInt32(simdgroups)])
+        eval(arr)
+        return arr
+    }
 
     @inline(__always)
     private static func getParams(axisSize: Int, numSimdgroups: Int) -> MLXArray {
-        if let hit = precomputedParams[axisSize] {
-            return hit
+        switch axisSize {
+        case 128: return params128
+        case 256: return params256
+        case 384: return params384
+        case 512: return params512
+        case 640: return params640
+        case 768: return params768
+        case 896: return params896
+        case 1024: return params1024
+        default:
+            return MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
         }
-        return MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
     }
 
     /// Runs the vectorized softmax, or returns nil to keep the caller on

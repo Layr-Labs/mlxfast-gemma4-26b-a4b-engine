@@ -6763,15 +6763,15 @@ public class Gemma4TextModelInner: Module {
             // K/V depend on it.
             let isFinalPromptLayer =
                 schedulePrefill && isCBv2 && idx == layers.count - 1
-                && h.dim(0) > 0 && h.dim(1) >= gemma4PrefillTailMinChunk
+                && inputBatchSize > 0 && inputLength >= gemma4PrefillTailMinChunk
             let outputTailRows: Int? =
                 isFinalPromptLayer && gemma4PrefillTailRows > 0
-                ? min(gemma4PrefillTailRows, h.dim(1)) : nil
+                ? min(gemma4PrefillTailRows, inputLength) : nil
             let useLastQueryPrefill = gemma4UseLastQueryPrefill(
                 config,
                 layerIdx: idx,
-                batchSize: h.dim(0),
-                sequenceLength: h.dim(1),
+                batchSize: inputBatchSize,
+                sequenceLength: inputLength,
                 outputTailRows: outputTailRows,
                 hasCapableCache: fullCache[idx] is any CBv2LastQueryPrefillLayerCache)
             let (out, kvPair, positionOffset) = layer(
@@ -7100,6 +7100,15 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             outDim: config.vocabSize)
     }
 
+    /// Cached softcap scalar for the pinned track value (30.0).
+    ///
+    /// `MLXArray(Float, ...)` routes through a real one-element copy dispatch,
+    /// so rebuilding it per forward adds one dispatch per step on any path
+    /// that reaches the softcap (mixed decode rows, prefill logits). The
+    /// constant is a read-only graph input, safe to share. Any non-default
+    /// config value falls back to a fresh array so behavior is identical.
+    nonisolated(unsafe) private static let cachedSoftcap30: MLXArray = MLXArray(Float(30.0))
+
     func applyLMHead(
         _ hidden: MLXArray,
         activationSums: Gemma4MMAQuantizedGEMV.ActivationSums? = nil
@@ -7127,8 +7136,10 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         // one transcendental pass over the whole vocabulary plus the float32
         // widening the untyped cap forces on the tensor the sampler reads.
         if config.finalLogitSoftcapping > 0, !CBv2OrderOnlyLogits.engaged {
-            out = gemma4CompiledLogitSoftcap(
-                out, MLXArray(config.finalLogitSoftcapping))
+            let capArray =
+                config.finalLogitSoftcapping == 30.0
+                ? Self.cachedSoftcap30 : MLXArray(config.finalLogitSoftcapping)
+            out = gemma4CompiledLogitSoftcap(out, capArray)
         }
         return out
     }

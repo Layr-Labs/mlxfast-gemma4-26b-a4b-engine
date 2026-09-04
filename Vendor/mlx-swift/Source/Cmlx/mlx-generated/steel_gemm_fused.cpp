@@ -1,7 +1,12 @@
+#include <cstdlib>
+#include <cstring>
+#include <string>
+
 namespace mlx::core::metal {
 
 const char* steel_gemm_fused() {
-  return R"preamble(
+  static const std::string selected = [] {
+    std::string s = R"preamble(
 // Copyright © 2025 Apple Inc.
 
 // Auto generated source for mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_fused.h
@@ -153,7 +158,7 @@ template <
   // 16 and each thread's even/odd fragments hold a matching gate/up pair.
   const bool gemma4_dense_geglu =
       !transpose_a && transpose_b && metal::is_same_v<T, bfloat16_t> &&
-      !use_out_source && WN == 2 && params->M >= 512 &&
+      use_out_source && !has_batch && WN == 2 && params->M >= 512 &&
       params->N == 4224 && params->K == 2816;
 
   // The admitted plane interleaves 16 gate columns with their 16 up columns
@@ -323,7 +328,7 @@ template <
     threadgroup_barrier(mem_flags::mem_none);
 
     // Do epilogue
-    if (use_out_source) {
+    if (use_out_source && !gemma4_dense_geglu) {
       if (do_axpby) {
         if (softmax_loader) {
           // PREFILL-ATTN-TRAFFIC (at1): the out-source operand carried the
@@ -412,7 +417,7 @@ template <
           LoopAlignment<true, true, true>{});
 
       // Do epilogue
-      if (use_out_source) {
+      if (use_out_source && !gemma4_dense_geglu) {
         if (do_axpby) {
           mma_op.apply_epilogue(
               C, addmm_params->ldc, addmm_params->fdc, epilogue_op_axpby);
@@ -443,7 +448,7 @@ template <
           LoopAlignment<false, true, true>{});
 
       // Do epilogue
-      if (use_out_source) {
+      if (use_out_source && !gemma4_dense_geglu) {
         if (do_axpby) {
           mma_op.apply_epilogue_safe(
               C,
@@ -482,7 +487,7 @@ template <
           LoopAlignment<true, false, true>{});
 
       // Do epilogue
-      if (use_out_source) {
+      if (use_out_source && !gemma4_dense_geglu) {
         if (do_axpby) {
           mma_op.apply_epilogue_safe(
               C,
@@ -521,7 +526,7 @@ template <
           LoopAlignment<false, false, true>{});
 
       // Do epilogue
-      if (use_out_source) {
+      if (use_out_source && !gemma4_dense_geglu) {
         if (do_axpby) {
           mma_op.apply_epilogue_safe(
               C,
@@ -551,6 +556,22 @@ template <
 
 ///////////////////////////////////////////////////////////////////////////////
 )preamble";
+    const char* raw = std::getenv("DARKBLOOM_GEMMA4_GEGLU_RESTRICT");
+    const bool on = !(raw && (!std::strcmp(raw, "0") || !std::strcmp(raw, "false") ||
+                              !std::strcmp(raw, "no") || !std::strcmp(raw, "off")));
+    if (!on) {
+      auto sub = [&s](const char* a, const char* b) {
+        const size_t la = std::strlen(a), lb = std::strlen(b);
+        for (size_t p = s.find(a); p != std::string::npos; p = s.find(a, p + lb)) {
+          s.replace(p, la, b);
+        }
+      };
+      sub("use_out_source && !has_batch", "!use_out_source");
+      sub("if (use_out_source && !gemma4_dense_geglu) {", "if (use_out_source) {");
+    }
+    return s;
+  }();
+  return selected.c_str();
 }
 
 } // namespace mlx::core::metal

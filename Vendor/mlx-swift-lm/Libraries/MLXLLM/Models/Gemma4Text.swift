@@ -5090,6 +5090,18 @@ private let gemma4DenseGateUpJoinEnabled: Bool = {
 /// never builds the paired plane, so the kernel predicate can never observe
 /// its geometry and the incumbent path runs exactly as before.
 /// Engage mark: `dense-geglu-epilogue-prefill`.
+/// Selects the form in which the paired gate|up prefill plane is handed to the
+/// dense GeGLU close: the out-source form, or the plain form.
+///
+/// `DARKBLOOM_GEMMA4_GEGLU_RESTRICT=0` (or `false`/`no`/`off`) selects the plain
+/// form and the incumbent kernel text.
+internal let gemma4GeGLURestrictEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_GEGLU_RESTRICT"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private let gemma4DenseGeGLUEpilogueEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_DENSE_GEGLU_EPILOGUE"]
@@ -5212,7 +5224,14 @@ private class Gemma4MLP: Module {
             let plane = Self.pairedGateUpPlane(
                 gate: gate, gateBiases: gateBiases, up: up, upBiases: upBiases)
         else { return nil }
-        let joined = MLX.matmul(x, plane)
+        let joined: MLXArray
+        if gemma4GeGLURestrictEnabled {
+            let zero = MLXArray.zeros([1, 1], dtype: .bfloat16)
+            joined = MLX.addMM(zero, x, plane, alpha: 1.0, beta: 0.0)
+            CBv2EngageMark.once("geglu-restrict")
+        } else {
+            joined = MLX.matmul(x, plane)
+        }
         CBv2EngageMark.once("dense-geglu-epilogue-prefill")
         // The specialized store writes the compact plane densely into the
         // first physical half of the ordinary N=4224 allocation. Preserve

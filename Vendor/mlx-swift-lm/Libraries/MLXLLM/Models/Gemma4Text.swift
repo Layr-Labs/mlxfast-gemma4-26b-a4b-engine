@@ -5792,6 +5792,7 @@ public class Gemma4DecoderLayer: Module {
         {
             // Dense + sparse branches in parallel, summed into one residual.
             let h1Raw: MLXArray
+            var fusedPrefillDense: MLXArray? = nil
             let expertBranch: (
                 raw: MLXArray?,
                 deferred: DeferredWeightedExpertRows?,
@@ -5899,21 +5900,31 @@ public class Gemma4DecoderLayer: Module {
                     // a lazy fallback: it is dispatched only if SwitchGLU
                     // declines the producer, and never otherwise.
                     let expertNormWeight = preFeedforwardLayernorm2.weight
+                    let denseNormWeight = preFeedforwardLayernorm.weight
                     let expertTopK = topKIndices.dim(-1)
                     let normEps = config.rmsNormEps
-                    h1Raw = mlp(n1)
                     expertBranch = projectExpertBranch(
                         n2,
                         indices: topKIndices,
                         weights: topKWeights,
                         sortedPlane: { inverseOrder in
-                            Gemma4PrefillGlueV1.preNormScatter(
+                            if let fused = Gemma4PrefillGlueV1.dualPreNormScatter(
                                 x: out,
-                                weight: expertNormWeight,
+                                denseWeight: denseNormWeight,
+                                expertWeight: expertNormWeight,
                                 inverseOrder: inverseOrder,
                                 topK: expertTopK,
                                 eps: normEps)
+                            {
+                                fusedPrefillDense = fused.dense
+                                return fused.sorted
+                            }
+                            return Gemma4PrefillGlueV1.preNormScatter(
+                                x: out, weight: expertNormWeight,
+                                inverseOrder: inverseOrder, topK: expertTopK,
+                                eps: normEps)
                         })
+                    h1Raw = mlp(fusedPrefillDense ?? n1)
                 } else if let (n1, n2) = Gemma4PrefillGlueV1.dualPreNorm(
                     x: out,
                     w1: preFeedforwardLayernorm.weight,

@@ -551,6 +551,56 @@ public enum Gemma4PrefillGlueV1 {
         ensureRowContiguous: true
     )
 
+    /// Dual pre-norm variant for the sorted expert-prefill path. The dense
+    /// result and the expert result share the same input reduction; the latter
+    /// is written directly to inverse-order positions.
+    private static let dualPreNormScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_glue_dual_prenorm_scatter_2816_v1",
+        inputNames: ["x", "w1", "w2", "inverse"],
+        outputNames: ["dense", "out"],
+        source: """
+            threadgroup float local_sums[32];
+            threadgroup float local_inv[1];
+
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+            float xv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                xv[i] = static_cast<float>(x[base + i]);
+            }
+            const float inv = glue_inv_rms(
+                xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+            T densev[GLUE_NREADS];
+            T expertv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T scaled = static_cast<T>(xv[i] * inv);
+                densev[i] = w1[j] * scaled;
+                expertv[i] = w2[j] * scaled;
+                dense[base + i] = densev[i];
+            }
+
+            const size_t assignment_base = size_t(row) * K;
+            for (int k = 0; k < K; k++) {
+                const size_t pos = size_t(inverse[assignment_base + k]);
+                const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    out[obase + i] = expertv[i];
+                }
+            }
+            """,
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
     /// `rmsNorm(x, weight)` alone. Returns `nil` off the prefill plane or with
     /// the arm switched off.
     public static func preNorm(
@@ -596,6 +646,36 @@ public enum Gemma4PrefillGlueV1 {
             outputShapes: [[rows * topK, 1, axis]],
             outputDTypes: [x.dtype]
         )[0]
+    }
+
+    /// Returns the dense pre-norm and the expert pre-norm already scattered
+    /// into sorted order, sharing one RMS reduction and one input read.
+    public static func dualPreNormScatter(
+        x: MLXArray, denseWeight: MLXArray, expertWeight: MLXArray,
+        inverseOrder: MLXArray, topK: Int, eps epsIn: Float
+    ) -> (dense: MLXArray, sorted: MLXArray)? {
+        guard prenormGatherEnabled,
+            let rows = planeRows(x, weight: denseWeight, eps: epsIn),
+            expertWeight.shape == denseWeight.shape,
+            expertWeight.dtype == denseWeight.dtype,
+            topK >= 1,
+            inverseOrder.ndim == 1,
+            inverseOrder.dtype == .uint32,
+            inverseOrder.dim(0) == rows * topK
+        else { return nil }
+
+        CBv2EngageMark.once("prefill-dual-prenorm-scatter")
+        let outputs = dualPreNormScatterKernel(
+            [x, denseWeight, expertWeight, inverseOrder],
+            template: [
+                ("T", x.dtype), ("K", topK)
+            ],
+            grid: (threadsPerRow, rows, 1),
+            threadGroup: (threadsPerRow, 1, 1),
+            outputShapes: [x.shape, [rows * topK, 1, axis]],
+            outputDTypes: [x.dtype, x.dtype]
+        )
+        return (outputs[0], outputs[1])
     }
 
     // MARK: - branch tail (5 dispatches -> 1)

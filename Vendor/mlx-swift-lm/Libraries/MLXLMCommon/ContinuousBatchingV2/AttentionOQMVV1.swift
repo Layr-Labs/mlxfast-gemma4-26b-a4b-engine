@@ -32,6 +32,19 @@ public enum CBv2AttentionOQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// OPROJ-UR4. The scored run-sum loops have exact trip counts of 32 and
+    /// 64, both divisible by four. This retains the independently promoted
+    /// four-way compiler schedule while OPROJ-CARRY2 changes only when the
+    /// immutable weight/scale/bias loads are issued.
+    public static let unroll4Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_OPROJ_UNROLL4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let unroll4KeySuffix = unroll4Enabled ? "_ur4_58ef" : ""
+
     private static let batch = 8
     private static let sequence = 1
     private static let outputWidth = 2816
@@ -447,6 +460,30 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
     private static let mma8Rsp2Carry2Header = applyOprojCarry2(
         to: mma8Rsp2KernelHeader, occurrences: 2)
 
+    private static func applyOprojUnroll4(to header: String, occurrences: Int) -> String {
+        let old = "#pragma unroll\n  for (int gi = 0; gi < nGroups; ++gi) {"
+        precondition(
+            header.components(separatedBy: old).count == occurrences + 1,
+            "unroll4 anchor drift")
+        return header.replacingOccurrences(
+            of: old,
+            with: "#pragma clang loop unroll_count(4)\n  for (int gi = 0; gi < nGroups; ++gi) {")
+    }
+
+    private static let mma8RunSumHeader: String = {
+        let header = oprojCarry2Enabled ? mma8Carry2Header : mma8KernelHeader
+        return unroll4Enabled
+            ? applyOprojUnroll4(to: header, occurrences: 1)
+            : header
+    }()
+
+    private static let mma8Rsp2RunSumHeader: String = {
+        let header = oprojCarry2Enabled ? mma8Rsp2Carry2Header : mma8Rsp2KernelHeader
+        return unroll4Enabled
+            ? applyOprojUnroll4(to: header, occurrences: 2)
+            : header
+    }()
+
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_bfill_v4",
@@ -602,7 +639,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
 
     private static let mma8RspKernelK4096 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_rsp_v1"
-            + carry2KeySuffix,
+            + carry2KeySuffix + unroll4KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -615,12 +652,12 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: oprojCarry2Enabled ? mma8Carry2Header : mma8KernelHeader,
+        header: mma8RunSumHeader,
         ensureRowContiguous: true)
 
     private static let mma8RspKernelK8192 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp_v1"
-            + carry2KeySuffix,
+            + carry2KeySuffix + unroll4KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -633,7 +670,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: oprojCarry2Enabled ? mma8Carry2Header : mma8KernelHeader,
+        header: mma8RunSumHeader,
         ensureRowContiguous: true)
 
     /// ORS-D512: the `_rsp` body with the run sums read as PAIRS of
@@ -735,7 +772,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
 
     private static let mma8Rsp2KernelK8192 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp2_v1"
-            + carry2KeySuffix,
+            + carry2KeySuffix + unroll4KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_pairs"],
         outputNames: ["y"],
         source: """
@@ -748,7 +785,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: oprojCarry2Enabled ? mma8Rsp2Carry2Header : mma8Rsp2KernelHeader,
+        header: mma8Rsp2RunSumHeader,
         ensureRowContiguous: true)
 
     @inline(__always)

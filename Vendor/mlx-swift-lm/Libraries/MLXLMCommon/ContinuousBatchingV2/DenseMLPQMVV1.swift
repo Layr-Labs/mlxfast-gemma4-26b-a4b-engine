@@ -485,7 +485,144 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
     /// and the close is the reference's own `s * C + rs * b`. KS = 2 splits
     /// the K/64 groups across the two simdgroups; an odd count (down_proj,
     /// G = 33) gives the extra group to simdgroup 0, deterministically.
-    private static let mma8KernelHeader = """
+    // -------------------------------------------------------------------
+    // The promoted `_h1` fp16 A-side dequant, carried to the dense MLP MMA8
+    // bodies.  The base applies it to the 4-bit `MMA8_STEP` shared by the
+    // Q/K/V and o_proj hosts; the 8-bit `MMA8_STEP8` below is the same fill in
+    // the same position, on codes that are whole bytes rather than nibbles.
+    //
+    // `0x6400` is the half bit pattern of 1024 -- exponent field 25 against a
+    // bias of 15, mantissa zero.  The half significand is ten bits, so a byte
+    // code 0...255 occupies its low eight and never reaches the exponent
+    // field: `0x6400 | n` is exactly `1024 + n` for every byte code, the
+    // binade [1024, 2048) has unit ULP so that value is exactly representable,
+    // and `(1024 + n) - 1024` is exact in half.  `A.thread_elements()`
+    // therefore receives the same float it received before, in the same order,
+    // into the same unchanged `simdgroup_multiply_accumulate` chain.  No
+    // address is formed, no load moves, no barrier is added and no
+    // accumulation is reordered.
+    //
+    // Only this SUBTRACTION form is exact.  Folding the 1024 into the affine
+    // bias (`b2 = fma(s, -1024, b)`) rounds twice and is a different number --
+    // and it is the cheaper of the two in AIR, which is what makes it
+    // dangerous.  The close is untouched here either way.
+    //
+    // THE TWO HALVES OF THIS PLANE ARE SEPARATELY SWITCHED.  The gate/up body
+    // and the down body are different bodies with different register
+    // pressure, and a single switch cannot say which of them paid.  Each half
+    // has its own environment switch, each defaults ON, and each carries its
+    // own key suffix, so any of the four states is reachable from one binary
+    // with no rebuild.
+
+    /// Gate/up half of the dense MLP MMA8 plane.  Default ON.
+    /// `DARKBLOOM_GEMMA4_DENSE_MLP_GATEUP_FP16_DEQUANT=0` restores the
+    /// promoted integer-convert fill byte for byte, under the promoted
+    /// registration name, in the same executable.
+    public static let gateUpFp16DequantEnabled: Bool =
+        fp16DequantArm("DARKBLOOM_GEMMA4_DENSE_MLP_GATEUP_FP16_DEQUANT")
+
+    /// Down half of the dense MLP MMA8 plane.  Default ON.
+    /// `DARKBLOOM_GEMMA4_DENSE_MLP_DOWN_FP16_DEQUANT=0` restores the promoted
+    /// integer-convert fill byte for byte, under the promoted registration
+    /// names, in the same executable.
+    public static let downFp16DequantEnabled: Bool =
+        fp16DequantArm("DARKBLOOM_GEMMA4_DENSE_MLP_DOWN_FP16_DEQUANT")
+
+    private static func fp16DequantArm(_ name: String) -> Bool {
+        // The fill below is SLICED out of the Q/K/V donor, so neither half can
+        // be in the fp16 form while the donor is in the integer form.
+        guard CBv2AttentionQKVMMA8V1.fp16DequantEnabled else { return false }
+        guard let raw = ProcessInfo.processInfo.environment[name]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }
+
+    /// Registration-key suffixes, empty in the off state, so a registered name
+    /// never outlives the body it was compiled from.  Every kernel whose
+    /// header text an arm changes takes that arm's suffix, including
+    /// `mma8DownLaneSumKernel`, whose own source never expands `MMA8_STEP8`
+    /// but which is compiled from the same header string.
+    static let gateUpFp16DequantKeySuffix = gateUpFp16DequantEnabled ? "_h1" : ""
+    static let downFp16DequantKeySuffix = downFp16DequantEnabled ? "_h1" : ""
+
+    /// The donor's own A-side fill, TAKEN APART rather than transcribed.
+    /// `lead` is every character `CBv2AttentionQKVMMA8V1.mma8StepMacro` puts
+    /// in front of its code expression and `tail` every character it puts
+    /// after; the code expression is located by its `extract_bits(` call and
+    /// that call's matching close paren, both of which are Metal builtins
+    /// rather than part of the transform.  A hand-written copy of the fill
+    /// would be a second source of truth that can silently drift from the
+    /// promoted one, and on this tree a transcribed duplicate is exactly how
+    /// a mechanism came to have zero reach.  `nil` means the donor is not in
+    /// its fp16 form, and this plane then stays on the integer fill.
+    private static let donorH1Fill: (lead: String, tail: String)? = {
+        let donor = CBv2AttentionQKVMMA8V1.mma8StepMacro
+        let head = "A.thread_elements()[0] = "
+        let sep = "; A.thread_elements()[1] = "
+        guard let h = donor.range(of: head), let s = donor.range(of: sep),
+            h.upperBound < s.lowerBound
+        else { return nil }
+        let fill = String(donor[h.upperBound..<s.lowerBound])
+        guard let e = fill.range(of: "extract_bits(") else { return nil }
+        var depth = 0
+        var close: String.Index? = nil
+        var i = fill.index(before: e.upperBound)
+        while i < fill.endIndex {
+            if fill[i] == "(" { depth += 1 }
+            if fill[i] == ")" {
+                depth -= 1
+                if depth == 0 { close = i; break }
+            }
+            i = fill.index(after: i)
+        }
+        guard let c = close else { return nil }
+        let lead = String(fill[fill.startIndex..<e.lowerBound])
+        let tail = String(fill[fill.index(after: c)...])
+        // The donor is only in its fp16 form if the slice actually carries the
+        // half-domain wrapper; in the integer form `lead` is just "float(".
+        guard lead.contains("as_type<half>"), !tail.isEmpty else { return nil }
+        return (lead, tail)
+    }()
+
+    /// The promoted integer-convert 8-bit step, byte for byte.
+    private static let mma8Step8MacroInt = """
+
+#define MMA8_STEP8(BB, WLO, WHI, SH) A.thread_elements()[0] = float(extract_bits(wv.WLO, (SH), 8)); A.thread_elements()[1] = float(extract_bits(wv.WHI, (SH), 8)); simdgroup_multiply_accumulate(C, A, BB, C);
+"""
+
+    /// The same step with each code expression wrapped in the donor's fill.
+    private static let mma8Step8MacroH1: String = {
+        guard let f = donorH1Fill else { return mma8Step8MacroInt }
+        var result = mma8Step8MacroInt
+        for code in [
+            "extract_bits(wv.WLO, (SH), 8)", "extract_bits(wv.WHI, (SH), 8)",
+        ] {
+            let old = "float(" + code + ")"
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(
+                of: old, with: f.lead + code + f.tail)
+        }
+        return result
+    }()
+
+    /// The header the base ships, split at the step macro so the two halves
+    /// rejoin byte for byte in the off state.  Every `replaceOnce` anchor in
+    /// `mma8DownStaticKHeader` and `mma8DownLaneSumHeader` lies wholly inside
+    /// one half, so both derived headers follow their own arm automatically.
+    private static func mma8KernelHeader(h1: Bool) -> String {
+        mma8KernelHeaderPrefix
+            + (h1 ? mma8Step8MacroH1 : mma8Step8MacroInt)
+            + mma8KernelHeaderSuffix
+    }
+
+    /// The gate/up base, and the base every down-plane registration derives
+    /// from.  With both arms off these are one string and it is the base's.
+    private static let mma8GateUpHeader =
+        mma8KernelHeader(h1: gateUpFp16DequantEnabled)
+    private static let mma8DownBaseHeader =
+        mma8KernelHeader(h1: downFp16DequantEnabled)
+
+    private static let mma8KernelHeaderPrefix = """
 #include <metal_simdgroup_matrix>
 
 #ifndef METAL_FUNC
@@ -604,7 +741,10 @@ inline float mma8_runsum8(uint4 r) {
 // byte 0..255 and x is unscaled, exactly as the 8-bit `qdot` arm forms its
 // product; a bf16 x carries 8 significant bits and the code 8, so the product
 // needs at most 16 and is exact in fp32.
-#define MMA8_STEP8(BB, WLO, WHI, SH) A.thread_elements()[0] = float(extract_bits(wv.WLO, (SH), 8)); A.thread_elements()[1] = float(extract_bits(wv.WHI, (SH), 8)); simdgroup_multiply_accumulate(C, A, BB, C);
+"""
+
+    private static let mma8KernelHeaderSuffix = """
+
 
 // x is [8, K] with K % 64 == 0, w is packed [N, K / 4] uint32 (one byte per
 // code, so the row stride is K bytes and K % 64 == 0 keeps every `uint4` load
@@ -706,7 +846,8 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
 """
 
     private static let mma8Kernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_v1"
+            + gateUpFp16DequantKeySuffix,
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -719,14 +860,14 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: mma8KernelHeader,
+        header: mma8GateUpHeader,
         ensureRowContiguous: true)
 
     // DMLP-STATIC-K-018: the frontier's attention kernels expose their K walk
     // to the compiler. Down has G=33, so its final second-SIMD iteration must
     // skip before any load/MMA, retaining the original 17+16 split and close.
     private static let mma8DownStaticKHeader: String = {
-        var result = mma8KernelHeader
+        var result = mma8DownBaseHeader
         func replaceOnce(_ old: String, with new: String) {
             precondition(result.components(separatedBy: old).count == 2)
             result = result.replacingOccurrences(of: old, with: new)
@@ -821,7 +962,8 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }()
 
     private static let mma8DownStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_bfill_v4",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_bfill_v4"
+            + downFp16DequantKeySuffix,
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -839,7 +981,8 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     /// One complete SIMD group per g64 group. Keep all lane results rather
     /// than canonicalizing row sums: the consumer reads its own lane's tree.
     private static let mma8DownLaneSumKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_down_lane_sums_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_down_lane_sums_v1"
+            + downFp16DequantKeySuffix,
         inputNames: ["x"],
         outputNames: ["laneSums"],
         source: """
@@ -857,11 +1000,11 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
             rs += simd_shuffle_xor(rs, 16u);
             ((device float2*)laneSums)[g * 32 + lane] = rs;
             """,
-        header: mma8KernelHeader,
+        header: mma8DownBaseHeader,
         ensureRowContiguous: true)
 
     private static let mma8DownLaneSumHeader: String = {
-        var result = mma8KernelHeader
+        var result = mma8DownBaseHeader
         func replaceOnce(_ old: String, with new: String) {
             precondition(result.components(separatedBy: old).count == 2)
             result = result.replacingOccurrences(of: old, with: new)
@@ -899,7 +1042,8 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }()
 
     private static let mma8DownLaneSumQMVKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_lane_sums_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_lane_sums_v1"
+            + downFp16DequantKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "laneSums"],
         outputNames: ["y"],
         source: """

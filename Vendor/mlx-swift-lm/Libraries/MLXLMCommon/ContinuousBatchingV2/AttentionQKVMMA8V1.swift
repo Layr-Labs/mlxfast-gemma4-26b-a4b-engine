@@ -49,17 +49,16 @@ public enum CBv2AttentionQKVMMA8V1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// H1-ATTN arm. Default ON. Applies to the Q/K/V host and the o_proj host
-    /// in `AttentionOQMVV1.swift`; both read the same env so a submission runs
-    /// one policy.
-    /// `DARKBLOOM_GEMMA4_MMA8_FP16_DEQUANT=0` restores the promoted
-    /// integer-convert A-side fill byte for byte in the same executables: in
-    /// the off state the header text and every registration name are the
-    /// incumbent's, so the off arm is the incumbent kernel, not a twin of it.
+    /// H1-ATTN arm. Default OFF after its isolated ranked receipt regressed
+    /// decode. Applies to the Q/K/V host and the o_proj host in
+    /// `AttentionOQMVV1.swift`; both read the same env so a submission runs one
+    /// policy. `DARKBLOOM_GEMMA4_MMA8_FP16_DEQUANT=1` restores the H1 body.
+    /// In the default-off state the header text and every registration name
+    /// are the pre-H1 integer-convert path byte for byte.
     public static let fp16DequantEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_MMA8_FP16_DEQUANT"]
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 

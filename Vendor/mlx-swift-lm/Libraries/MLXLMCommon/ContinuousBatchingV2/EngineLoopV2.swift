@@ -589,6 +589,15 @@ public final class EngineLoopV2: @unchecked Sendable {
     // driver in EngineLoopV2+MTP.swift is part of the loop).
     var detokenizers: [CBv2RequestID: CBv2IncrementalDetokenizer] = [:]
     var kvStates: [CBv2RequestID: [CBv2SequenceKV?]] = [:]
+    /// Host vectors shared by consecutive chained-decode steps. A chain is
+    /// admitted only while membership is unchanged; the general-path boundary
+    /// below clears this cache before any join, finish, preemption, or ID reuse.
+    private struct ChainedDecodeHostVectors {
+        let ids: [CBv2RequestID]
+        let rowStates: [[CBv2SequenceKV?]]
+        let params: [CBv2SamplingParams]
+    }
+    private var chainedDecodeHostVectors: ChainedDecodeHostVectors?
     /// Tokens skipped via prefix-cache adoption, reported in usage.
     private var prefixHitTokens: [CBv2RequestID: Int] = [:]
     /// Lookup/adoption outcome carried to terminal usage.
@@ -1198,7 +1207,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                         "v2.boundary", seconds: CFAbsoluteTimeGetCurrent() - stepStart)
                 }
                 let measurement = mtpMeasurement(for: plan)
-                let next = launchChainedDecode(plan, feeding: previous.sampledTokens!)
+                let next = launchChainedDecode(ids: ids, feeding: previous.sampledTokens!)
                 attachMTPMeasurement(measurement, to: next, chained: true)
                 if var previousMeasurement = previous.mtpMeasurement {
                     // The previous step's finalize-to-launch interval now
@@ -1254,6 +1263,7 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         // Chain broken (or nothing chained): finalize before re-planning so
         // the plan sees confirmed tokens and post-stop membership.
+        chainedDecodeHostVectors = nil
         if let previous = inFlight {
             inFlight = nil
             finalize(previous, now: stepNow)
@@ -1582,15 +1592,24 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     /// Pure-decode step fed by the previous step's still-lazy tokens.
     private func launchChainedDecode(
-        _ plan: CBv2StepPlan, feeding lazyTokens: MLXArray
+        ids: [CBv2RequestID], feeding lazyTokens: MLXArray
     ) -> CBv2InFlightStep {
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
         let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        let ids = plan.assignments.map(\.id)
-        let rowStates = ids.map { kvStates[$0]! }  // presence pre-checked
-        var params: [CBv2SamplingParams] = []
-        params.reserveCapacity(ids.count)
-        for id in ids { params.append(scheduler.record(for: id)!.request.sampling) }
+        let hostVectors: ChainedDecodeHostVectors
+        if let cached = chainedDecodeHostVectors, cached.ids == ids {
+            hostVectors = cached
+        } else {
+            let rowStates = ids.map { kvStates[$0]! }  // presence pre-checked
+            var params: [CBv2SamplingParams] = []
+            params.reserveCapacity(ids.count)
+            for id in ids { params.append(scheduler.record(for: id)!.request.sampling) }
+            hostVectors = ChainedDecodeHostVectors(
+                ids: ids, rowStates: rowStates, params: params)
+            chainedDecodeHostVectors = hostVectors
+        }
+        let rowStates = hostVectors.rowStates
+        let params = hostVectors.params
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0

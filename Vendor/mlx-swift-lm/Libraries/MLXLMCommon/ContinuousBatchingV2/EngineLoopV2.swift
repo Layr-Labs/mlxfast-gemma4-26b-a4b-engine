@@ -1608,7 +1608,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         {
             let caches = eagerCaches(rowStates: rowStates)
             sampled = fusedModel.decodeArgmax(tokens: inputs, caches: caches)
-            cacheInnerState = eagerCacheInnerState(caches)
+            // The fused token roots the same complete Gemma decode graph as
+            // ordinary logits, so reuse its fail-closed compact offsets/fences.
+            // Keep this path aligned for an independent paired confirmation draw.
+            cacheInnerState = eagerDecodeEvaluationRoots(caches, logitsRoot: sampled)
             stepLogprobs = nil
             fusedSampler.noteFusedGreedySample()
             if CBv2StepProfiler.enabled {

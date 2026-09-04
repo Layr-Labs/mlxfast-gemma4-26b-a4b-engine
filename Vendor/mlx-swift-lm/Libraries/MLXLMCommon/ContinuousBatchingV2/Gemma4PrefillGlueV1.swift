@@ -89,6 +89,96 @@ public enum Gemma4PrefillGlueV1 {
     private static let threadsPerRow = 704
     private static let eps: Float = 1e-6
 
+    // MARK: - GLUEBAR: mask the dead combine lanes instead of zero-filling them
+
+    /// Every kernel in this file launches `threadsPerRow` threads, so the
+    /// cross-simd combine always has exactly 22 live entries in a 32-lane
+    /// `local_sums`. `rms_single_row` zero-fills all 32 with simdgroup 0 and
+    /// then has to spend a `threadgroup_barrier` before the per-group stores
+    /// can land, purely so lanes 22..31 read a defined 0 in the final
+    /// `simd_sum`. The lane count is a launch constant here, so the combine can
+    /// substitute the 0 itself and the zero-fill pass and its barrier both go
+    /// away: three threadgroup rendezvous per reduction become two.
+    ///
+    /// Bit-exact. `simd_sum` sees the identical 32-lane vector either way (the
+    /// same 22 partial sums, zeros above them), so the combine tree, the
+    /// division and `precise::rsqrt` are untouched.
+    ///
+    /// DEFAULT OFF, and that is a measurement rather than caution. A ranked
+    /// archive carrying only this arm on top of the same three prefill chips
+    /// measured a prompt leg 1.58% below the identical tree without it. Two
+    /// fewer rendezvous per reduction is a real saving in isolation, but the
+    /// reductions here overlap the surrounding loads, and shortening them just
+    /// moves the row's threads onto the next dependent load sooner. The arm
+    /// stays in the tree as a recorded negative and an A/B handle.
+    ///
+    /// Opt in with `DARKBLOOM_GEMMA4_PREFILL_GLUE_BARRIER=1`.
+    /// Engage mark: `prefill-glue-barrier`.
+    private static let glueBarrier: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_GLUE_BARRIER"]
+        else { return false }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// The stock zero-fill combine, kept byte for byte as the kill-switch arm.
+    private static let combineZeroFill = """
+          acc = simd_sum(acc);
+          if (simd_group_id == 0) {
+            local_sums[simd_lane_id] = 0;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (simd_lane_id == 0) {
+            local_sums[simd_group_id] = acc;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (simd_group_id == 0) {
+            acc = simd_sum(local_sums[simd_lane_id]);
+        """
+
+    private static let combineMasked = """
+          acc = simd_sum(acc);
+          if (simd_lane_id == 0) {
+            local_sums[simd_group_id] = acc;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (simd_group_id == 0) {
+            acc = simd_sum(
+                simd_lane_id < GLUE_NGROUPS ? local_sums[simd_lane_id] : 0.0f);
+        """
+
+    private static let combine2ZeroFill = """
+          acc_a = simd_sum(acc_a);
+          acc_b = simd_sum(acc_b);
+          if (simd_group_id == 0) {
+            local_sums_a[simd_lane_id] = 0;
+            local_sums_b[simd_lane_id] = 0;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (simd_lane_id == 0) {
+            local_sums_a[simd_group_id] = acc_a;
+            local_sums_b[simd_group_id] = acc_b;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (simd_group_id == 0) {
+            acc_a = simd_sum(local_sums_a[simd_lane_id]);
+            acc_b = simd_sum(local_sums_b[simd_lane_id]);
+        """
+
+    private static let combine2Masked = """
+          acc_a = simd_sum(acc_a);
+          acc_b = simd_sum(acc_b);
+          if (simd_lane_id == 0) {
+            local_sums_a[simd_group_id] = acc_a;
+            local_sums_b[simd_group_id] = acc_b;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (simd_group_id == 0) {
+            const bool live = simd_lane_id < GLUE_NGROUPS;
+            acc_a = simd_sum(live ? local_sums_a[simd_lane_id] : 0.0f);
+            acc_b = simd_sum(live ? local_sums_b[simd_lane_id] : 0.0f);
+        """
+
     /// `rms_single_row`'s reduction, reproduced so the fused kernels see the
     /// same accumulation order, the same cross-simd combine and the same
     /// `precise::rsqrt` the stock kernel uses.
@@ -97,6 +187,9 @@ public enum Gemma4PrefillGlueV1 {
         constant constexpr const int GLUE_NREADS = 4;
         // Pinned; `planeRows` refuses any other eps.
         constant constexpr const float GLUE_EPS = 1e-6f;
+        // 704 threads per row, so the cross-simd combine has exactly this many
+        // live entries.
+        constant constexpr const uint GLUE_NGROUPS = 22;
 
         inline float glue_inv_rms(
             thread const float* xv,
@@ -110,17 +203,7 @@ public enum Gemma4PrefillGlueV1 {
           for (int i = 0; i < GLUE_NREADS; i++) {
             acc += xv[i] * xv[i];
           }
-          acc = simd_sum(acc);
-          if (simd_group_id == 0) {
-            local_sums[simd_lane_id] = 0;
-          }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          if (simd_lane_id == 0) {
-            local_sums[simd_group_id] = acc;
-          }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          if (simd_group_id == 0) {
-            acc = simd_sum(local_sums[simd_lane_id]);
+        \(glueBarrier ? combineMasked : combineZeroFill)
             if (simd_lane_id == 0) {
               local_inv[0] = metal::precise::rsqrt(acc / GLUE_AXIS + eps);
             }
@@ -149,21 +232,7 @@ public enum Gemma4PrefillGlueV1 {
             acc_a += av[i] * av[i];
             acc_b += bv[i] * bv[i];
           }
-          acc_a = simd_sum(acc_a);
-          acc_b = simd_sum(acc_b);
-          if (simd_group_id == 0) {
-            local_sums_a[simd_lane_id] = 0;
-            local_sums_b[simd_lane_id] = 0;
-          }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          if (simd_lane_id == 0) {
-            local_sums_a[simd_group_id] = acc_a;
-            local_sums_b[simd_group_id] = acc_b;
-          }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          if (simd_group_id == 0) {
-            acc_a = simd_sum(local_sums_a[simd_lane_id]);
-            acc_b = simd_sum(local_sums_b[simd_lane_id]);
+        \(glueBarrier ? combine2Masked : combine2ZeroFill)
             if (simd_lane_id == 0) {
               local_inv2[0] = metal::precise::rsqrt(acc_a / GLUE_AXIS + eps);
               local_inv2[1] = metal::precise::rsqrt(acc_b / GLUE_AXIS + eps);
@@ -174,6 +243,402 @@ public enum Gemma4PrefillGlueV1 {
           inv_b = local_inv2[1];
         }
         """
+
+    // MARK: - GLUEVEC: one vector transaction per lane per plane
+
+    /// Every kernel below owns `GLUE_NREADS` consecutive features per lane, so
+    /// a lane's window on any full-width plane is exactly one `vec<T, 4>`. The
+    /// `_v2` bodies address those four elements one at a time, which issues
+    /// four transactions where one would do and reopens each cache line four
+    /// times, because adjacent lanes are `GLUE_NREADS` elements apart. The
+    /// `_v3` bodies below load and store the window as a single vector.
+    ///
+    /// `base` is always `row * GLUE_AXIS + lid * GLUE_NREADS`; `GLUE_AXIS` is
+    /// 2816 and `lid * 4` is a multiple of 4, so the offset is 4-element
+    /// aligned unconditionally, and every kernel declares
+    /// `ensureRowContiguous: true`, so the base pointer is a real contiguous
+    /// buffer. No arithmetic, rounding point or reduction order changes.
+    ///
+    /// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_GLUE_VEC4` set to
+    /// `0`/`false`/`no`/`off` restores the `_v2` kernels above.
+    /// Engage mark: `prefill-glue-vec4`.
+    private static let glueVec4: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_GLUE_VEC4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let normResidualVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_glue_norm_residual_2816_vec4_v3",
+        inputNames: ["x", "w", "res"],
+        outputNames: ["out"],
+        source: """
+            threadgroup float local_sums[32];
+            threadgroup float local_inv[1];
+
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+            const vec<T, 4> xq = *((const device vec<T, 4>*)(x + base));
+            float xv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                xv[i] = static_cast<float>(xq[i]);
+            }
+
+            const float inv = glue_inv_rms(
+                xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+            const vec<T, 4> rq = *((const device vec<T, 4>*)(res + base));
+            vec<T, 4> oq;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T normed = static_cast<T>(w[j] * static_cast<T>(xv[i] * inv));
+                oq[i] = rq[i] + normed;
+            }
+            *((device vec<T, 4>*)(out + base)) = oq;
+            """,
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
+    private static let attentionBranchPrefixVecKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_prefill_glue_attention_branch_prefix_2816_vec4_v3",
+            inputNames: ["x", "w", "res", "wd", "wr"],
+            outputNames: ["out", "dense", "router"],
+            source: """
+                threadgroup float local_sums[32];
+                threadgroup float local_inv[1];
+
+                const uint row = threadgroup_position_in_grid.y;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+                const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+                const vec<T, 4> xq = *((const device vec<T, 4>*)(x + base));
+                float xv[GLUE_NREADS];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    xv[i] = static_cast<float>(xq[i]);
+                }
+
+                const float inv = glue_inv_rms(
+                    xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+                const vec<T, 4> rq = *((const device vec<T, 4>*)(res + base));
+                vec<T, 4> outq;
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    const uint j = lid * GLUE_NREADS + i;
+                    const T normed = static_cast<T>(w[j] * static_cast<T>(xv[i] * inv));
+                    outq[i] = rq[i] + normed;
+                }
+                *((device vec<T, 4>*)(out + base)) = outq;
+
+                float ov[GLUE_NREADS];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    ov[i] = static_cast<float>(outq[i]);
+                }
+
+                const float inv2 = glue_inv_rms(
+                    ov, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+                vec<T, 4> dq;
+                vec<T, 4> rrq;
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    const uint j = lid * GLUE_NREADS + i;
+                    const T scaled = static_cast<T>(ov[i] * inv2);
+                    dq[i] = wd[j] * scaled;
+                    rrq[i] = wr[j] * scaled;
+                }
+                *((device vec<T, 4>*)(dense + base)) = dq;
+                *((device vec<T, 4>*)(router + base)) = rrq;
+                """,
+            header: kernelHeader,
+            ensureRowContiguous: true
+        )
+
+    private static let dualPreNormVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_glue_dual_prenorm_2816_vec4_v3",
+        inputNames: ["x", "w1", "w2"],
+        outputNames: ["out1", "out2"],
+        source: """
+            threadgroup float local_sums[32];
+            threadgroup float local_inv[1];
+
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+            const vec<T, 4> xq = *((const device vec<T, 4>*)(x + base));
+            float xv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                xv[i] = static_cast<float>(xq[i]);
+            }
+
+            const float inv = glue_inv_rms(
+                xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+            vec<T, 4> o1;
+            vec<T, 4> o2;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T scaled = static_cast<T>(xv[i] * inv);
+                o1[i] = w1[j] * scaled;
+                o2[i] = w2[j] * scaled;
+            }
+            *((device vec<T, 4>*)(out1 + base)) = o1;
+            *((device vec<T, 4>*)(out2 + base)) = o2;
+            """,
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
+    private static let preNormVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_glue_prenorm_2816_vec4_v3",
+        inputNames: ["x", "w"],
+        outputNames: ["out"],
+        source: """
+            threadgroup float local_sums[32];
+            threadgroup float local_inv[1];
+
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+            const vec<T, 4> xq = *((const device vec<T, 4>*)(x + base));
+            float xv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                xv[i] = static_cast<float>(xq[i]);
+            }
+
+            const float inv = glue_inv_rms(
+                xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+            vec<T, 4> oq;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                oq[i] = w[j] * static_cast<T>(xv[i] * inv);
+            }
+            *((device vec<T, 4>*)(out + base)) = oq;
+            """,
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
+    /// The `_v2` twin stores the row to each of its `K` sorted positions one
+    /// `bf16` at a time. At the scored geometry this plane is `[rows * 8, 2816]`,
+    /// the largest single buffer any prefill glue kernel touches, and the
+    /// scatter is `4 * K` scalar stores per lane where `K` are enough.
+    ///
+    /// The `K` destination indices are read into registers before the RMS
+    /// reduction rather than one per store at the end. Their latency is then
+    /// covered by the reduction's `simd_sum` chain and its two threadgroup
+    /// barriers, and the `K` stores issue back to back instead of each waiting
+    /// on its own address load.
+    private static let preNormScatterVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_glue_prenorm_scatter_2816_idxhoist_v4",
+        inputNames: ["x", "w", "inverse"],
+        outputNames: ["out"],
+        source: """
+            threadgroup float local_sums[32];
+            threadgroup float local_inv[1];
+
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+            const vec<T, 4> xq = *((const device vec<T, 4>*)(x + base));
+            float xv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                xv[i] = static_cast<float>(xq[i]);
+            }
+
+            const size_t assignment_base = size_t(row) * K;
+            uint positions[K];
+            #pragma clang loop unroll(full)
+            for (int k = 0; k < K; k++) {
+                positions[k] = (uint)inverse[assignment_base + k];
+            }
+
+            const float inv = glue_inv_rms(
+                xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+            vec<T, 4> normedq;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T scaled = static_cast<T>(xv[i] * inv);
+                normedq[i] = w[j] * scaled;
+            }
+
+            #pragma clang loop unroll(full)
+            for (int k = 0; k < K; k++) {
+                const size_t obase =
+                    size_t(positions[k]) * GLUE_AXIS + lid * GLUE_NREADS;
+                *((device vec<T, 4>*)(out + obase)) = normedq;
+            }
+            """,
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
+    private static let tailVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_glue_tail_2816_vec4_v3",
+        inputNames: ["h1", "h2", "w1", "w2", "w3", "res2"],
+        outputNames: ["out"],
+        source: """
+            threadgroup float local_sums_a[32];
+            threadgroup float local_sums_b[32];
+            threadgroup float local_inv2[2];
+
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+            const vec<T, 4> h1q = *((const device vec<T, 4>*)(h1 + base));
+            const vec<T, 4> h2q = *((const device vec<T, 4>*)(h2 + base));
+            float av[GLUE_NREADS];
+            float bv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                av[i] = static_cast<float>(h1q[i]);
+                bv[i] = static_cast<float>(h2q[i]);
+            }
+
+            float inv_a = 0;
+            float inv_b = 0;
+            glue_inv_rms2(
+                av, bv, local_sums_a, local_sums_b, local_inv2,
+                simd_lane_id, simd_group_id, GLUE_EPS, inv_a, inv_b);
+
+            float tv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T n1 = static_cast<T>(w1[j] * static_cast<T>(av[i] * inv_a));
+                const T n2 = static_cast<T>(w2[j] * static_cast<T>(bv[i] * inv_b));
+                tv[i] = static_cast<float>(static_cast<T>(n1 + n2));
+            }
+
+            const float inv_t = glue_inv_rms(
+                tv, local_sums_a, local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
+
+            const vec<T, 4> r2q = *((const device vec<T, 4>*)(res2 + base));
+            vec<T, 4> oq;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T normed = static_cast<T>(w3[j] * static_cast<T>(tv[i] * inv_t));
+                oq[i] = r2q[i] + normed;
+            }
+            *((device vec<T, 4>*)(out + base)) = oq;
+            """,
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
+    private static let tailChainVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_glue_tail_chain_2816_vec4_v3",
+        inputNames: ["h1", "h2", "w1", "w2", "w3", "res2", "s", "wn"],
+        outputNames: ["out", "normed"],
+        source: """
+            threadgroup float local_sums_a[32];
+            threadgroup float local_sums_b[32];
+            threadgroup float local_inv2[2];
+
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+            const vec<T, 4> h1q = *((const device vec<T, 4>*)(h1 + base));
+            const vec<T, 4> h2q = *((const device vec<T, 4>*)(h2 + base));
+            float av[GLUE_NREADS];
+            float bv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                av[i] = static_cast<float>(h1q[i]);
+                bv[i] = static_cast<float>(h2q[i]);
+            }
+
+            float inv_a = 0;
+            float inv_b = 0;
+            glue_inv_rms2(
+                av, bv, local_sums_a, local_sums_b, local_inv2,
+                simd_lane_id, simd_group_id, GLUE_EPS, inv_a, inv_b);
+
+            float tv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T n1 = static_cast<T>(w1[j] * static_cast<T>(av[i] * inv_a));
+                const T n2 = static_cast<T>(w2[j] * static_cast<T>(bv[i] * inv_b));
+                tv[i] = static_cast<float>(static_cast<T>(n1 + n2));
+            }
+
+            const float inv_t = glue_inv_rms(
+                tv, local_sums_a, local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
+
+            const T scalar = s[0];
+            const vec<T, 4> r2q = *((const device vec<T, 4>*)(res2 + base));
+            float ov[GLUE_NREADS];
+            vec<T, 4> oq;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T normed3 = static_cast<T>(w3[j] * static_cast<T>(tv[i] * inv_t));
+                const T summed = static_cast<T>(r2q[i] + normed3);
+                const T scaled = static_cast<T>(summed * scalar);
+                oq[i] = scaled;
+                ov[i] = static_cast<float>(scaled);
+            }
+            *((device vec<T, 4>*)(out + base)) = oq;
+
+            const float inv_n = glue_inv_rms(
+                ov, local_sums_a, local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
+
+            vec<T, 4> nq;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                nq[i] = wn[j] * static_cast<T>(ov[i] * inv_n);
+            }
+            *((device vec<T, 4>*)(normed + base)) = nq;
+            """,
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
 
     // MARK: - norm + residual (2 dispatches -> 1)
 
@@ -223,7 +688,7 @@ public enum Gemma4PrefillGlueV1 {
             residual.dtype == x.dtype
         else { return nil }
 
-        return normResidualKernel(
+        return (glueVec4 ? normResidualVecKernel : normResidualKernel)(
             [x, weight, residual],
             template: [("T", x.dtype)],
             grid: (threadsPerRow, rows, 1),
@@ -357,7 +822,7 @@ public enum Gemma4PrefillGlueV1 {
         else { return nil }
 
         CBv2EngageMark.once("prefill-attention-branch-prefix")
-        let outs = attentionBranchPrefixKernel(
+        let outs = (glueVec4 ? attentionBranchPrefixVecKernel : attentionBranchPrefixKernel)(
             [x, weight, residual, wDense, wRouter],
             template: [("T", x.dtype)],
             grid: (threadsPerRow, rows, 1),
@@ -418,7 +883,7 @@ public enum Gemma4PrefillGlueV1 {
             w2.dtype == w1.dtype
         else { return nil }
 
-        let outs = dualPreNormKernel(
+        let outs = (glueVec4 ? dualPreNormVecKernel : dualPreNormKernel)(
             [x, w1, w2],
             template: [("T", x.dtype)],
             grid: (threadsPerRow, rows, 1),
@@ -560,7 +1025,7 @@ public enum Gemma4PrefillGlueV1 {
             let rows = planeRows(x, weight: weight, eps: epsIn)
         else { return nil }
 
-        return preNormKernel(
+        return (glueVec4 ? preNormVecKernel : preNormKernel)(
             [x, weight],
             template: [("T", x.dtype)],
             grid: (threadsPerRow, rows, 1),
@@ -588,7 +1053,13 @@ public enum Gemma4PrefillGlueV1 {
         else { return nil }
 
         CBv2EngageMark.once("prefill-prenorm-gather")
-        return preNormScatterKernel(
+        if glueVec4 {
+            CBv2EngageMark.once("prefill-glue-vec4")
+        }
+        if glueBarrier {
+            CBv2EngageMark.once("prefill-glue-barrier")
+        }
+        return (glueVec4 ? preNormScatterVecKernel : preNormScatterKernel)(
             [x, weight, inverseOrder],
             template: [("T", x.dtype), ("K", topK)],
             grid: (threadsPerRow, rows, 1),
@@ -668,7 +1139,7 @@ public enum Gemma4PrefillGlueV1 {
             w3.shape == w1.shape, w3.dtype == w1.dtype
         else { return nil }
 
-        return tailKernel(
+        return (glueVec4 ? tailVecKernel : tailKernel)(
             [h1, h2, w1, w2, w3, residual2],
             template: [("T", h1.dtype)],
             grid: (threadsPerRow, rows, 1),
@@ -779,7 +1250,7 @@ public enum Gemma4PrefillGlueV1 {
             nextInputNormWeight.dtype == w1.dtype
         else { return nil }
 
-        let outs = tailChainKernel(
+        let outs = (glueVec4 ? tailChainVecKernel : tailChainKernel)(
             [h1, h2, w1, w2, w3, residual2, layerScalar, nextInputNormWeight],
             template: [("T", h1.dtype)],
             grid: (threadsPerRow, rows, 1),
@@ -796,7 +1267,7 @@ public enum Gemma4PrefillGlueV1 {
     /// same `[tokens, hidden]` expert result. Produce each reduced expert value
     /// in the tail thread that consumes it, removing the intermediate tensor.
     private static let expertTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_expert_unsort_tail_chain_2816_unroll_v2",
+        name: "gemma4_prefill_expert_unsort_tail_chain_2816_vec4_v6",
         inputNames: [
             "sorted", "inverse_order", "route_weights", "h1",
             "w1", "w2", "w3", "res2", "s", "wn",
@@ -814,19 +1285,34 @@ public enum Gemma4PrefillGlueV1 {
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
             const uint assignment_base = row * 8;
 
+            uint inv_orders[8];
+            float r_weights[8];
+            #pragma clang loop unroll(full)
+            for (uint slot = 0; slot < 8; ++slot) {
+                const uint assignment = assignment_base + slot;
+                inv_orders[slot] = (uint)inverse_order[assignment];
+                r_weights[slot] = (float)route_weights[assignment];
+            }
+
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
+            const vec<T, 4> h1_v0 = *((const device vec<T, 4>*)(h1 + base));
+            const vec<T, 4> h1_v1 = *((const device vec<T, 4>*)(h1 + base + 4));
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 4; i++) {
+                av[i] = static_cast<float>(h1_v0[i]);
+                av[i + 4] = static_cast<float>(h1_v1[i]);
+            }
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint feature = lid * GLUE_NREADS + i;
-                av[i] = static_cast<float>(h1[base + i]);
                 T accumulator = (T)0;
+                #pragma clang loop unroll(full)
                 for (uint slot = 0; slot < 8; ++slot) {
-                    const uint assignment = assignment_base + slot;
-                    const uint sorted_row = (uint)inverse_order[assignment];
+                    const uint sorted_row = inv_orders[slot];
                     const T weighted = (T)(
                         (float)sorted[size_t(sorted_row) * GLUE_AXIS + feature]
-                        * (float)route_weights[assignment]);
+                        * r_weights[slot]);
                     accumulator = accumulator + weighted;
                 }
                 bv[i] = static_cast<float>(accumulator);
@@ -854,28 +1340,167 @@ public enum Gemma4PrefillGlueV1 {
                 simd_lane_id, simd_group_id, GLUE_EPS);
 
             const T scalar = s[0];
+            const vec<T, 4> r2_v0 = *((const device vec<T, 4>*)(res2 + base));
+            const vec<T, 4> r2_v1 = *((const device vec<T, 4>*)(res2 + base + 4));
             float ov[GLUE_NREADS];
+            vec<T, 4> out_v0;
+            vec<T, 4> out_v1;
             #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
-                const T normed3 = static_cast<T>(
-                    w3[j] * static_cast<T>(tv[i] * inv_t));
-                const T summed = static_cast<T>(res2[base + i] + normed3);
-                const T scaled = static_cast<T>(summed * scalar);
-                out[base + i] = scaled;
-                ov[i] = static_cast<float>(scaled);
+            for (int i = 0; i < 4; i++) {
+                const uint j0 = lid * GLUE_NREADS + i;
+                const uint j1 = lid * GLUE_NREADS + i + 4;
+                const T normed3_0 = static_cast<T>(w3[j0] * static_cast<T>(tv[i] * inv_t));
+                const T normed3_1 = static_cast<T>(w3[j1] * static_cast<T>(tv[i + 4] * inv_t));
+                const T summed_0 = static_cast<T>(r2_v0[i] + normed3_0);
+                const T summed_1 = static_cast<T>(r2_v1[i] + normed3_1);
+                const T scaled_0 = static_cast<T>(summed_0 * scalar);
+                const T scaled_1 = static_cast<T>(summed_1 * scalar);
+                out_v0[i] = scaled_0;
+                out_v1[i] = scaled_1;
+                ov[i] = static_cast<float>(scaled_0);
+                ov[i + 4] = static_cast<float>(scaled_1);
             }
+            *((device vec<T, 4>*)(out + base)) = out_v0;
+            *((device vec<T, 4>*)(out + base + 4)) = out_v1;
 
             const float inv_n = glue_inv_rms(
                 ov, local_sums_a, local_inv2,
                 simd_lane_id, simd_group_id, GLUE_EPS);
 
+            vec<T, 4> normed_v0;
+            vec<T, 4> normed_v1;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 4; i++) {
+                const uint j0 = lid * GLUE_NREADS + i;
+                const uint j1 = lid * GLUE_NREADS + i + 4;
+                normed_v0[i] = wn[j0] * static_cast<T>(ov[i] * inv_n);
+                normed_v1[i] = wn[j1] * static_cast<T>(ov[i + 4] * inv_n);
+            }
+            *((device vec<T, 4>*)(normed + base)) = normed_v0;
+            *((device vec<T, 4>*)(normed + base + 4)) = normed_v1;
+        """,
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
+    /// TAILLANE: `..._EXPERT_TAIL_LANE_EXACT=0` restores the v6 kernel above.
+    private static let tailLaneExact: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_EXPERT_TAIL_LANE_EXACT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// One thread owns `GLUE_NREADS` features, so a thread's window is the
+    /// single `vec<T, 4>` at `base`. v6 also loaded and stored the vector at
+    /// `base + 4`, which is the next thread's window: every `h1`, `res2`, `out`
+    /// and `normed` element was touched twice, and the second half indexed
+    /// `av`, `tv` and `ov` one vector past their `GLUE_NREADS` extent.
+    private static let expertTailChainLaneKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_expert_unsort_tail_chain_2816_slotvec_v7",
+        inputNames: [
+            "sorted", "inverse_order", "route_weights", "h1",
+            "w1", "w2", "w3", "res2", "s", "wn",
+        ],
+        outputNames: ["out", "normed"],
+        source: """
+            threadgroup float local_sums_a[32];
+            threadgroup float local_sums_b[32];
+            threadgroup float local_inv2[2];
+
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+            const uint assignment_base = row * 8;
+
+            uint inv_orders[8];
+            float r_weights[8];
+            #pragma clang loop unroll(full)
+            for (uint slot = 0; slot < 8; ++slot) {
+                const uint assignment = assignment_base + slot;
+                inv_orders[slot] = (uint)inverse_order[assignment];
+                r_weights[slot] = (float)route_weights[assignment];
+            }
+
+            float av[GLUE_NREADS];
+            float bv[GLUE_NREADS];
+            const vec<T, 4> h1_v0 = *((const device vec<T, 4>*)(h1 + base));
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                av[i] = static_cast<float>(h1_v0[i]);
+            }
+
+            T accumulator[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                accumulator[i] = (T)0;
+            }
+            #pragma clang loop unroll(full)
+            for (uint slot = 0; slot < 8; ++slot) {
+                const size_t sorted_base =
+                    size_t(inv_orders[slot]) * GLUE_AXIS + lid * GLUE_NREADS;
+                const vec<T, 4> sv = *((const device vec<T, 4>*)(sorted + sorted_base));
+                const float r_weight = r_weights[slot];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    const T weighted = (T)((float)sv[i] * r_weight);
+                    accumulator[i] = accumulator[i] + weighted;
+                }
+            }
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                bv[i] = static_cast<float>(accumulator[i]);
+            }
+
+            float inv_a = 0;
+            float inv_b = 0;
+            glue_inv_rms2(
+                av, bv, local_sums_a, local_sums_b, local_inv2,
+                simd_lane_id, simd_group_id, GLUE_EPS, inv_a, inv_b);
+
+            float tv[GLUE_NREADS];
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
-                normed[base + i] =
-                    wn[j] * static_cast<T>(ov[i] * inv_n);
+                const T n1 = static_cast<T>(
+                    w1[j] * static_cast<T>(av[i] * inv_a));
+                const T n2 = static_cast<T>(
+                    w2[j] * static_cast<T>(bv[i] * inv_b));
+                tv[i] = static_cast<float>(static_cast<T>(n1 + n2));
             }
+
+            const float inv_t = glue_inv_rms(
+                tv, local_sums_a, local_inv2,
+                simd_lane_id, simd_group_id, GLUE_EPS);
+
+            const T scalar = s[0];
+            const vec<T, 4> r2_v0 = *((const device vec<T, 4>*)(res2 + base));
+            float ov[GLUE_NREADS];
+            vec<T, 4> out_v0;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j0 = lid * GLUE_NREADS + i;
+                const T normed3_0 = static_cast<T>(w3[j0] * static_cast<T>(tv[i] * inv_t));
+                const T summed_0 = static_cast<T>(r2_v0[i] + normed3_0);
+                const T scaled_0 = static_cast<T>(summed_0 * scalar);
+                out_v0[i] = scaled_0;
+                ov[i] = static_cast<float>(scaled_0);
+            }
+            *((device vec<T, 4>*)(out + base)) = out_v0;
+
+            const float inv_n = glue_inv_rms(
+                ov, local_sums_a, local_inv2,
+                simd_lane_id, simd_group_id, GLUE_EPS);
+
+            vec<T, 4> normed_v0;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j0 = lid * GLUE_NREADS + i;
+                normed_v0[i] = wn[j0] * static_cast<T>(ov[i] * inv_n);
+            }
+            *((device vec<T, 4>*)(normed + base)) = normed_v0;
         """,
         header: kernelHeader,
         ensureRowContiguous: true
@@ -916,7 +1541,10 @@ public enum Gemma4PrefillGlueV1 {
         else { return nil }
 
         CBv2EngageMark.once("prefill-expert-tail-fuse")
-        let outputs = expertTailChainKernel(
+        if tailLaneExact {
+            CBv2EngageMark.once("prefill-expert-tail-lane")
+        }
+        let outputs = (tailLaneExact ? expertTailChainLaneKernel : expertTailChainKernel)(
             [
                 expert.sortedOutputs, expert.inverseOrder, expert.weights, h1,
                 w1, w2, w3, residual2, layerScalar, nextInputNormWeight,

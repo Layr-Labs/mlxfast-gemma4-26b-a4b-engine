@@ -5189,7 +5189,8 @@ private class Gemma4MLP: Module {
     /// Swift admission mirrors the kernel-side uniform predicate exactly;
     /// a nil keeps the incumbent split road untouched.
     fileprivate func zipPrefillGateUpGeGLU(_ x: MLXArray) -> MLXArray? {
-        guard gemma4DenseGeGLUEpilogueEnabled,
+        guard x.ndim >= 2, x.dim(-2) >= 512, x.dim(-1) == 2816,
+            gemma4DenseGeGLUEpilogueEnabled,
             Gemma4PrefillDeqGEMMV1.enabled,
             let gate = gateProj as? QuantizedLinear,
             let up = upProj as? QuantizedLinear,
@@ -5253,7 +5254,7 @@ private class Gemma4MLP: Module {
     ) -> MLXArray {
         // DENSE-GEGLU-EPILOGUE: the exact prefill geometry closes GeGLU inside
         // the single paired GEMM; every other rectangle falls through.
-        if let activated = zipPrefillGateUpGeGLU(x) {
+        if x.ndim >= 2 && x.dim(-2) >= 512, let activated = zipPrefillGateUpGeGLU(x) {
             return denseProjection(downProj, activated)
         }
         // DMLP-002: one exact activation-sum prepass feeds both fallback

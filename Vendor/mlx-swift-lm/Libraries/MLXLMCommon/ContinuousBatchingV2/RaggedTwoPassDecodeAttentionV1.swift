@@ -1730,7 +1730,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp3_ey51_yrp1_ey130",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp3_ey51_yrp1_ey131",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -2201,26 +2201,6 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return value >= 2
     }()
 
-    /// SLIDE-PF4. The promoted walk holds `PF = 2` token steps of K/V words
-    /// outstanding per lane. `N % (PF * BLOCKS) == 0` admits 4 as well as 2
-    /// (1024 = 32 * 32), and nothing else in the peeled walk depends on the
-    /// value: the seed loop, the phase registers, the hot-loop bound
-    /// `N - 2 * PF * BLOCKS` and the two boundary trips are all written in
-    /// terms of `PF`. Four phases read the same slots in the same order and
-    /// each is consumed by the same token, so the arm is bit-identical and
-    /// only the issue point of a load moves earlier -- at the cost of eleven
-    /// more registers per thread per extra phase pair.
-    ///
-    /// `DARKBLOOM_CBV2_SLIDING_PREFETCH_DEPTH=4` selects it; anything else
-    /// keeps the promoted two.
-    private static let slidingPrefetchPhases: Int = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_SLIDING_PREFETCH_DEPTH"], let value = Int(raw),
-            value == 4
-        else { return 2 }
-        return value
-    }()
-
     /// PF2-TAIL-PEEL. Default on only inside the promoted depth-two arm.
     /// Set `DARKBLOOM_CBV2_SLIDING_PREFETCH_PEEL=0` to restore the promoted
     /// modulo-two walk and its `_spd2` registration byte for byte.
@@ -2235,443 +2215,10 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// name whose generated source changed (`backend/metal/custom_kernel.cpp`
     /// `:56-70`, `device.cpp:770-796`), so a changed body takes a changed
     /// name. Empty on the depth-one arm, while peel-off keeps `_spd2`.
-    private static let slidingPrefetchKey: String = {
-        guard slidingPrefetchDepth2 else { return "" }
-        let base = slidingPrefetchPeelEnabled ? "_spd2_lp1" : "_spd2"
-        return slidingPrefetchPhases == 2 ? base : base + "_pf4"
-    }()
-
-    /// SLIDE-SOFTREF-001 (engage mark `sliding-softmax-ref`), mode 1. The
-    /// shipped arm is mode 2, described at `slidingSoftRefReferenceInit`;
-    /// this comment states the idea both modes share. Neither is
-    /// bit-identical; both are priced against the cohort token-tolerance
-    /// budget rather than against a hash.
-    ///
-    /// The resident sliding walk carries an online softmax over the 1024-slot
-    /// window. On every one of its 128 token steps the incumbent body raises a
-    /// running MAX to the score it just formed and renormalises the whole
-    /// state onto that new offset: two `max`, two of the four `fast::exp`, the
-    /// two running-sum rescales, and -- the expensive part -- one multiply per
-    /// accumulator element per head, sixteen per step, purely to move
-    /// `acc_lo`/`acc_hi` onto the new offset. Sixteen of the roughly one
-    /// hundred and thirty arithmetic operations in the step body do nothing
-    /// but restate a number that was already correct at the old offset.
-    ///
-    /// The offset does not have to BE the maximum. It only has to keep
-    /// `exp(score - offset)` inside the float range. This arm keeps the same
-    /// `max_lo`/`max_hi` variables and the same downstream contract, but
-    /// treats them as a lazy REFERENCE: the reference is raised, and the state
-    /// renormalised, only on a step whose score exceeds it by more than
-    /// `SPAN` nats. Every other step forms `weight = exp(score - reference)`
-    /// and folds it straight in with one `fma` per element per head.
-    ///
-    /// The guard is simdgroup-uniform. `score_lo` and `score_hi` leave
-    /// `simd_sum` with the same value in all 32 lanes, so the branch is a
-    /// uniform branch, not a divergent one. At the shipped 32-nat span it is
-    /// taken on the first step of the walk (the reference starts at
-    /// `-FLT_MAX`) and then only if a later score beats the first by more than
-    /// 32 nats, which the Q/K-normalised scores of this model do not do.
-    ///
-    /// Range. Weights are bounded by `exp(SPAN)`, the running sums by 128 of
-    /// them, and the accumulators by that times the dequantised value
-    /// magnitude. At SPAN = 32 that is `7.9e13 * 128 * |v|`, far inside float
-    /// and inside the bfloat16 exponent range the threadgroup partials are
-    /// stored in (bfloat16 carries the float exponent field, so a partial
-    /// cannot overflow at any span this switch admits). Terms more than ~87
-    /// nats below the reference underflow to zero, exactly as they do under
-    /// the incumbent when they sit that far below the max.
-    ///
-    /// Merge. The resident pass-B combine already renormalises each block by
-    /// `exp(block_offset - max_over_blocks)` and divides by the recombined
-    /// sum, which is correct for ANY per-block offset, not only the block max.
-    /// `max_out` therefore keeps carrying the offset this walk used and no
-    /// consumer changes.
-    ///
-    /// What stops being bit-identical: the accumulators are no longer scaled
-    /// on every step, so the same products are summed at a different exponent
-    /// and in a different association. The values agree to float rounding; the
-    /// bits do not.
-    ///
-    /// `DARKBLOOM_GEMMA4_SLIDE_SOFTREF=0` restores the promoted body and the
-    /// promoted kernel names byte for byte.
-    ///
-    /// `DARKBLOOM_GEMMA4_SLIDE_SOFTREF_SPAN=0` isolates the instruction
-    /// saving from the reference change: at span zero the reference is raised
-    /// on exactly the steps the incumbent raised the max, and on every other
-    /// step the incumbent's `old_factor` is `exp(0)`, which is exactly 1.0, so
-    /// the multiplies this arm skips were multiplies by one.
-    ///
-    /// It is still not bit-identical, and the reason is worth recording. The
-    /// incumbent's `acc[e] * old_factor + score_factor * value_element` rounds
-    /// the product and then rounds the sum; with `old_factor` gone the
-    /// statement is `fma(weight, value_element, acc[e])`, which rounds once.
-    /// A measured span-zero build differs from the promoted token plane on
-    /// that alone.
-    /// Mode selector. `0` (also `off`/`no`/`false`) is the promoted body and
-    /// the promoted kernel names, byte for byte. `1` is the lazy-reference
-    /// body above, which raises the reference from a uniform branch. `2`, the
-    /// shipped value, replaces that branch with a reference fixed for the
-    /// whole walk (see `slidingSoftRefReferenceInit`).
-    static let slidingSoftRefMode: Int = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_SLIDE_SOFTREF"]?
-            .trimmingCharacters(in: .whitespaces).lowercased()
-        else { return 2 }
-        if ["0", "false", "no", "off"].contains(raw) { return 0 }
-        if let value = Int(raw), value == 0 || value == 1 || value == 2 {
-            return value
-        }
-        return 2
-    }()
-
-    /// SLIDE-SOFTREF-002 (the shipped arm). The reference is chosen ONCE, in
-    /// the prologue, as this row and head's score against the token being
-    /// decoded -- the query dotted with the normalized key the same kernel
-    /// just wrote for the current position, which is already in threadgroup
-    /// memory (`local_key`) and already published by the prologue's second
-    /// barrier. Every simdgroup in the threadgroup computes the same value, so
-    /// all eight block offsets agree and the pass-B merge factors are 1.
-    ///
-    /// The walk then carries no max, no rescale and no branch at all: one
-    /// exponential per head per step and one `fma` per element per head.
-    ///
-    /// Why a self score is the right reference. It is a real score of this
-    /// query against a real key, so `score - reference` is bounded by the
-    /// spread of one row's attention logits rather than by anything about the
-    /// weights, and the model's per-head Q and K RMS normalisation bounds that
-    /// spread tightly. The `min(..., 60.0f)` is a hard ceiling that makes the
-    /// exponential finite for ANY input rather than a value this cohort
-    /// reaches: at the ceiling a weight is 1.1e26, 128 of them sum to 1.4e28,
-    /// and the accumulators stay inside float and inside the bfloat16 exponent
-    /// range the threadgroup partials use. Terms more than ~87 nats under the
-    /// reference underflow to zero, which is what they do under the promoted
-    /// body too when they sit that far under the max.
-    private static let slidingSoftRefReferenceInit: String = {
-        guard slidingSoftRefMode == 2 else { return "" }
-        return """
-                {
-                    const threadgroup T* self_key =
-                        local_key + lane * values_per_lane;
-                    float self_lo = 0.0f;
-                    float self_hi = 0.0f;
-                    #pragma clang loop unroll(full)
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        const float self_element = float(self_key[element]);
-                        self_lo += q_lo[element] * self_element;
-                        self_hi += q_hi[element] * self_element;
-                    }
-                    max_lo = simd_sum(self_lo);
-                    max_hi = simd_sum(self_hi);
-                }
-        """
-    }()
-
-    /// Nats a score must beat the carried reference by before the walk
-    /// renormalises. Zero is the bit-exact control (see above); the shipped
-    /// value is 32.
-    private static let slidingSoftRefSpan: Double = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_SLIDE_SOFTREF_SPAN"],
-            let value = Double(raw.trimmingCharacters(in: .whitespaces)),
-            value >= 0, value <= 64
-        else { return 32 }
-        return value
-    }()
-
-    private static let slidingSoftRefSpanLiteral =
-        String(format: "%.1ff", slidingSoftRefSpan)
-
-    /// The nineteen promoted lines this arm replaces, trimmed. Every one of
-    /// the four walk bodies carries this block verbatim at its own indent.
-    private static let slidingSoftRefIncumbentBlock = [
-        "const float new_max_lo = max(max_lo, score_lo);",
-        "const float new_max_hi = max(max_hi, score_hi);",
-        "const float old_factor_lo = fast::exp(max_lo - new_max_lo);",
-        "const float old_factor_hi = fast::exp(max_hi - new_max_hi);",
-        "const float score_factor_lo = fast::exp(score_lo - new_max_lo);",
-        "const float score_factor_hi = fast::exp(score_hi - new_max_hi);",
-        "max_lo = new_max_lo;",
-        "max_hi = new_max_hi;",
-        "sum_lo = sum_lo * old_factor_lo + score_factor_lo;",
-        "sum_hi = sum_hi * old_factor_hi + score_factor_hi;",
-        "#pragma clang loop unroll(full)",
-        "for (int element = 0; element < values_per_lane; ++element) {",
-        "const float value_element =",
-        "fma(float((vw >> (4 * element)) & 0xfu), vs, vb);",
-        "acc_lo[element] = acc_lo[element] * old_factor_lo",
-        "+ score_factor_lo * value_element;",
-        "acc_hi[element] = acc_hi[element] * old_factor_hi",
-        "+ score_factor_hi * value_element;",
-        "}",
-    ]
-
-    private static let slidingSoftRefBlock = """
-if (score_lo > max_lo + SOFTREF_SPAN) {
-    const float rescale_lo = fast::exp(max_lo - score_lo);
-    max_lo = score_lo;
-    sum_lo *= rescale_lo;
-    #pragma clang loop unroll(full)
-    for (int element = 0; element < values_per_lane; ++element) {
-        acc_lo[element] *= rescale_lo;
-    }
-}
-if (score_hi > max_hi + SOFTREF_SPAN) {
-    const float rescale_hi = fast::exp(max_hi - score_hi);
-    max_hi = score_hi;
-    sum_hi *= rescale_hi;
-    #pragma clang loop unroll(full)
-    for (int element = 0; element < values_per_lane; ++element) {
-        acc_hi[element] *= rescale_hi;
-    }
-}
-const float weight_lo = fast::exp(score_lo - max_lo);
-const float weight_hi = fast::exp(score_hi - max_hi);
-sum_lo += weight_lo;
-sum_hi += weight_hi;
-#pragma clang loop unroll(full)
-for (int element = 0; element < values_per_lane; ++element) {
-    const float value_element =
-        fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
-    acc_lo[element] = fma(weight_lo, value_element, acc_lo[element]);
-    acc_hi[element] = fma(weight_hi, value_element, acc_hi[element]);
-}
-"""
-
-    /// SLIDE-AFFFOLD-001 (engage mark `sliding-affine-fold`). Default ON,
-    /// active only inside SLIDE-SOFTREF mode 2. NOT bit-identical.
-    ///
-    /// Both inner loops of the walk dequantise before they use the value:
-    ///
-    ///     key_element   = fma(code, ks, kb);  score += q[e] * key_element
-    ///     value_element = fma(code, vs, vb);  acc[e] += weight * value_element
-    ///
-    /// `ks`, `kb`, `vs` and `vb` are one quantisation group's affine pair, and
-    /// a lane owns eight consecutive elements of ONE group (values_per_lane is
-    /// 8, group_size is 64, and the group index a lane reads is `lane / 8`), so
-    /// both pairs are loop-invariant across the eight elements. The affine term
-    /// can therefore leave the element loop:
-    ///
-    ///     score_lane = ks * SUM(q[e] * code_e) + kb * SUM(q[e])
-    ///     acc[e]    += (weight * vs) * code_e,  plus  SUM(weight * vb)
-    ///
-    /// `SUM(q[e])` is a per-lane constant of the whole walk and is formed once
-    /// in the prologue; `SUM(weight * vb)` is one scalar per head accumulated
-    /// alongside the running sum and added to the lane's eight accumulator
-    /// elements once, where the partials are written. The bias is the same for
-    /// all eight of a lane's elements precisely because they share a group.
-    ///
-    /// This removes one fused multiply-add per element per step from each
-    /// loop -- sixteen of the step's arithmetic operations -- and pays four
-    /// back outside the loops.
-    ///
-    /// The affine scale is applied per lane BEFORE `simd_sum`, so the
-    /// cross-lane reduction still sums the same 32 per-lane terms in the same
-    /// order; only the point at which each lane's group scale enters moves.
-    /// Not bit-identical: the products are formed at a different exponent and
-    /// the bias term is summed separately.
-    ///
-    /// `DARKBLOOM_GEMMA4_SLIDE_AFFFOLD=0` restores the SLIDE-SOFTREF mode 2
-    /// bodies and their `_sr2` names byte for byte.
-    static let slidingAffineFoldEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_SLIDE_AFFFOLD"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(
-            raw.trimmingCharacters(in: .whitespaces).lowercased())
-    }()
-
-    private static var slidingAffineFoldActive: Bool {
-        slidingSoftRefMode == 2 && slidingAffineFoldEnabled
-    }
-
-    /// Prologue constants the fold needs: the per-lane query sum for each of
-    /// the two heads, and the two value-bias accumulators.
-    private static let slidingAffineFoldPrologue: String = {
-        guard slidingAffineFoldActive else { return "" }
-        return """
-                float qsum_lo = 0.0f;
-                float qsum_hi = 0.0f;
-                float vbias_lo = 0.0f;
-                float vbias_hi = 0.0f;
-                #pragma clang loop unroll(full)
-                for (int element = 0; element < values_per_lane; ++element) {
-                    qsum_lo += q_lo[element];
-                    qsum_hi += q_hi[element];
-                }
-        """
-    }()
-
-    private static var slidingAffineFoldAccLo: String {
-        slidingAffineFoldActive ? " + vbias_lo" : ""
-    }
-
-    private static var slidingAffineFoldAccHi: String {
-        slidingAffineFoldActive ? " + vbias_hi" : ""
-    }
-
-    /// The nine promoted lines of the score loop, trimmed.
-    private static let slidingAffineFoldIncumbentScore = [
-        "float score_lo = 0.0f;",
-        "float score_hi = 0.0f;",
-        "#pragma clang loop unroll(full)",
-        "for (int element = 0; element < values_per_lane; ++element) {",
-        "const float key_element =",
-        "fma(float((kw >> (4 * element)) & 0xfu), ks, kb);",
-        "score_lo += q_lo[element] * key_element;",
-        "score_hi += q_hi[element] * key_element;",
-        "}",
-    ]
-
-    private static let slidingAffineFoldScoreBlock = """
-float score_lo = 0.0f;
-float score_hi = 0.0f;
-#pragma clang loop unroll(full)
-for (int element = 0; element < values_per_lane; ++element) {
-    const float key_code = float((kw >> (4 * element)) & 0xfu);
-    score_lo += q_lo[element] * key_code;
-    score_hi += q_hi[element] * key_code;
-}
-score_lo = fma(ks, score_lo, kb * qsum_lo);
-score_hi = fma(ks, score_hi, kb * qsum_hi);
-"""
-
-    private static let slidingAffineFoldStepBlock = """
-const float weight_lo = fast::exp(min(score_lo - max_lo, 60.0f));
-const float weight_hi = fast::exp(min(score_hi - max_hi, 60.0f));
-sum_lo += weight_lo;
-sum_hi += weight_hi;
-const float value_scale_lo = weight_lo * vs;
-const float value_scale_hi = weight_hi * vs;
-vbias_lo = fma(weight_lo, vb, vbias_lo);
-vbias_hi = fma(weight_hi, vb, vbias_hi);
-#pragma clang loop unroll(full)
-for (int element = 0; element < values_per_lane; ++element) {
-    const float value_code = float((vw >> (4 * element)) & 0xfu);
-    acc_lo[element] = fma(value_scale_lo, value_code, acc_lo[element]);
-    acc_hi[element] = fma(value_scale_hi, value_code, acc_hi[element]);
-}
-"""
-
-    private static let slidingSoftRefFixedBlock = """
-const float weight_lo = fast::exp(min(score_lo - max_lo, 60.0f));
-const float weight_hi = fast::exp(min(score_hi - max_hi, 60.0f));
-sum_lo += weight_lo;
-sum_hi += weight_hi;
-#pragma clang loop unroll(full)
-for (int element = 0; element < values_per_lane; ++element) {
-    const float value_element =
-        fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
-    acc_lo[element] = fma(weight_lo, value_element, acc_lo[element]);
-    acc_hi[element] = fma(weight_hi, value_element, acc_hi[element]);
-}
-"""
-
-    /// Line-exact surgery: find each promoted block by its own text, keep the
-    /// indent it was written at, and substitute. Anything that does not match
-    /// the nineteen promoted lines is left alone and reported, so a body that
-    /// drifts fails closed onto the promoted walk instead of half-rewritten.
-    private static func slidingSoftRefRewrite(_ walk: String) -> (String, Int) {
-        var lines = walk.components(separatedBy: "\n")
-        let block = slidingSoftRefIncumbentBlock
-        let replacement = (
-            slidingAffineFoldActive
-                ? slidingAffineFoldStepBlock
-                : (slidingSoftRefMode == 2
-                    ? slidingSoftRefFixedBlock
-                    : slidingSoftRefBlock))
-            .replacingOccurrences(
-                of: "SOFTREF_SPAN", with: slidingSoftRefSpanLiteral)
-            .components(separatedBy: "\n")
-            .filter { !$0.isEmpty }
-        var index = 0
-        var applied = 0
-        while index < lines.count {
-            guard lines[index].trimmingCharacters(in: .whitespaces) == block[0],
-                index + block.count <= lines.count
-            else {
-                index += 1
-                continue
-            }
-            let window = (0..<block.count).map {
-                lines[index + $0].trimmingCharacters(in: .whitespaces)
-            }
-            guard window == block else {
-                index += 1
-                continue
-            }
-            let indent = String(lines[index].prefix(while: { $0 == " " }))
-            let body = replacement.map { indent + $0 }
-            lines.replaceSubrange(index..<(index + block.count), with: body)
-            index += body.count
-            applied += 1
-        }
-        guard slidingAffineFoldActive else {
-            return (lines.joined(separator: "\n"), applied)
-        }
-        let score = slidingAffineFoldIncumbentScore
-        let scoreBody = slidingAffineFoldScoreBlock
-            .components(separatedBy: "\n")
-            .filter { !$0.isEmpty }
-        var scoreIndex = 0
-        var scoreApplied = 0
-        while scoreIndex < lines.count {
-            guard lines[scoreIndex].trimmingCharacters(in: .whitespaces)
-                == score[0],
-                scoreIndex + score.count <= lines.count
-            else {
-                scoreIndex += 1
-                continue
-            }
-            let window = (0..<score.count).map {
-                lines[scoreIndex + $0].trimmingCharacters(in: .whitespaces)
-            }
-            guard window == score else {
-                scoreIndex += 1
-                continue
-            }
-            let indent = String(
-                lines[scoreIndex].prefix(while: { $0 == " " }))
-            let body = scoreBody.map { indent + $0 }
-            lines.replaceSubrange(
-                scoreIndex..<(scoreIndex + score.count), with: body)
-            scoreIndex += body.count
-            scoreApplied += 1
-        }
-        return (lines.joined(separator: "\n"), min(applied, scoreApplied))
-    }
-
-    /// The three resident walk bodies after SLIDE-SOFTREF. `applied` is true
-    /// only when all four promoted blocks (one in each of the depth-one and
-    /// depth-two walks, two in the peeled walk) were substituted; otherwise
-    /// every body is the promoted text and the kernel keys stay unchanged.
-    private static let slidingSoftRefWalks:
-        (depth1: String, depth2: String, peeled: String, applied: Bool) = {
-        let promoted = (
-            residentSlidingWalkDepth1,
-            residentSlidingWalkDepth2,
-            residentSlidingWalkDepth2Peeled)
-        guard slidingSoftRefMode != 0 else {
-            return (promoted.0, promoted.1, promoted.2, false)
-        }
-        let one = slidingSoftRefRewrite(promoted.0)
-        let two = slidingSoftRefRewrite(promoted.1)
-        let peeled = slidingSoftRefRewrite(promoted.2)
-        guard one.1 == 1, two.1 == 1, peeled.1 == 2 else {
-            return (promoted.0, promoted.1, promoted.2, false)
-        }
-        return (one.0, two.0, peeled.0, true)
-    }()
-
-    /// A changed body takes a changed name, and the span is part of the body.
-    private static let slidingSoftRefKey: String = {
-        guard slidingSoftRefWalks.applied else { return "" }
-        if slidingSoftRefMode == 2 {
-            return slidingAffineFoldActive ? "_sr2_af1" : "_sr2"
-        }
-        return slidingSoftRefSpan == 32
-            ? "_sr1"
-            : "_sr1s\(Int(slidingSoftRefSpan.rounded()))"
-    }()
+    private static let slidingPrefetchKey =
+        slidingPrefetchDepth2
+        ? (slidingPrefetchPeelEnabled ? "_spd2_lp1" : "_spd2")
+        : ""
 
     /// The shipped depth-one ring walk, verbatim.
     private static let residentSlidingWalkDepth1 = """
@@ -2769,7 +2316,7 @@ for (int element = 0; element < values_per_lane; ++element) {
                 // served from `kword`/`vword` and its slot is the one this kernel stores
                 // into, so no address formed here is a slot the one-stage walk did not
                 // also read, in the same order, exactly once.
-                constexpr int PF = \(slidingPrefetchPhases);
+                constexpr int PF = 2;
                 static_assert(N % (PF * BLOCKS) == 0,
                     "depth-two walk needs an even number of token steps");
                 uint pf_slot = slot;
@@ -2861,7 +2408,7 @@ for (int element = 0; element < values_per_lane; ++element) {
     /// outer trips. The final two trips retain the promoted boundary logic.
     private static let residentSlidingWalkDepth2Peeled = """
             uint slot = (start + uint(block)) % uint(N);
-                constexpr int PF = \(slidingPrefetchPhases);
+                constexpr int PF = 2;
                 constexpr int OUTER = N / (PF * BLOCKS);
                 static_assert(N % (PF * BLOCKS) == 0,
                     "peeled depth-two walk needs integral phase groups");
@@ -3016,9 +2563,9 @@ for (int element = 0; element < values_per_lane; ++element) {
 
 
     private static var residentSlidingWalk: String {
-        if !slidingPrefetchDepth2 { return slidingSoftRefWalks.depth1 }
+        if !slidingPrefetchDepth2 { return residentSlidingWalkDepth1 }
         return slidingPrefetchPeelEnabled
-            ? slidingSoftRefWalks.peeled : slidingSoftRefWalks.depth2
+            ? residentSlidingWalkDepth2Peeled : residentSlidingWalkDepth2
     }
 
     /// F4: exact decode Q/K/V normalization and sliding RoPE in the resident
@@ -3310,8 +2857,6 @@ for (int element = 0; element < values_per_lane; ++element) {
                 float max_hi = -3.402823466e+38F;
                 float sum_lo = 0.0f;
                 float sum_hi = 0.0f;
-                \(slidingSoftRefReferenceInit)
-                \(slidingAffineFoldPrologue)
                 \(residentSlidingWalk)
 
                 if (lane == 0) {
@@ -3329,8 +2874,8 @@ for (int element = 0; element < values_per_lane; ++element) {
                     T4 p4_lo, p4_hi;
                     #pragma clang loop unroll(full)
                     for (int j = 0; j < 4; ++j) {
-                        p4_lo[j] = T(acc_lo[q * 4 + j]\(slidingAffineFoldAccLo));
-                        p4_hi[j] = T(acc_hi[q * 4 + j]\(slidingAffineFoldAccHi));
+                        p4_lo[j] = T(acc_lo[q * 4 + j]);
+                        p4_hi[j] = T(acc_hi[q * 4 + j]);
                     }
                     partial_vec_lo[q] = p4_lo;
                     partial_vec_hi[q] = p4_hi;
@@ -3446,7 +2991,7 @@ for (int element = 0; element < values_per_lane; ++element) {
 
     private static let portQuantFusedWriteResidentNormRopeKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)\(slidingSoftRefKey)",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)",
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -3462,7 +3007,7 @@ for (int element = 0; element < values_per_lane; ++element) {
     /// fifth output, so the standalone prepass never runs on a sliding layer.
     private static let portQuantFusedWriteResidentNormRopeORunsumKernel:
         MLXFast.MLXFastKernel = MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)\(slidingSoftRefKey)",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)",
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -3681,12 +3226,6 @@ for (int element = 0; element < values_per_lane; ++element) {
                 CBv2EngageMark.once("kvq4-resident-norm-rope")
                 if slidingPrefetchDepth2 && slidingPrefetchPeelEnabled {
                     CBv2EngageMark.once("sliding-prefetch-pf2-tail-peel")
-                }
-                if slidingSoftRefWalks.applied {
-                    CBv2EngageMark.once("sliding-softmax-ref")
-                    if slidingAffineFoldActive {
-                        CBv2EngageMark.once("sliding-affine-fold")
-                    }
                 }
                 return (resident[0], resident[1])
             }

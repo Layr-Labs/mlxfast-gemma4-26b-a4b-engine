@@ -311,6 +311,8 @@ private func geGLUClaimsPinnedDecode(_ gate: MLXArray, _ up: MLXArray) -> Bool {
     let s = gate.shape
     if s.count == 3, s[0] == 64, s[1] == 1 { return true }
     if s.count == 2, s[0] == 64 { return true }
+    // GATEUP-FUSE-DECODE: the routed-expert decode rectangle.
+    if s.count == 3, s[0] == 64, s[1] == 44, s[2] == 16 { return true }
     return false
 }
 
@@ -1255,6 +1257,20 @@ public let switchGateUpFusePrefillEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// GATEUP-FUSE-DECODE. The decode plane reads its gathered expert activations
+/// through one gather over the fused gate|up storage instead of one over each
+/// split projection.
+///
+/// Kill switch, runtime, same executable: `DARKBLOOM_GEMMA4_GATEUP_FUSE_DECODE`
+/// set to `0`/`false`/`no`/`off` restores the two split gathers. Engage mark:
+/// `decode-gateup-fuse`.
+public let switchGateUpFuseDecodeEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_GATEUP_FUSE_DECODE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// The fused gate/up affine 4-bit right-hand side of one expert layer plus the
 /// split projection arrays used outside the large sorted prefill path. A
 /// plain final class (not a `Module`, not an `MLXArray` tuple) so the module
@@ -1616,6 +1632,36 @@ public class SwitchGLU: Module {
                 x = downProj(
                     activated, idx, lhsIndices: downLhs, sortedIndices: true)
                 return (x, inverseOrder, true)
+            } else if switchGateUpFuseDecodeEnabled,
+                doSort, useLhsIndices, let lhs = lhsIndices,
+                inputDims == 2816, hiddenDims == 704, numExperts == 128,
+                activationProduct == nil, isGeluActivation,
+                x.ndim == 3, x.dim(0) == 8, x.dim(-2) == 1,
+                x.dim(-1) == inputDims, x.dtype == .bfloat16,
+                idx.ndim == 1, idx.size == 64,
+                let fused = fusedGateUpDispatch()
+            {
+                // GATEUP-FUSE-DECODE: one gather over the fused storage.
+                CBv2EngageMark.once("decode-gateup-fuse")
+                let xGateUp = MLX.gatherQuantizedMM(
+                    x,
+                    fused.storage.weight,
+                    scales: fused.storage.scales,
+                    biases: fused.storage.biases,
+                    lhsIndices: lhs,
+                    rhsIndices: idx,
+                    transpose: true,
+                    groupSize: fused.groupSize,
+                    bits: fused.bits,
+                    mode: fused.mode,
+                    sortedIndices: true
+                )
+                // Take the gate and up halves of the fused result.
+                let pairs = xGateUp.reshaped(64, hiddenDims / 16, 2, 16)
+                xGate = pairs[.ellipsis, 0, 0...]
+                xUp = pairs[.ellipsis, 1, 0...]
+                promptActivated = geGLUProduct(xGate, xUp)
+                    .reshaped(64, 1, hiddenDims)
             } else {
                 xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
                 xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)

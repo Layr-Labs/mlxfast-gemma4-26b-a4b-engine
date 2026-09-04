@@ -4044,10 +4044,12 @@ template <typename T, int group_size, int bits>
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   int M = x_shape[x_batch_ndims];
+  // Selects the fused gate|up decode geometry.
+  constexpr int kGemma4GateUpFusedN = 1408;
   const bool gemma4_pair_geometry =
       group_size == 64 && bits == 4 && M == 1 && batch_ndims == 1 &&
       batch_shape[0] == 64 && x_batch_ndims == 1 && w_batch_ndims == 1 &&
-      ((in_vec_size == 2816 && out_vec_size == 704) ||
+      ((in_vec_size == 2816 && out_vec_size == kGemma4GateUpFusedN) ||
        (in_vec_size == 704 && out_vec_size == 2816));
   if (gemma4_pair_geometry) {
     // KERN-DOWN-TILE gate (strip-walk pattern): compile-time flip; ON

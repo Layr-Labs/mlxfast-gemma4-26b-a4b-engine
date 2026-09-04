@@ -905,6 +905,84 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         header: mma8GateUpStaticKHeader,
         ensureRowContiguous: true)
 
+    /// Gate/up output stride supplied at kernel selection. The stride of the
+    /// gate/up output plane is fixed the moment the kernel is chosen, but the
+    /// promoted body reads it from `w_shape[0]` inside the kernel.
+    ///
+    /// Mechanism. The stride reaches the body only through the store
+    /// expressions at the tail, `y[c.fn * N + n0 + c.fm]`, so handing it in as
+    /// a template int lets those addresses be formed from a compile-time
+    /// value. The body no longer names `w_shape`, so the shape parameter the
+    /// custom kernel path emits for that operand is not emitted either.
+    ///
+    /// Exactness. `outDim` is passed through unchanged as a template argument,
+    /// so no shape is assumed: whatever `liveShape` admitted is what the body
+    /// is compiled for, and the custom kernel path folds the template value
+    /// into the composed name so each name is presented with exactly one body.
+    /// The change is integer addressing only. No floating-point expression is
+    /// introduced, removed, reordered, retyped or reassociated; the group
+    /// walk, the BFILL steps and the KS = 2 close are the promoted text word
+    /// for word. Bit-identical by construction.
+    ///
+    /// `DARKBLOOM_GEMMA4_MLP_GATEUP_STATIC_N=0` restores the promoted gate/up
+    /// kernel, under its promoted name and its promoted header text, in the
+    /// same executable. Engage mark: `mlp-gateup-static-n`.
+    private static let mma8GateUpStaticNEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_GATEUP_STATIC_N"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
+    /// `mma8GateUpStaticKHeader` with the runtime stride parameter replaced by
+    /// a template int bound next to the body's own compile-time K.
+    private static let mma8GateUpStaticKNHeader: String = {
+        var result = mma8GateUpStaticKHeader
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(
+            """
+            template <typename T, int KS>
+            METAL_FUNC void gemma4_qmv_mma8_affine8_g64_gateup_k2816_impl(
+            """,
+            with: """
+            template <typename T, int KS, int NFIX>
+            METAL_FUNC void gemma4_qmv_mma8_affine8_g64_gateup_k2816_impl(
+            """)
+        replaceOnce(
+            """
+                device T* y,
+                const int N,
+            """,
+            with: "    device T* y,")
+        replaceOnce(
+            "  constexpr int K = 2816;",
+            with: """
+              constexpr int N = NFIX;
+              constexpr int K = 2816;
+            """)
+        return result
+    }()
+
+    private static let mma8GateUpStaticKNKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_k2816_staticn_u2_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            gemma4_qmv_mma8_affine8_g64_gateup_k2816_impl<T, 2, N>(
+                w, scales, biases, x, y,
+                int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            """,
+        header: mma8GateUpStaticKNHeader,
+        ensureRowContiguous: true)
+
     /// One complete SIMD group per g64 group. Keep all lane results rather
     /// than canonicalizing row sums: the consumer reads its own lane's tree.
     private static let mma8DownLaneSumKernel = MLXFast.metalKernel(
@@ -1359,6 +1437,17 @@ inline U qdot_affine8_registered_v4(
             if isGateUp {
                 if mma8GateUpStaticKEnabled {
                     CBv2EngageMark.once("mlp-gateup-k2816-u2")
+                }
+                if mma8GateUpStaticKEnabled && mma8GateUpStaticNEnabled {
+                    CBv2EngageMark.once("mlp-gateup-static-n")
+                    return mma8GateUpStaticKNKernel(
+                        [x, weight, scales, biases],
+                        template: [("T", x.dtype), ("N", outDim)],
+                        grid: (simdWidth, yTiles * simdGroups, 1),
+                        threadGroup: (simdWidth, simdGroups, 1),
+                        outputShapes: [[batch, sequence, outDim]],
+                        outputDTypes: [x.dtype]
+                    )[0]
                 }
                 selectedMMA = mma8GateUpStaticKEnabled
                     ? mma8GateUpStaticKKernel : mma8Kernel

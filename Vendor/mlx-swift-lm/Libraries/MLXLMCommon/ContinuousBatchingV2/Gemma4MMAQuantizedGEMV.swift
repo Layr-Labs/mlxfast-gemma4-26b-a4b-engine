@@ -3130,7 +3130,9 @@ public enum Gemma4MMAQuantizedGEMV {
         guard relayoutEnabled else { return nil }
         guard let logits = relayoutRewrite(sourceV27, relayoutLanePairs),
             let carry = relayoutRewrite(sourceV27Carry, relayoutCarryLanePairs),
-            let argmax = relayoutRewrite(sourceV27Argmax, relayoutLanePairs)
+            let argmax = relayoutRewrite(
+                sourceV27Argmax,
+                argmaxCarryEnabled ? relayoutCarryLanePairs : relayoutLanePairs)
         else {
             FileHandle.standardError.write(
                 Data("[head-relayout] derivation mismatch; incumbent kept\n".utf8))
@@ -3153,7 +3155,8 @@ public enum Gemma4MMAQuantizedGEMV {
                 header: "#include <metal_simdgroup_matrix>\n",
                 ensureRowContiguous: true),
             argmax: MLXFast.metalKernel(
-                name: "gemma4_mma_affine4_qmv_m8_v27_argmax_rl1",
+                name: "gemma4_mma_affine4_qmv_m8_v27_argmax_rl1"
+                    + (argmaxCarryEnabled ? "_carry_v1" : ""),
                 inputNames: ["x", "w", "scales", "biases", "xSums"],
                 outputNames: ["pv", "pi"],
                 source: argmax,
@@ -3356,6 +3359,20 @@ public enum Gemma4MMAQuantizedGEMV {
         }
     }()
 
+    /// Carry the next immutable weight group on the fused greedy path, just
+    /// as the logits path already does. The existing carry derivation leaves
+    /// the accumulation and store epilogue unchanged; the top-1 derivation
+    /// below then replaces only that epilogue. The relaid path must use the
+    /// matching carry rewrite so it retains its coalesced weight layout.
+    /// Explicit off restores the original argmax source and kernel names.
+    private static let argmaxCarryEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ARGMAX_HEAD_CARRY"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
     /// The promoted version 27 with the vocabulary store replaced by an in-register top-1
     /// selection. The GEMV above is untouched, so what the reduction compares
     /// is the SAME bf16 the store would have written --- `T(acc)`, rounded
@@ -3374,7 +3391,7 @@ public enum Gemma4MMAQuantizedGEMV {
     /// into `pv`/`pi`: `[8, N / 128]`, 128 KB at the tied head's geometry
     /// against the 4 MB the logits store cost.
     private static let sourceV27Argmax: String = {
-        var result = sourceV27
+        var result = argmaxCarryEnabled ? sourceV27Carry : sourceV27
 
         func replaceOnce(_ old: String, with new: String) {
             let count = result.components(separatedBy: old).count
@@ -3464,7 +3481,8 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27Argmax: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_argmax",
+        name: "gemma4_mma_affine4_qmv_m8_v27_argmax"
+            + (argmaxCarryEnabled ? "_carry_v1" : ""),
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["pv", "pi"],
         source: sourceV27Argmax,
@@ -3586,6 +3604,9 @@ public enum Gemma4MMAQuantizedGEMV {
 
         let headKernel: MLXFast.MLXFastKernel
         let plane: MLXArray
+        if argmaxCarryEnabled {
+            CBv2EngageMark.once("argmax-head-carry")
+        }
         if let relaid = relayoutKernels {
             CBv2EngageMark.once("head-relayout")
             headKernel = relaid.argmax

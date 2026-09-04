@@ -6314,10 +6314,10 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
 
             // Exact `rms_single_row<T, 4>` reduction for axis 2816.
             float acc = 0.0f;
-            for (int i = 0; i < 4; ++i) {
-                const float xi = x[base + i];
-                acc += xi * xi;
-            }
+            acc += x[base] * x[base];
+            acc += x[base + 1] * x[base + 1];
+            acc += x[base + 2] * x[base + 2];
+            acc += x[base + 3] * x[base + 3];
             acc = simd_sum(acc);
             if (simd_group_id == 0) {
                 local_sums[simd_lane_id] = 0.0f;
@@ -6337,12 +6337,14 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             T outv[4];
-            for (int i = 0; i < 4; ++i) {
-                // Preserve the stock RMSNorm's BF16 boundary exactly.
-                outv[i] = w[wbase + i]
-                    * static_cast<T>((float)x[base + i] * local_inv[0]);
-                out[base + i] = outv[i];
-            }
+            outv[0] = w[wbase] * static_cast<T>((float)x[base] * local_inv[0]);
+            outv[1] = w[wbase + 1] * static_cast<T>((float)x[base + 1] * local_inv[0]);
+            outv[2] = w[wbase + 2] * static_cast<T>((float)x[base + 2] * local_inv[0]);
+            outv[3] = w[wbase + 3] * static_cast<T>((float)x[base + 3] * local_inv[0]);
+            out[base] = outv[0];
+            out[base + 1] = outv[1];
+            out[base + 2] = outv[2];
+            out[base + 3] = outv[3];
 
             // This four-value expression is exactly one addend of the head's
             // stock xsum loop, evaluated at activation dtype then widened.

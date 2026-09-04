@@ -796,7 +796,7 @@ public enum Gemma4PrefillGlueV1 {
     /// same `[tokens, hidden]` expert result. Produce each reduced expert value
     /// in the tail thread that consumes it, removing the intermediate tensor.
     private static let expertTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_expert_unsort_tail_chain_2816_unroll_v2",
+        name: "gemma4_prefill_expert_unsort_tail_chain_2816_vec4_v5",
         inputNames: [
             "sorted", "inverse_order", "route_weights", "h1",
             "w1", "w2", "w3", "res2", "s", "wn",
@@ -814,22 +814,37 @@ public enum Gemma4PrefillGlueV1 {
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
             const uint assignment_base = row * 8;
 
+            uint inv_orders[8];
+            float r_weights[8];
+            #pragma clang loop unroll(full)
+            for (uint slot = 0; slot < 8; ++slot) {
+                const uint assignment = assignment_base + slot;
+                inv_orders[slot] = (uint)inverse_order[assignment];
+                r_weights[slot] = (float)route_weights[assignment];
+            }
+
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
+            const vec<T, 4> h1_v = *((const device vec<T, 4>*)(h1 + base));
             #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint feature = lid * GLUE_NREADS + i;
-                av[i] = static_cast<float>(h1[base + i]);
-                T accumulator = (T)0;
-                for (uint slot = 0; slot < 8; ++slot) {
-                    const uint assignment = assignment_base + slot;
-                    const uint sorted_row = (uint)inverse_order[assignment];
-                    const T weighted = (T)(
-                        (float)sorted[size_t(sorted_row) * GLUE_AXIS + feature]
-                        * (float)route_weights[assignment]);
-                    accumulator = accumulator + weighted;
+            for (int i = 0; i < 4; i++) {
+                av[i] = static_cast<float>(h1_v[i]);
+            }
+
+            float accum[GLUE_NREADS] = {0.0f, 0.0f, 0.0f, 0.0f};
+            #pragma clang loop unroll(full)
+            for (uint slot = 0; slot < 8; ++slot) {
+                const uint sorted_row = inv_orders[slot];
+                const vec<T, 4> s_v = *((const device vec<T, 4>*)(sorted + size_t(sorted_row) * GLUE_AXIS + lid * GLUE_NREADS));
+                const float rw = r_weights[slot];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < 4; i++) {
+                    accum[i] += static_cast<float>(s_v[i]) * rw;
                 }
-                bv[i] = static_cast<float>(accumulator);
+            }
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 4; i++) {
+                bv[i] = static_cast<float>(static_cast<T>(accum[i]));
             }
 
             float inv_a = 0;
@@ -854,28 +869,31 @@ public enum Gemma4PrefillGlueV1 {
                 simd_lane_id, simd_group_id, GLUE_EPS);
 
             const T scalar = s[0];
+            const vec<T, 4> r2_v = *((const device vec<T, 4>*)(res2 + base));
             float ov[GLUE_NREADS];
+            vec<T, 4> out_v;
             #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
+            for (int i = 0; i < 4; i++) {
                 const uint j = lid * GLUE_NREADS + i;
-                const T normed3 = static_cast<T>(
-                    w3[j] * static_cast<T>(tv[i] * inv_t));
-                const T summed = static_cast<T>(res2[base + i] + normed3);
+                const T normed3 = static_cast<T>(w3[j] * static_cast<T>(tv[i] * inv_t));
+                const T summed = static_cast<T>(r2_v[i] + normed3);
                 const T scaled = static_cast<T>(summed * scalar);
-                out[base + i] = scaled;
+                out_v[i] = scaled;
                 ov[i] = static_cast<float>(scaled);
             }
+            *((device vec<T, 4>*)(out + base)) = out_v;
 
             const float inv_n = glue_inv_rms(
                 ov, local_sums_a, local_inv2,
                 simd_lane_id, simd_group_id, GLUE_EPS);
 
+            vec<T, 4> normed_v;
             #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
+            for (int i = 0; i < 4; i++) {
                 const uint j = lid * GLUE_NREADS + i;
-                normed[base + i] =
-                    wn[j] * static_cast<T>(ov[i] * inv_n);
+                normed_v[i] = wn[j] * static_cast<T>(ov[i] * inv_n);
             }
+            *((device vec<T, 4>*)(normed + base)) = normed_v;
         """,
         header: kernelHeader,
         ensureRowContiguous: true

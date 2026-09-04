@@ -128,6 +128,16 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Gate/up has the fixed K = 2816 geometry whenever the MMA arm is live.
+    /// Exposing its 44 g64 groups (22 per SIMD group) lets Metal unroll the
+    /// same walk without changing the matrix or reduction arithmetic.
+    private static let mma8GateUpStaticKEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_GATEUP_STATIC_K"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// W4-LOAD (engage mark `mlp-w4-load`). The four packed affine-8 codes a
     /// lane owns for one output row are four CONTIGUOUS bytes at a 4-byte
     /// aligned address, so they can be fetched as ONE aligned 32-bit load
@@ -722,6 +732,54 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
+    /// Compile-time K twin for the fixed gate/up MMA geometry. The source
+    /// transform is deliberately bounded to the MMA helper, not the other
+    /// affine-8 bodies that share its header.
+    private static let mma8GateUpStaticKHeader: String = {
+        var result = mma8KernelHeader
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(
+            "gemma4_qmv_mma8_affine8_g64_impl(",
+            with: "gemma4_qmv_mma8_affine8_g64_gateup_k2816_impl(")
+        replaceOnce(
+            """
+                device T* y,
+                const int K,
+                const int N,
+            """,
+            with: """
+                device T* y,
+                const int N,
+            """)
+        replaceOnce(
+            "  const int G = K / 64;\n  const int gh = (G + 1) / 2;\n  const int g_begin = (KS == 2 && simd_gid == 1) ? gh : 0;\n  const int g_end = (KS == 2 && simd_gid == 0) ? gh : G;",
+            with: "  constexpr int K = 2816;\n  constexpr int G = K / 64;\n  constexpr int gh = (G + 1) / 2;\n  constexpr int nGroups = (KS == 2) ? gh : G;\n  const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;")
+        replaceOnce(
+            "  for (int g = g_begin; g < g_end; ++g) {",
+            with: "  #pragma unroll\n  for (int gi = 0; gi < nGroups; ++gi) {\n    const int g = g0 + gi;")
+        return result
+    }()
+
+    private static let mma8GateUpStaticKKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_k2816_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            gemma4_qmv_mma8_affine8_g64_gateup_k2816_impl<T, 2>(
+                w, scales, biases, x, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8GateUpStaticKHeader,
+        ensureRowContiguous: true)
+
     // DMLP-STATIC-K-018: the frontier's attention kernels expose their K walk
     // to the compiler. Down has G=33, so its final second-SIMD iteration must
     // skip before any load/MMA, retaining the original 17+16 split and close.
@@ -1286,8 +1344,14 @@ inline U qdot_affine8_registered_v4(
                     outputDTypes: [x.dtype]
                 )[0]
             }
-            let selectedMMA = !isGateUp && mma8DownStaticKEnabled
-                ? mma8DownStaticKKernel : mma8Kernel
+            let selectedMMA: MLXFast.MLXFastKernel
+            if isGateUp {
+                selectedMMA = mma8GateUpStaticKEnabled
+                    ? mma8GateUpStaticKKernel : mma8Kernel
+            } else {
+                selectedMMA = mma8DownStaticKEnabled
+                    ? mma8DownStaticKKernel : mma8Kernel
+            }
             return selectedMMA(
                 [x, weight, scales, biases],
                 template: [("T", x.dtype)],

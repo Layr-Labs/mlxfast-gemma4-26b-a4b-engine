@@ -2201,10 +2201,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                     generatedTokens: rec.generatedTokenCount)
                 leasesByID[id] = lease
             }
-            // Publish the reconciled usage once tokens start flowing (prompt
-            // count with zero completion was already seeded at enqueue, so a
-            // still-prefilling row needs no lock traffic here).
-            if rec.generatedTokenCount > 0 {
+            // Publish reconciled usage periodically (every 16 tokens) once tokens start flowing
+            // to eliminate lock contention and array allocations on the hot decode loop while keeping the watchdog snapshot fresh.
+            if rec.generatedTokenCount > 0 && rec.generatedTokenCount % 16 == 0 {
                 setUsageSnapshot(
                     id,
                     CBv2Usage(

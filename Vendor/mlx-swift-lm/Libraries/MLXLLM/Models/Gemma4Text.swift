@@ -5259,7 +5259,9 @@ private class Gemma4MLP: Module {
         // DMLP-002: one exact activation-sum prepass feeds both fallback
         // projections. If either projection is not the pinned affine8 cell,
         // the candidate arrays remain unevaluated and stock takes over.
-        let activationSums = producerSums ?? CBv2DenseMLPQMVV1.activationSums(for: x)
+        let activationSums = Gemma4FusedLayerGlue.denseXSumElideEnabled
+            ? nil
+            : (producerSums ?? CBv2DenseMLPQMVV1.activationSums(for: x))
         return denseProjection(
             downProj,
             gemma4GeluProduct(
@@ -6690,9 +6692,12 @@ public class Gemma4TextModelInner: Module {
         // for every Q/K RoPE call in this forward.
         let unifiedCBv2PositionOffset: Gemma4.PositionOffset? = {
             guard isCBv2 else { return nil }
+            if let first = fullCache.first, let offsets = (first as? CBv2LayerCache)?.unifiedPositionOffsets {
+                return schedulePrefill ? .batch(offsets + 0) : .batch(offsets)
+            }
             for case let entry? in fullCache {
                 if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
-                    return .batch(offsets + 0)
+                    return schedulePrefill ? .batch(offsets + 0) : .batch(offsets)
                 }
             }
             return nil
@@ -7632,5 +7637,6 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
 // Ranked resample marker 3: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.
 
-// Ranked resample marker 36: this archive is a further ranked sample of the tree carried
+// Ranked resample marker 37: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.
+// Candidate EXP-034: Crown 1f756c2 rebase + compact inflight participants + Dense MLP Gate/Up static K=2816 unroll (#pragma unroll across 22 g64 groups) + 128-bit MoE expert unsort tail chain (gemma4_prefill_expert_unsort_tail_chain_2816_vec4_v5) with vec4 sorted loads & bounds fix + precomputed softmax params array [128..1024] + switch-based rowsPerThreadgroup + eager lowest/neg-zero scalars + eager switchDownIdentity64 eval + GeGLU shaped JIT warmup + throttled watchdog usage snapshot (% 16 == 0) + elided dead activationSums in Gemma4MLP + clean baseline MTP execution + restored stock AOT metallib decode stack (38 registers, zero JIT).

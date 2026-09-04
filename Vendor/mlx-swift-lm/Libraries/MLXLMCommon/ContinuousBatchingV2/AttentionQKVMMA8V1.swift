@@ -59,8 +59,8 @@ public enum CBv2AttentionQKVMMA8V1 {
     public static let fp16DequantEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_MMA8_FP16_DEQUANT"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
     }()
 
     /// Registration-key suffix for the H1 arm, empty in the off state, so a

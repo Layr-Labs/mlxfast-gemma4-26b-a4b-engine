@@ -144,6 +144,62 @@ public enum Gemma4PromptGlueV1 {
             outputShape: shape)
     }
 
+    /// GEGLU-PG1-DECODE: the fused-plane form, admitted at the DECODE row
+    /// counts.
+    ///
+    /// `geluProductFusedPlane` above is unreachable on every plane it was
+    /// written for. Its own doc calls it "the routed-expert form", and the
+    /// `[..., 2 * hidden]` layout it describes is exactly what the decode
+    /// dense (`[8, 1, 4224]`) and routed-expert (`[64, 1, 1408]`) gate|up
+    /// joins produce today -- but `minRows` is 1024 and those planes carry 8
+    /// and 64 rows, so it has never had a caller.
+    ///
+    /// The floor is inherited from `Gemma4PrefillDeqGEMMV1`, where it is
+    /// load-bearing: that mechanism trades plane BYTES for plane WORK, and
+    /// the trade only pays above a row count (the arithmetic intensity of a
+    /// weight plane is exactly the number of activation rows multiplied
+    /// against it). THIS mechanism moves no weight plane and does no
+    /// dequantization. It reads and writes byte-for-byte the traffic the
+    /// incumbent compiled closure reads and writes; the only difference is
+    /// that it reads a contiguous plane with `vec<T, 4>` accesses at one
+    /// computed base, where the incumbent walks two strided views of pitch
+    /// `2 * hidden` one element per thread. A row floor prices nothing here.
+    ///
+    /// Bit-identity is the design of `geluProductKernel` above and is not
+    /// assumed: it reproduces the compiled closure's constants at seven
+    /// significant digits and every bf16 temporary in order, and
+    /// `DARKBLOOM_GEMMA4_PROMPT_GLUE_XCHECK=1` counts differing bf16 words
+    /// against the exact incumbent this replaces.
+    ///
+    /// `DARKBLOOM_GEMMA4_PROMPT_GLUE_DECODE=0` returns nil here and nowhere
+    /// else, which restores the incumbent closure on the decode planes while
+    /// leaving every prompt-width admission above untouched.
+    public static let decodePlaneEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PROMPT_GLUE_DECODE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Admits exactly the two pinned decode rectangles and nothing else, so
+    /// no prefill or verify geometry can reach this entry point.
+    public static func geluProductFusedPlaneDecode(
+        _ plane: MLXArray, hidden n: Int
+    ) -> MLXArray? {
+        guard enabled, decodePlaneEnabled,
+            plane.dtype == .bfloat16, plane.ndim >= 2,
+            n > 0, n % 4 == 0, plane.dim(-1) == 2 * n
+        else { return nil }
+        let rows = plane.size / (2 * n)
+        guard rows == 8 || rows == 64 else { return nil }
+        var shape = plane.shape
+        shape[shape.count - 1] = n
+        CBv2EngageMark.once("prompt-glue-decode")
+        return dispatch(
+            gate: plane, up: plane, rows: rows, n: n, pitch: 2 * n, upOffset: n,
+            outputShape: shape)
+    }
+
     private static func dispatch(
         gate: MLXArray, up: MLXArray, rows: Int, n: Int, pitch: Int, upOffset: Int,
         outputShape: [Int]

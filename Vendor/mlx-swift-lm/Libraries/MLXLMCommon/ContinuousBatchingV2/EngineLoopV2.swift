@@ -1558,7 +1558,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         {
             let caches = eagerCaches(rowStates: rowStates)
             sampled = fusedModel.decodeArgmax(tokens: inputs, caches: caches)
-            cacheInnerState = eagerCacheInnerState(caches)
+            cacheInnerState = eagerDecodeEvaluationRoots(caches, logitsRoot: sampled)
             stepLogprobs = nil
             fusedSampler.noteFusedGreedySample()
             if CBv2StepProfiler.enabled {

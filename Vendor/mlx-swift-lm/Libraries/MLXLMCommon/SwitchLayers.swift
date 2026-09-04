@@ -1081,7 +1081,7 @@ public func gatherSort(
         (indices.shape == [8, 8] || (indices.ndim == 1 && indices.size == 64)),
         indices.dtype == .uint32
     {
-        let flat = indices.flattened()
+        let flat = routeSimdRank64DirectInputEnabled ? indices : indices.flattened()
         let outputs = routeSimdRank64Kernel(
             [flat],
             grid: (64, 1, 1),

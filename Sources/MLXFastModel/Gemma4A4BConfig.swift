@@ -2,6 +2,8 @@ import CoreFoundation
 import Foundation
 import MLXFastCore
 
+// Ranked control receipt: TIP-REDRAW-20260904T062949Z-CODEX.
+
 /// Attention kind of one decoder layer, as spelled in `layer_types`.
 public enum Gemma4A4BLayerType: String, Equatable, Sendable {
     case sliding = "sliding_attention"
@@ -78,7 +80,7 @@ public struct Gemma4A4BQuantization: Equatable, Sendable {
 
     /// Resolve the width for one checkpoint path.
     public func spec(forPath path: String) -> Gemma4A4BQuantizationSpec {
-        overrides[path] ?? fallback
+        self.overrides[path] ?? self.fallback
     }
 }
 

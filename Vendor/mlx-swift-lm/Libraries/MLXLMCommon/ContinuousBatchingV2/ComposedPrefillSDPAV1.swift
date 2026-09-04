@@ -822,6 +822,21 @@ enum CBv2PrefillAttnTrafficV1 {
     /// drifts: a soft gate, never a trap inside a lazy static.
     private static let statsSource: String? = {
         let text = CBv2PrefillSoftmaxVecV1.sourcePg2
+        let parameterLoads = [
+            "const int axis_size = int(params[0]);",
+            "const int num_simdgroups = int(params[1]);",
+        ].joined(separator: "\n")
+        let specializedParameters = [
+            "const int axis_size = AXIS_SIZE;",
+            "const int num_simdgroups = NUM_SIMDGROUPS;",
+        ].joined(separator: "\n")
+        guard text.components(separatedBy: parameterLoads).count == 2 else {
+            FileHandle.standardError.write(
+                Data("[prefill-attn-traffic] pg2 parameter text drifted; twin disabled\n".utf8))
+            return nil
+        }
+        let specializedText = text.replacingOccurrences(
+            of: parameterLoads, with: specializedParameters)
         let store = [
             "if (row_valid) {",
             "    device T* row_out = probs + size_t(gid) * axis_size;",
@@ -842,18 +857,18 @@ enum CBv2PrefillAttnTrafficV1 {
             "        uint2(as_type<uint>(maxval), as_type<uint>(normalizer));",
             "}",
         ].joined(separator: "\n")
-        guard text.components(separatedBy: store).count == 2 else {
+        guard specializedText.components(separatedBy: store).count == 2 else {
             FileHandle.standardError.write(
                 Data("[prefill-attn-traffic] pg2 softmax text drifted; twin disabled\n".utf8))
             return nil
         }
-        return text.replacingOccurrences(of: store, with: statsStore)
+        return specializedText.replacingOccurrences(of: store, with: statsStore)
     }()
 
     private static let statsKernel: MLXFast.MLXFastKernel? = statsSource.map { source in
         MLXFast.metalKernel(
-            name: "cbv2_prefill_sdpa_softmax_stats_bf16_at1",
-            inputNames: ["scores", "params"],
+            name: "cbv2_prefill_sdpa_softmax_stats_bf16_at1_ctparams1",
+            inputNames: ["scores"],
             outputNames: ["stats"],
             source: source,
             ensureRowContiguous: true
@@ -888,14 +903,16 @@ enum CBv2PrefillAttnTrafficV1 {
         let rows = CBv2PrefillSoftmaxVecV1.rowsPerThreadgroup(
             axisSize: axisSize, threadgroupSize: threadgroupSize)
         guard rows >= 1, rows * threadgroupSize <= 1024 else { return nil }
-        let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
         var statsShape = scores.shape
         statsShape[statsShape.count - 1] = 4
 
         CBv2EngageMark.once("prefill-attn-traffic")
         let stats = statsKernel(
-            [scores, paramsArray],
-            template: [("T", scores.dtype), ("RPT", rows)],
+            [scores],
+            template: [
+                ("T", scores.dtype), ("RPT", rows),
+                ("AXIS_SIZE", axisSize), ("NUM_SIMDGROUPS", numSimdgroups),
+            ],
             grid: (threadgroupSize * nRows, 1, 1),
             threadGroup: (threadgroupSize * rows, 1, 1),
             outputShapes: [statsShape],

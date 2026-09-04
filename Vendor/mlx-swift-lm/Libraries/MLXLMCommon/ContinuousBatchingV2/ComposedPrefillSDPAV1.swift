@@ -703,6 +703,16 @@ enum CBv2PrefillSoftmaxVecV1 {
         return MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
     }
 
+    /// AT1-PARAMS-REUSE. The `CBv2PrefillAttnTrafficV1` stats kernel takes the
+    /// same 2-element params tensor as `apply` above. Sharing the precomputed
+    /// table removes one host allocation + H2D per attention call on the at1
+    /// path; a non-standard axis still builds a fresh tensor, exactly as
+    /// today. Read-only constant input, never a mutated output.
+    @inline(__always)
+    static func paramsForTraffic(axisSize: Int, numSimdgroups: Int) -> MLXArray {
+        getParams(axisSize: axisSize, numSimdgroups: numSimdgroups)
+    }
+
     /// Runs the vectorized softmax, or returns nil to keep the caller on
     /// the stock `MLX.softmax(scores, axis: -1, precise: true)` call.
     /// `scores` may be any contiguous rank; it is treated as a flat
@@ -908,7 +918,10 @@ enum CBv2PrefillAttnTrafficV1 {
         let rows = CBv2PrefillSoftmaxVecV1.rowsPerThreadgroup(
             axisSize: axisSize, threadgroupSize: threadgroupSize)
         guard rows >= 1, rows * threadgroupSize <= 1024 else { return nil }
-        let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        // AT1-PARAMS-REUSE: same precomputed table `apply` uses above; a
+        // non-standard axis falls back to a fresh tensor, as before.
+        let paramsArray = CBv2PrefillSoftmaxVecV1.paramsForTraffic(
+            axisSize: axisSize, numSimdgroups: numSimdgroups)
         var statsShape = scores.shape
         statsShape[statsShape.count - 1] = 4
 

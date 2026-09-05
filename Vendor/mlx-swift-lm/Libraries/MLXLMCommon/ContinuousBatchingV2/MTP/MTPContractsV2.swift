@@ -59,6 +59,20 @@ public protocol CBv2MTPForwardable: AnyObject {
     /// plain forward on the logits side.
     func cbv2ForwardWithHidden(_ tokens: MLXArray, caches: [KVCache])
         -> (logits: MLXArray, lastHidden: MLXArray)
+    /// Optional rectangular-verification refinement. When present, the model
+    /// returns the target top-1 ids directly and omits the full vocabulary
+    /// logits allocation while preserving the pre-norm hidden used by MTP.
+    func cbv2ForwardWithHiddenAndArgmax(
+        _ tokens: MLXArray, caches: [KVCache]
+    ) -> (argmax: MLXArray, lastHidden: MLXArray)?
+}
+
+extension CBv2MTPForwardable {
+    public func cbv2ForwardWithHiddenAndArgmax(
+        _ tokens: MLXArray, caches: [KVCache]
+    ) -> (argmax: MLXArray, lastHidden: MLXArray)? {
+        nil
+    }
 }
 
 /// Steppable models that can drive MTP rounds. Additive refinement of
@@ -76,10 +90,21 @@ public protocol CBv2MTPSteppableModel: CBv2SteppableModel {
     /// [B, L, hidden]. Same cache/attention semantics as `forward`.
     func forwardWithHidden(tokens: MLXArray, caches: [CBv2AttendingLayerCache])
         -> (logits: MLXArray, lastHidden: MLXArray)
+    /// Optional rectangular-verification refinement. The default implementation
+    /// returns nil, leaving arbitrary adapters on the full-logits contract.
+    func forwardWithHiddenAndArgmax(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (argmax: MLXArray, lastHidden: MLXArray)?
 }
 
 extension CBv2MTPSteppableModel {
     public var mtpTargetIdentity: ObjectIdentifier? { nil }
+
+    public func forwardWithHiddenAndArgmax(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (argmax: MLXArray, lastHidden: MLXArray)? {
+        nil
+    }
 }
 
 // MARK: - Drafter seam

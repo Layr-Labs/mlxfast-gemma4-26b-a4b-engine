@@ -87,9 +87,16 @@ extension EngineLoopV2 {
                 for cache in serializingCaches { cache.mtpSerializesRectangularAttention = false }
             }
             let tokens = concatenated(columns, axis: 1)
-            let output = mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
-            argmax = argMax(output.logits, axis: -1).asType(.int32)
-            hidden = output.lastHidden
+            if let optimized = mtp.model.forwardWithHiddenAndArgmax(
+                tokens: tokens, caches: caches)
+            {
+                argmax = optimized.argmax
+                hidden = optimized.lastHidden
+            } else {
+                let output = mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
+                argmax = argMax(output.logits, axis: -1).asType(.int32)
+                hidden = output.lastHidden
+            }
         }
 
         return (argmax, hidden, eagerCacheInnerState(caches))

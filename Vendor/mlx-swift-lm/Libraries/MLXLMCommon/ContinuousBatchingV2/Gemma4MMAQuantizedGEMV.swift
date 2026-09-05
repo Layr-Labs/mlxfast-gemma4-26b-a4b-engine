@@ -1118,6 +1118,38 @@ public enum Gemma4MMAQuantizedGEMV {
             """,
         ensureRowContiguous: true
     )
+    /// Rectangular MTP twin. The target hidden is laid out `[B, L, K]`; the
+    /// result is sequence-major `[L, B, K / 64]` so the head's per-sequence
+    /// threadgroups can consume one compact row table without a transpose.
+    private static let rectangularXSumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_xsum_m8_rect_v1",
+        inputNames: ["x"],
+        outputNames: ["xSums"],
+        source: """
+            constexpr uint M_ROWS = 8;
+            constexpr uint GROUP = 64;
+            constexpr uint N_GROUPS = K / GROUP;
+            constexpr uint CELLS = M_ROWS * L * N_GROUPS;
+            const uint cell = thread_position_in_grid.x;
+            if (cell >= CELLS) return;
+
+            const uint sequenceRow = cell / N_GROUPS;
+            const uint sequence = sequenceRow / M_ROWS;
+            const uint row = sequenceRow % M_ROWS;
+            const uint group = cell % N_GROUPS;
+            const device T* xp =
+                x + (row * L + sequence) * K + group * GROUP;
+            float s = 0.0f;
+            #pragma unroll
+            for (uint c = 0; c < GROUP / 8; ++c) {
+                const uint i = c * 8;
+                s += xp[i + 0] + xp[i + 1] + xp[i + 2] + xp[i + 3];
+                s += xp[i + 4] + xp[i + 5] + xp[i + 6] + xp[i + 7];
+            }
+            xSums[cell] = s;
+            """,
+        ensureRowContiguous: true
+    )
 
     /// Version 5 consumes the precomputed sums and exposes the eight packed
     /// weight words for each group through two aligned vector loads. Activation,
@@ -3122,16 +3154,20 @@ public enum Gemma4MMAQuantizedGEMV {
         let logits: MLXFast.MLXFastKernel
         let carry: MLXFast.MLXFastKernel
         let argmax: MLXFast.MLXFastKernel
+        let rectangularArgmax: MLXFast.MLXFastKernel
     }
 
-    /// The three `_rl1` twins, or nil when the switch is off or a derivation
-    /// did not match (then every caller keeps the incumbent).
+    /// The four `_rl1` twins, or nil when a derivation did not match (then
+    /// every caller keeps the incumbent).
     private static let relayoutKernels: RelayoutKernels? = {
         guard relayoutEnabled else { return nil }
         guard let logits = relayoutRewrite(sourceV27, relayoutLanePairs),
             let carry = relayoutRewrite(sourceV27Carry, relayoutCarryLanePairs),
             let argmax = relayoutRewrite(
                 sourceV27Argmax,
+                logitslessCarryEnabled ? relayoutCarryLanePairs : relayoutLanePairs),
+            let rectangularArgmax = relayoutRewrite(
+                sourceRectangularV27Argmax,
                 logitslessCarryEnabled ? relayoutCarryLanePairs : relayoutLanePairs)
         else {
             FileHandle.standardError.write(
@@ -3160,6 +3196,14 @@ public enum Gemma4MMAQuantizedGEMV {
                 inputNames: ["x", "w", "scales", "biases", "xSums"],
                 outputNames: ["pv", "pi"],
                 source: argmax,
+                header: "#include <metal_simdgroup_matrix>\n",
+                ensureRowContiguous: true),
+            rectangularArgmax: MLXFast.metalKernel(
+                name: "gemma4_mma_affine4_qmv_m8_rect_v27_argmax_rl1"
+                    + logitslessCarryKeySuffix,
+                inputNames: ["x", "w", "scales", "biases", "xSums"],
+                outputNames: ["pv", "pi"],
+                source: rectangularArgmax,
                 header: "#include <metal_simdgroup_matrix>\n",
                 ensureRowContiguous: true))
     }()
@@ -3480,6 +3524,66 @@ public enum Gemma4MMAQuantizedGEMV {
         return result
     }()
 
+    /// Rectangular MTP twin of the logitsless v27 body. Grid-y selects one
+    /// verification column while the eight activation rows remain the
+    /// threadgroup's matrix tile, so each column scans the vocabulary plane
+    /// once instead of the stock batched QMM scanning it once per batch row.
+    private static let sourceRectangularV27Argmax: String = {
+        var result = sourceV27Argmax
+
+        func replaceAll(_ old: String, with new: String) {
+            precondition(
+                result.contains(old),
+                "sourceRectangularV27Argmax missing pattern: \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceAll(
+            "const uint tg = threadgroup_position_in_grid.x;\n",
+            with: """
+            const uint tg = threadgroup_position_in_grid.x;
+            const uint seq = threadgroup_position_in_grid.y;
+            """
+        )
+        replaceAll(
+            "x[fragmentCol * K + activationK]",
+            with: "x[(fragmentCol * L + seq) * K + activationK]"
+        )
+        replaceAll(
+            "x[(fragmentCol + 1) * K + activationK]",
+            with: "x[((fragmentCol + 1) * L + seq) * K + activationK]"
+        )
+        replaceAll(
+            "xSums[fragmentCol * N_GROUPS + biasRow]",
+            with: "xSums[(seq * M_ROWS + fragmentCol) * N_GROUPS + biasRow]"
+        )
+        replaceAll(
+            "xSums[(fragmentCol + 1) * N_GROUPS + biasRow]",
+            with:
+                "xSums[(seq * M_ROWS + fragmentCol + 1) * N_GROUPS + biasRow]"
+        )
+        replaceAll(
+            "pv[lid * TILES + tg]",
+            with: "pv[(seq * M_ROWS + lid) * TILES + tg]"
+        )
+        replaceAll(
+            "pi[lid * TILES + tg]",
+            with: "pi[(seq * M_ROWS + lid) * TILES + tg]"
+        )
+        precondition(!result.contains("out["), "rectangular argmax stores logits")
+        return result
+    }()
+
+    private static let kernelRectangularV27Argmax: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_mma_affine4_qmv_m8_rect_v27_argmax"
+                + logitslessCarryKeySuffix,
+            inputNames: ["x", "w", "scales", "biases", "xSums"],
+            outputNames: ["pv", "pi"],
+            source: sourceRectangularV27Argmax,
+            header: "#include <metal_simdgroup_matrix>\n",
+            ensureRowContiguous: true)
+
     private static let kernelV27Argmax: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v27_argmax" + logitslessCarryKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "xSums"],
@@ -3552,6 +3656,48 @@ public enum Gemma4MMAQuantizedGEMV {
         guard w.dim(1) == k * bits / 32 else { return false }
         guard scales.dim(0) == n, biases.dim(0) == n else { return false }
         guard scales.dim(1) == k / groupSize, biases.dim(1) == k / groupSize else { return false }
+        return true
+    }
+
+    /// True when the rectangular MTP head can answer every verification
+    /// column without materialising vocabulary logits.
+    public static func admitsRectangularArgmax(
+        x shape: [Int],
+        xDType: DType,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int
+    ) -> Bool {
+        guard let biases,
+            logitslessEnabled,
+            enabled,
+            version == 27,
+            groupSize == 64,
+            bits == 4
+        else { return false }
+        guard xDType == .bfloat16, scales.dtype == .bfloat16, biases.dtype == .bfloat16
+        else { return false }
+        guard w.dtype == .uint32 else { return false }
+        guard w.ndim == 2, scales.ndim == 2, biases.ndim == 2 else { return false }
+        guard shape.count == 3,
+            shape[0] == mRows,
+            shape[1] > 1,
+            shape[1] <= 8,
+            let k = shape.last,
+            k > 0
+        else { return false }
+        let n = w.dim(0)
+        guard n >= minOutputWidth, n % (colsPerThreadgroup * 4) == 0 else {
+            return false
+        }
+        guard k % groupSize == 0, k % 8 == 0 else { return false }
+        guard w.dim(1) == k * bits / 32 else { return false }
+        guard scales.dim(0) == n, biases.dim(0) == n else { return false }
+        guard scales.dim(1) == k / groupSize,
+            biases.dim(1) == k / groupSize
+        else { return false }
         return true
     }
 
@@ -3640,5 +3786,73 @@ public enum Gemma4MMAQuantizedGEMV {
             outputShapes: [[mRows]],
             outputDTypes: [.int32]
         )[0]
+    }
+
+    /// Rectangular MTP top-1 per batch row and sequence column, `[8, L]`.
+    /// The full `[8, L, N]` vocabulary plane is never materialised.
+    public static func applyRectangularArgmax(
+        x: MLXArray,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int
+    ) -> MLXArray? {
+        guard
+            admitsRectangularArgmax(
+                x: x.shape, xDType: x.dtype, w: w, scales: scales, biases: biases,
+                groupSize: groupSize, bits: bits),
+            biases != nil
+        else { return nil }
+
+        let rows = x.dim(0)
+        let length = x.dim(1)
+        let k = x.dim(2)
+        let n = w.dim(0)
+        let threadgroups = n / (colsPerThreadgroup * 4)
+        let sumCells = rows * length * (k / groupSize)
+        let sumThreads = 128
+        let xSums = rectangularXSumKernel(
+            [x],
+            template: [("T", x.dtype), ("K", k), ("L", length)],
+            grid: (
+                ((sumCells + sumThreads - 1) / sumThreads) * sumThreads,
+                1,
+                1),
+            threadGroup: (sumThreads, 1, 1),
+            outputShapes: [[sumCells]],
+            outputDTypes: [.float32]
+        )[0]
+
+        let headKernel: MLXFast.MLXFastKernel
+        let plane: MLXArray
+        if let relaid = relayoutKernels {
+            CBv2EngageMark.once("head-relayout")
+            headKernel = relaid.rectangularArgmax
+            plane = relayoutPlane(for: w, k: k, n: n)
+        } else {
+            headKernel = kernelRectangularV27Argmax
+            plane = w
+        }
+        let partials = headKernel(
+            [x, plane, scales, biases!, xSums],
+            template: [("T", x.dtype), ("K", k), ("N", n), ("L", length)],
+            grid: (threadgroups * threadsPerThreadgroup, length, 1),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [
+                [rows * length * threadgroups],
+                [rows * length * threadgroups],
+            ],
+            outputDTypes: [.float32, .uint32]
+        )
+        let flat = argmaxReduceKernel(
+            [partials[0], partials[1]],
+            template: [("NT", threadgroups)],
+            grid: (rows * length * 32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[rows * length]],
+            outputDTypes: [.int32]
+        )[0]
+        return flat.reshaped([length, rows]).transposed(1, 0)
     }
 }

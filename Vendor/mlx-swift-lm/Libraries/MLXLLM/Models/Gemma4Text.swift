@@ -7656,6 +7656,18 @@ extension Gemma4TextModel: CBv2EmbeddingForwardable {
 /// chains from, and the layer indices the engine snapshots for the drafter's
 /// frozen KV. The logits side is numerically identical to
 /// `callAsFunction(_:cache:)` — same trunk, same LM head, same softcap.
+
+/// Off only on an explicit off value. The rectangular MTP head otherwise
+/// remains fail-closed behind its shape, dtype, quantization and model gates.
+private let gemma4MTPRectangularHeadEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_MTP_RECTANGULAR_HEAD"]
+    else { return true }
+    switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+    case "0", "false", "no", "off": return false
+    default: return true
+    }
+}()
 extension Gemma4TextModel: CBv2MTPForwardable {
 
     public var cbv2MTPCaptureLayers: CBv2MTPCaptureLayers? {
@@ -7670,6 +7682,41 @@ extension Gemma4TextModel: CBv2MTPForwardable {
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
         return (applyLMHead(postNorm), preNorm)
+    }
+
+    public func cbv2ForwardWithHiddenAndArgmax(
+        _ tokens: MLXArray, caches: [KVCache]
+    ) -> (argmax: MLXArray, lastHidden: MLXArray)? {
+        guard gemma4MTPRectangularHeadEnabled,
+            tokens.ndim == 2,
+            tokens.dim(0) == 8,
+            tokens.dim(1) > 1,
+            tokens.dim(1) <= 8,
+            config.finalLogitSoftcapping >= 0,
+            lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            Gemma4MMAQuantizedGEMV.admitsRectangularArgmax(
+                x: [tokens.dim(0), tokens.dim(1), config.hiddenSize],
+                xDType: .bfloat16,
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits)
+        else { return nil }
+
+        let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
+        guard let argmax = Gemma4MMAQuantizedGEMV.applyRectangularArgmax(
+            x: postNorm,
+            w: quantized.weight,
+            scales: quantized.scales,
+            biases: quantized.biases,
+            groupSize: quantized.groupSize,
+            bits: quantized.bits)
+        else { return nil }
+        CBv2EngageMark.once("mtp-rectangular-logitsless-head")
+        return (argmax, preNorm)
     }
 }
 

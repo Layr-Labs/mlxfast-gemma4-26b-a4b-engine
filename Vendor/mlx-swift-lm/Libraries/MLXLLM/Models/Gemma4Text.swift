@@ -907,7 +907,6 @@ private struct Gemma4QKVRopeParameters {
     let log2Base: MLXArray
     let frequencies: MLXArray
     let usesFrequencies: Bool
-    let inverseFrequencies: MLXArray?
 }
 
 private let gemma4QKVNormRopeEnabled: Bool = {
@@ -2423,13 +2422,9 @@ private class Gemma4Attention: Module {
             self.rope = initializeRope(
                 dims: effectiveHeadDim, base: config.slidingRopeTheta, traditional: false,
                 scalingConfig: nil, maxPositionEmbeddings: nil)
-            let log2Base = MLXArray([log2f(config.slidingRopeTheta)])
             self.qkvRopeParameters = Gemma4QKVRopeParameters(
-                log2Base: log2Base,
-                frequencies: MLXArray([Float.infinity]), usesFrequencies: false,
-                inverseFrequencies: CBv2RaggedTwoPassDecodeAttentionV1
-                    .makeBaseRopeInverseFrequencies(
-                        log2Base: log2Base, dimensions: effectiveHeadDim))
+                log2Base: MLXArray([log2f(config.slidingRopeTheta)]),
+                frequencies: MLXArray([Float.infinity]), usesFrequencies: false)
         } else {
             let fullRope = initializeRope(
                 dims: effectiveHeadDim, base: config.fullRopeTheta, traditional: false,
@@ -2446,7 +2441,7 @@ private class Gemma4Attention: Module {
             self.rope = proportional
             self.qkvRopeParameters = Gemma4QKVRopeParameters(
                 log2Base: MLXArray([Float.zero]), frequencies: frequencies,
-                usesFrequencies: true, inverseFrequencies: nil)
+                usesFrequencies: true)
         }
 
         super.init()
@@ -2887,7 +2882,6 @@ private class Gemma4Attention: Module {
                 qWeight: qNorm.weight, kWeight: kNorm.weight,
                 positionOffsets: capturedOffsets,
                 ropeLog2Base: qkvRopeParameters.log2Base,
-                ropeInverseFrequencies: qkvRopeParameters.inverseFrequencies,
                 eps: config.rmsNormEps, appliedRope: appliedRope)
         } else if vProj == nil, qkvRopeParameters.usesFrequencies {
             // NORMROPE-D512: the full layers' store dispatch takes the raw

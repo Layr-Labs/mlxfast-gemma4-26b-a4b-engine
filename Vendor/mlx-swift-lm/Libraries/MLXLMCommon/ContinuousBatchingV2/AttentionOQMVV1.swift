@@ -475,6 +475,42 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
 
     private static let mma8Rsp2Carry2Header = applyOprojCarry2(
         to: mma8Rsp2KernelHeader, occurrences: 2)
+    /// OPROJ-RSP2-RSCARRY (P2). The rsp2 K=8192 body reads its ORS pair-table
+    /// values at the point of use (zero outstanding pair loads); the weight
+    /// path already carries 2-deep via OPROJ-CARRY2, which stages wv/s/b only.
+    /// This preloads the next group's pair values (1-deep float2 carry):
+    /// use rs_next, then rotate from g_next. Addresses, add order into
+    /// acc, and types unchanged — pure load scheduling.
+    /// Bottleneck model: pair-table device latency on the critical path of
+    /// each rsp2 group iteration on full-attention layers.
+    /// Predicted: decode gain with d512-ors-oproj-rscarry2 demonstrably firing.
+    /// Falsification: mark fires + parity clean, yet box decode flat/negative.
+    /// `DARKBLOOM_GEMMA4_OPROJ_RSP2_RSCARRY=0` restores the crown bodies/names.
+    public static let oprojRsp2RsCarryEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_OPROJ_RSP2_RSCARRY"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let rsp2RsCarryKeySuffix = oprojRsp2RsCarryEnabled ? "_rscarry2" : ""
+
+    private static func applyOprojRsp2RsCarry(to header: String, occurrences: Int) -> String {
+        var result = header
+        func replace(_ old: String, with new: String) {
+            precondition(
+                result.components(separatedBy: old).count == occurrences + 1,
+                "rsp2rscarry anchor drift")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replace(
+            "#pragma unroll\n  for (int gi = 0; gi < nGroups; ++gi) {\n    const int g = g0 + gi;\n    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));\n    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));\n\n    const float2 rs = float2(\n        p0[2 * g] + p0[2 * g + 1], p1[2 * g] + p1[2 * g + 1]);",
+            with: "  float2 rs_next = float2(\n      p0[2 * g0] + p0[2 * g0 + 1], p1[2 * g0] + p1[2 * g0 + 1]);\n#pragma unroll\n  for (int gi = 0; gi < nGroups; ++gi) {\n    const int g = g0 + gi;\n    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));\n    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));\n\n    const float2 rs = rs_next;\n    const int g_rs_next = g0 + min(gi + 1, nGroups - 1);\n    rs_next = float2(\n        p0[2 * g_rs_next] + p0[2 * g_rs_next + 1], p1[2 * g_rs_next] + p1[2 * g_rs_next + 1]);")
+        return result
+    }
+
+    private static let mma8Rsp2RsCarryHeader = applyOprojRsp2RsCarry(
+        to: oprojCarry2Enabled ? mma8Rsp2Carry2Header : mma8Rsp2KernelHeader, occurrences: 1)
 
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
@@ -764,7 +800,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
 
     private static let mma8Rsp2KernelK8192 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp2_v1"
-            + carry2KeySuffix,
+            + carry2KeySuffix + rsp2RsCarryKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_pairs"],
         outputNames: ["y"],
         source: """
@@ -777,7 +813,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: oprojCarry2Enabled ? mma8Rsp2Carry2Header : mma8Rsp2KernelHeader,
+        header: oprojRsp2RsCarryEnabled ? mma8Rsp2RsCarryHeader : (oprojCarry2Enabled ? mma8Rsp2Carry2Header : mma8Rsp2KernelHeader),
         ensureRowContiguous: true)
 
     @inline(__always)
@@ -841,6 +877,9 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
                     CBv2EngageMark.once("oproj-carry2")
                 }
                 CBv2EngageMark.once("d512-ors-oproj-pairs")
+                if oprojRsp2RsCarryEnabled {
+                    CBv2EngageMark.once("d512-ors-oproj-rscarry2")
+                }
                 return mma8Rsp2KernelK8192(
                     [x, weight, scales, biases, rsPairTable!],
                     template: [("T", x.dtype)],

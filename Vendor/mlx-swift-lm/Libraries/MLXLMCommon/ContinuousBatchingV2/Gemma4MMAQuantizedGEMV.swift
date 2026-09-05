@@ -4,6 +4,10 @@ import Foundation
 import MLX
 import MLXFast
 
+/// Control redraw of crown 5816e36: never called, dead code only so the tree differs from the crown
+/// by a real source change and the benchmarker takes a fresh timing sample. No behaviour change.
+@inline(never) private func gemma4MMAQuantizedGEMVRedrawControlMarker() -> Int { 0 }
+
 /// MMA-001 --- simdgroup-matrix affine-4/8 quantized GEMV for the tied LM head.
 ///
 /// WHY. Gemma 4 26B A4B ties its embedding to the LM head, so `applyLMHead` is

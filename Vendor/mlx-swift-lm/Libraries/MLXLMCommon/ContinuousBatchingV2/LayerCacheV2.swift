@@ -228,6 +228,57 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         return output
     }
 
+    /// Read-only admission. Direct output storage must reproduce ordinary
+    /// fresh private capacity, never an alternative growth or pooling policy.
+    public func freshLastQueryPrivateCapacity(committedCount: Int) -> Int? {
+        guard !mtpSerializesRectangularAttention, kind.attention == .full,
+            kind.sharesKVWithLayer == nil, kind.kvHeads == 2, kind.headDim == 512,
+            kind.queryHeads == 16, rows.count == 8, committedCount >= 128,
+            attentionSoftcap == nil
+        else { return nil }
+        var capacity: Int?
+        for row in rows {
+            guard let full = row as? CBv2FullSequenceKV,
+                full.kvHeads == 2, full.headDim == 512,
+                let current = full.freshPrivateReservationCapacity(forCommittedCount: committedCount),
+                current > committedCount, capacity == nil || capacity == current
+            else { return nil }
+            capacity = current
+        }
+        return capacity
+    }
+
+    /// Every refusal precedes mutation. The producer supplies sixteen
+    /// independently-owned buffers with a committed prefix and zero tail.
+    public func adoptAndAttendLastQueryPrivate(
+        queries: MLXArray, keys: [MLXArray], values: [MLXArray],
+        committedCount: Int, scale: Float
+    ) -> MLXArray? {
+        guard let capacity = freshLastQueryPrivateCapacity(committedCount: committedCount),
+            queries.shape == [8, 16, 1, 512], queries.dtype == .bfloat16,
+            keys.count == 8, values.count == 8,
+            zip(keys, values).allSatisfy({ k, v in
+                k.dtype == .bfloat16 && v.dtype == .bfloat16
+                    && k.shape == [1, 2, capacity, 512] && v.shape == k.shape
+            })
+        else { return nil }
+        let fullRows = rows.map { $0 as! CBv2FullSequenceKV }
+        var committed: [(keys: MLXArray, values: MLXArray)] = []
+        committed.reserveCapacity(8)
+        for (index, row) in fullRows.enumerated() {
+            committed.append(row.adoptFreshPrivateReservation(
+                keys: keys[index], values: values[index], committedCount: committedCount))
+        }
+        let output = CBv2AttentionV1.attendLastQueryCommitted(
+            rows: rows, kind: kind, queries: queries, committed: committed,
+            scale: scale, sinks: nil, softcap: nil)
+        if advancesPositionOffsets {
+            positionOffsetsState.value = positionOffsetsState.value + Int32(committedCount)
+        }
+        CBv2EngageMark.once("lastquery-direct-store")
+        return output
+    }
+
     public func attendBorrowing(
         source: CBv2AttendingLayerCache,
         queries: MLXArray, scale: Float, sinks: MLXArray?

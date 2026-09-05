@@ -1677,6 +1677,36 @@ public class SwitchGLU: Module {
                 x = downProj(
                     activated, idx, lhsIndices: downLhs, sortedIndices: true)
                 return (x, inverseOrder, true)
+            } else if doSort, useLhsIndices, isGeluActivation,
+                activationProduct == nil, promptActivated == nil,
+                x.ndim == 3, x.dim(1) == 1, x.dim(2) == inputDims,
+                x.dtype == .bfloat16,
+                idx.ndim == 1, idx.size == 64,
+                let decodeLhs = lhsIndices,
+                let fused = fusedGateUpDispatch(),
+                // EXPERT-GATEUP-GEGLU: the batch-eight decode cell reads the
+                // same paired gate|up storage the prompt arm above uses and
+                // closes the product in the projection's own epilogue, so the
+                // two split projection planes are never written and the product
+                // dispatch -- a read-after-write stage between the gathers and
+                // the down projection -- leaves the chain. A nil falls through
+                // to the split gathers and the standalone product below.
+                let fusedActivated = CBv2ExpertGateUpGeGLUV1.apply(
+                    x: x,
+                    pairedWeight: fused.storage.weight,
+                    pairedScales: fused.storage.scales,
+                    pairedBiases: fused.storage.biases,
+                    lhsIndices: decodeLhs,
+                    rhsIndices: idx,
+                    groupSize: fused.groupSize,
+                    bits: fused.bits,
+                    mode: fused.mode)
+            {
+                let downLhs: MLXArray? =
+                    (idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
+                x = downProj(
+                    fusedActivated, idx, lhsIndices: downLhs, sortedIndices: true)
+                return (x, inverseOrder, true)
             } else {
                 xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
                 xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)

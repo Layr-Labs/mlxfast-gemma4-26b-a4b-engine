@@ -3358,11 +3358,73 @@ private enum Gemma4RouterFinalistsWeightsV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    private static let orderKeysEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_ROUTE_ORDER_KEYS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_router_finalists32_weights_bf16_v1",
+        name: orderKeysEnabled
+            ? "gemma4_router_finalists32_weights_bf16_max8_sg1_v1"
+            : "gemma4_router_finalists32_weights_bf16_v1",
         inputNames: ["scores", "pes"],
         outputNames: ["indices", "weights"],
-        source: """
+        source: orderKeysEnabled ? """
+            constexpr int K = 8;
+            constexpr int N_READS = 4;
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            uint a = gemma4_finalists_pack(scores[row * 128u + lane], lane);
+            uint b = gemma4_finalists_pack(scores[row * 128u + 32u + lane], 32u + lane);
+            uint c = gemma4_finalists_pack(scores[row * 128u + 64u + lane], 64u + lane);
+            uint d = gemma4_finalists_pack(scores[row * 128u + 96u + lane], 96u + lane);
+            uint item = 0u;
+            // Each key is unique and positive; zero removes exactly one winner.
+            // Rank zero belongs in lane 31, preserving ascending output order.
+            #pragma clang loop unroll(full)
+            for (uint rank = 0u; rank < 8u; ++rank) {
+                const uint winner = simd_max(max(max(a, b), max(c, d)));
+                if (lane == 31u - rank) item = winner;
+                if (a == winner) a = 0u;
+                if (b == winner) b = 0u;
+                if (c == winner) c = 0u;
+                if (d == winner) d = 0u;
+            }
+            if (lane >= 24u) indices[row * 8u + lane - 24u] = item & 127u;
+            uint chosen[N_READS];
+            float ld[N_READS];
+            // Every lane participates in each shuffle. Lanes 0 and 1 receive the
+            // same four original values as the incumbent axis-eight softmax.
+            for (int i = 0; i < N_READS; ++i) {
+                chosen[i] = simd_shuffle(item,
+                    ushort(24u + (lane & 1u) * 4u + uint(i))) & 127u;
+                ld[i] = lane < 2u ? float(scores[row * 128u + chosen[i]]) : Limits<float>::min;
+            }
+            float maxval = Limits<float>::finite_min;
+            for (int i = 0; i < N_READS; ++i) {
+                maxval = (maxval < ld[i]) ? ld[i] : maxval;
+            }
+            maxval = simd_max(maxval);
+            // Retain both stock reduction stages and their exact operands.
+            maxval = simd_max(lane == 0u ? maxval : Limits<float>::min);
+            float normalizer = 0;
+            for (int i = 0; i < N_READS; ++i) {
+                float exp_x = fast::exp(ld[i] - maxval);
+                ld[i] = exp_x;
+                normalizer += exp_x;
+            }
+            normalizer = simd_sum(normalizer);
+            normalizer = simd_sum(lane == 0u ? normalizer : 0.0f);
+            normalizer = 1 / normalizer;
+            if (lane < 2u) {
+                for (int i = 0; i < N_READS; ++i) {
+                    const T w = T(ld[i] * normalizer);
+                    weights[row * 8u + lane * 4u + uint(i)] = w * pes[chosen[i]];
+                }
+            }
+        """ : """
             constexpr int SIMD_SIZE = 32;
             constexpr int N_READS = 4;
             constexpr int K = 8;
@@ -3504,7 +3566,28 @@ private enum Gemma4RouterFinalistsWeightsV1 {
             }
         """,
         header: """
+            constant constexpr bool gemma4_route_order_keys = \(orderKeysEnabled ? "true" : "false");
+
+            inline uint gemma4_finalists_pack(bfloat16_t value, uint expert) {
+                const uint bits = uint(bfloat16_to_uint16(value));
+                if (!gemma4_route_order_keys) return (bits << 7) | expert;
+                // Use the native equality operation here: under Metal's flush-
+                // to-zero mode, BF16 subnormals must tie with signed zero too.
+                const uint ordinal = metal::isnan(value) ? 0xffffu
+                    : (value == bfloat16_t(0.0f) ? 0x8000u
+                       : ((bits & 0x8000u) ? ((~bits) & 0xffffu) : (bits ^ 0x8000u)));
+                return (ordinal << 7) | expert;
+            }
+
+            inline bfloat16_t gemma4_finalists_value(
+                uint item, const device bfloat16_t* row_scores)
+            {
+                return gemma4_route_order_keys ? row_scores[item & 127u]
+                    : uint16_to_bfloat16(uint16_t(item >> 7));
+            }
+
             inline bool gemma4_finalists_before(uint a, uint b) {
+                if (gemma4_route_order_keys) return a < b;
                 const bfloat16_t av = uint16_to_bfloat16(uint16_t(a >> 7));
                 const bfloat16_t bv = uint16_to_bfloat16(uint16_t(b >> 7));
                 const bool an = metal::isnan(av);
@@ -3540,11 +3623,12 @@ private enum Gemma4RouterFinalistsWeightsV1 {
         let l = scores.dim(1)
         let rows = b * l
         CBv2EngageMark.once("router-weights32-prefill")
+        if orderKeysEnabled { CBv2EngageMark.once("router-native-max8-sg1-prefill") }
         let outs = kernel(
             [scores, perExpertScale],
             template: [("T", scores.dtype)],
-            grid: (rows * 128, 1, 1),
-            threadGroup: (128, 1, 1),
+            grid: (rows * (orderKeysEnabled ? 32 : 128), 1, 1),
+            threadGroup: (orderKeysEnabled ? 32 : 128, 1, 1),
             outputShapes: [[b, l, 8], [b, l, 8]],
             outputDTypes: [.uint32, .bfloat16]
         )
@@ -3582,9 +3666,98 @@ private enum Gemma4RouterFinalistsWeightsV1 {
 /// two-dispatch chain unchanged. `DARKBLOOM_GEMMA4_GLUE_FOLD=0` is the kill
 /// switch (off = exact incumbent chain). Engage mark: `glue-fold`.
 private enum Gemma4RouteGlueFoldV1 {
+    /// Exact stable rank of 64 seven-bit expert IDs. Both complete SIMD
+    /// groups build identical bit planes, then count smaller keys and equal
+    /// keys at earlier assignment positions. Selection and weights are untouched.
+    private static let rankBitplanesEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTE_RANK64_BITPLANES"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
+    private static let incumbentRank64Source = """
+            // Phase 2 -- the incumbent simd-rank scatter, verbatim, over the
+            // staged 64 keys. Threads 0..63 are exactly the two complete
+            // SIMD groups the standalone kernel launched; `assignment` and
+            // `lane` reproduce its coordinates.
+            if (tid < 64u) {
+                const uint assignment = tid;
+                const uint key = sel[assignment];
+                const uint key_low = sel[lane];
+                const uint key_high = sel[32u + lane];
+                uint rank = 0;
+                #pragma clang loop unroll(full)
+                for (uint source = 0; source < 32; ++source) {
+                    const uint other_low = simd_broadcast(key_low, ushort(source));
+                    rank += (other_low < key)
+                        || (other_low == key && source < assignment);
+                    const uint other_high = simd_broadcast(key_high, ushort(source));
+                    const uint high_assignment = 32u + source;
+                    rank += (other_high < key)
+                        || (other_high == key && high_assignment < assignment);
+                }
+                row_order[rank] = assignment / 8;
+                sorted_keys[rank] = key;
+                inverse_order[assignment] = rank;
+            }
+        """
+
+    private static let bitplaneRank64Source = """
+            // All 64 assignments rank themselves against seven key bit planes.
+            // Both complete SIMD groups construct the same planes independently.
+            if (tid < 64u) {
+                const uint assignment = tid;
+                const uint key = sel[assignment];
+                const uint key_low = sel[lane];
+                const uint key_high = sel[32u + lane];
+                uint equal_low = 0xffffffffu;
+                uint equal_high = 0xffffffffu;
+                uint less_low = 0u;
+                uint less_high = 0u;
+                #pragma clang loop unroll(full)
+                for (int bit = 6; bit >= 0; --bit) {
+                    const uint plane_low = uint(simd_vote::vote_t(
+                        simd_ballot(((key_low >> bit) & 1u) != 0u)));
+                    const uint plane_high = uint(simd_vote::vote_t(
+                        simd_ballot(((key_high >> bit) & 1u) != 0u)));
+                    const uint ones = 0u - ((key >> bit) & 1u);
+                    less_low |= equal_low & ~plane_low & ones;
+                    less_high |= equal_high & ~plane_high & ones;
+                    equal_low &= ~(plane_low ^ ones);
+                    equal_high &= ~(plane_high ^ ones);
+                }
+                const uint prefix = (1u << lane) - 1u;
+                const uint earlier_low = assignment < 32u ? prefix : 0xffffffffu;
+                const uint earlier_high = assignment < 32u ? 0u : prefix;
+                const uint rank = popcount(less_low | (equal_low & earlier_low))
+                    + popcount(less_high | (equal_high & earlier_high));
+                row_order[rank] = assignment / 8u;
+                sorted_keys[rank] = key;
+                inverse_order[assignment] = rank;
+            }
+        """
+
+    private static func rank64Source(_ source: String) -> String {
+        guard rankBitplanesEnabled else { return source }
+        precondition(source.components(separatedBy: incumbentRank64Source).count == 2,
+                     "route rank64 bitplane source anchor drift")
+        return source.replacingOccurrences(
+            of: incumbentRank64Source, with: bitplaneRank64Source)
+    }
+
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_GLUE_FOLD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    // Encode native comparison order once, then select with integer maxima.
+    private static let orderKeysEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTE_ORDER_KEYS"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
@@ -3596,10 +3769,84 @@ private enum Gemma4RouteGlueFoldV1 {
     }
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_route_monolithic_top8_e128_k8_bf16_v2",
+        name: (orderKeysEnabled
+            ? "gemma4_route_monolithic_top8_e128_k8_bf16_max8_sg1_v1"
+            : "gemma4_route_monolithic_top8_e128_k8_bf16_v2")
+            + (rankBitplanesEnabled ? "_bp1" : ""),
         inputNames: ["scores", "pes"],
         outputNames: ["indices", "weights", "row_order", "sorted_keys", "inverse_order"],
-        source: """
+        source: rank64Source(orderKeysEnabled ? """
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint row = tid / 32u;
+            const uint lane = thread_index_in_simdgroup;
+            uint a = gemma4_finalists_pack(scores[row * 128u + lane], lane);
+            uint b = gemma4_finalists_pack(scores[row * 128u + 32u + lane], 32u + lane);
+            uint c = gemma4_finalists_pack(scores[row * 128u + 64u + lane], 64u + lane);
+            uint d = gemma4_finalists_pack(scores[row * 128u + 96u + lane], 96u + lane);
+            uint item = 0u;
+            threadgroup uint sel[64];
+            // Unique positive keys make zero a safe removal sentinel.
+            // Store the eight winners in ascending lanes 24 through 31.
+            #pragma clang loop unroll(full)
+            for (uint rank = 0u; rank < 8u; ++rank) {
+                const uint winner = simd_max(max(max(a, b), max(c, d)));
+                if (lane == 31u - rank) item = winner;
+                if (a == winner) a = 0u;
+                if (b == winner) b = 0u;
+                if (c == winner) c = 0u;
+                if (d == winner) d = 0u;
+            }
+            {
+                float score = (lane >= 24u) ? float(gemma4_finalists_value(item, scores + row * 128u)) : -1e38f;
+                float max_score = score;
+                max_score = metal::max(max_score, simd_shuffle_xor(max_score, 4));
+                max_score = metal::max(max_score, simd_shuffle_xor(max_score, 2));
+                max_score = metal::max(max_score, simd_shuffle_xor(max_score, 1));
+
+                float exp_score = (lane >= 24u) ? metal::precise::exp(score - max_score) : 0.0f;
+                float sum_exp = exp_score;
+                sum_exp += simd_shuffle_xor(sum_exp, 4);
+                sum_exp += simd_shuffle_xor(sum_exp, 2);
+                sum_exp += simd_shuffle_xor(sum_exp, 1);
+
+                if (lane >= 24u) {
+                    const uint selected = item & 127u;
+                    const uint out_idx = row * 8u + (lane - 24u);
+                    indices[out_idx] = selected;
+                    sel[out_idx] = selected;
+
+                    float weight = (sum_exp > 0.0f) ? (exp_score / sum_exp) : 0.0f;
+                    float scale = float(pes[selected]);
+                    weights[out_idx] = bfloat16_t(weight * scale);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Phase 2 -- the incumbent simd-rank scatter, verbatim, over the
+            // staged 64 keys. Threads 0..63 are exactly the two complete
+            // SIMD groups the standalone kernel launched; `assignment` and
+            // `lane` reproduce its coordinates.
+            if (tid < 64u) {
+                const uint assignment = tid;
+                const uint key = sel[assignment];
+                const uint key_low = sel[lane];
+                const uint key_high = sel[32u + lane];
+                uint rank = 0;
+                #pragma clang loop unroll(full)
+                for (uint source = 0; source < 32; ++source) {
+                    const uint other_low = simd_broadcast(key_low, ushort(source));
+                    rank += (other_low < key)
+                        || (other_low == key && source < assignment);
+                    const uint other_high = simd_broadcast(key_high, ushort(source));
+                    const uint high_assignment = 32u + source;
+                    rank += (other_high < key)
+                        || (other_high == key && high_assignment < assignment);
+                }
+                row_order[rank] = assignment / 8;
+                sorted_keys[rank] = key;
+                inverse_order[assignment] = rank;
+            }
+        """ : """
             const uint tid = thread_position_in_threadgroup.x;
             const uint row = tid / 128u;
             const uint lane = thread_index_in_simdgroup;
@@ -3697,9 +3944,30 @@ private enum Gemma4RouteGlueFoldV1 {
                 sorted_keys[rank] = key;
                 inverse_order[assignment] = rank;
             }
-        """,
+        """),
         header: """
+            constant constexpr bool gemma4_route_order_keys = \(orderKeysEnabled ? "true" : "false");
+
+            inline uint gemma4_finalists_pack(bfloat16_t value, uint expert) {
+                const uint bits = uint(bfloat16_to_uint16(value));
+                if (!gemma4_route_order_keys) return (bits << 7) | expert;
+                // Use the native equality operation here: under Metal's flush-
+                // to-zero mode, BF16 subnormals must tie with signed zero too.
+                const uint ordinal = metal::isnan(value) ? 0xffffu
+                    : (value == bfloat16_t(0.0f) ? 0x8000u
+                       : ((bits & 0x8000u) ? ((~bits) & 0xffffu) : (bits ^ 0x8000u)));
+                return (ordinal << 7) | expert;
+            }
+
+            inline bfloat16_t gemma4_finalists_value(
+                uint item, const device bfloat16_t* row_scores)
+            {
+                return gemma4_route_order_keys ? row_scores[item & 127u]
+                    : uint16_to_bfloat16(uint16_t(item >> 7));
+            }
+
             inline bool gemma4_finalists_before(uint a, uint b) {
+                if (gemma4_route_order_keys) return a < b;
                 const bfloat16_t av = uint16_to_bfloat16(uint16_t(a >> 7));
                 const bfloat16_t bv = uint16_to_bfloat16(uint16_t(b >> 7));
                 const bool an = metal::isnan(av);
@@ -3731,10 +3999,11 @@ private enum Gemma4RouteGlueFoldV1 {
             perExpertScale.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-fold")
+        if orderKeysEnabled { CBv2EngageMark.once("router-native-max8-sg1-decode") }
         let outs = kernel(
             [scores, perExpertScale],
-            grid: (1024, 1, 1),
-            threadGroup: (1024, 1, 1),
+            grid: (orderKeysEnabled ? 256 : 1024, 1, 1),
+            threadGroup: (orderKeysEnabled ? 256 : 1024, 1, 1),
             outputShapes: [[8, 1, 8], [8, 1, 8], [64], [64], [64]],
             outputDTypes: [.uint32, .bfloat16, .uint32, .uint32, .uint32]
         )

@@ -3280,6 +3280,12 @@ public enum Gemma4MMAQuantizedGEMV {
                     outputDTypes: [.float32]
                 )[0]
             }
+            if version == 27, !relayoutXCheck,
+                let logits = Gemma4TensorHeadV1.projection(
+                    x: flatX, w: w, scales: scales, biases: biases, sums: xSums)
+            {
+                return logits
+            }
             switch version {
             case 27:
                 if carryEnabled {
@@ -3525,6 +3531,69 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
+    /// Split only the large second-stage vocabulary reduction across eight
+    /// SIMD groups. Off values retain the existing single-SIMD kernel exactly.
+    private static let parallelArgmaxReduceEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_HEAD_REDUCE_PARALLEL"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
+    /// The input records are unchanged. Each SIMD group first chooses its
+    /// maximum under the incumbent (higher value, lower index) order. One
+    /// threadgroup barrier publishes eight records, then SIMD group zero
+    /// closes that same order. No floating-point sum is reassociated.
+    private static let parallelArgmaxReduceKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_mma_head_argmax_reduce_v3_sg8_vec4",
+            inputNames: ["pv", "pi"],
+            outputNames: ["tokens"],
+            source: """
+
+            const uint m = threadgroup_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint tid = thread_index_in_threadgroup;
+            const device float4* pv4 = (const device float4*)(pv + m * uint(NT));
+            const device uint4* pi4 = (const device uint4*)(pi + m * uint(NT));
+            float rv = -INFINITY;
+            uint ri = 0xFFFFFFFFu;
+            constexpr uint NT4 = uint(NT) / 4;
+            for (uint i = tid; i < NT4; i += 32 * SG) {
+                const float4 ov = pv4[i];
+                const uint4 oi = pi4[i];
+                #pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const float v = ov[e];
+                    const uint idx = oi[e];
+                    if (v > rv || (v == rv && idx < ri)) { rv = v; ri = idx; }
+                }
+            }
+            for (ushort xm = 1; xm < 32; xm <<= 1) {
+                const float ov = simd_shuffle_xor(rv, xm);
+                const uint oi = simd_shuffle_xor(ri, xm);
+                if (ov > rv || (ov == rv && oi < ri)) { rv = ov; ri = oi; }
+            }
+            threadgroup float bestVal[SG];
+            threadgroup uint bestIdx[SG];
+            if (lane == 0) { bestVal[sg] = rv; bestIdx[sg] = ri; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+                rv = lane < SG ? bestVal[lane] : -INFINITY;
+                ri = lane < SG ? bestIdx[lane] : 0xFFFFFFFFu;
+                for (ushort xm = 1; xm < 32; xm <<= 1) {
+                    const float ov = simd_shuffle_xor(rv, xm);
+                    const uint oi = simd_shuffle_xor(ri, xm);
+                    if (ov > rv || (ov == rv && oi < ri)) { rv = ov; ri = oi; }
+                }
+                if (lane == 0) { tokens[m] = int32_t(ri); }
+            }
+            """,
+            ensureRowContiguous: true
+        )
+
     /// True when `applyArgmax` would take the fused path for this geometry.
     /// Pure host predicate over shapes, dtypes and the kill switches, so the
     /// engine can choose the seam BEFORE it builds the forward graph.
@@ -3601,6 +3670,31 @@ public enum Gemma4MMAQuantizedGEMV {
             )[0]
         }
 
+        if !relayoutXCheck,
+            let partials = Gemma4TensorHeadV1.partialArgmax(
+                x: flatX, w: w, scales: scales, biases: biases, sums: xSums)
+        {
+            if parallelArgmaxReduceEnabled, partials.tiles >= 512,
+                partials.tiles % 4 == 0
+            {
+                CBv2EngageMark.once("head-argmax-reduce-sg8")
+                return parallelArgmaxReduceKernel(
+                    [partials.values, partials.indices],
+                    template: [("NT", partials.tiles), ("SG", 8)],
+                    grid: (mRows * 256, 1, 1),
+                    threadGroup: (256, 1, 1),
+                    outputShapes: [[mRows]],
+                    outputDTypes: [.int32]
+                )[0]
+            }
+            return argmaxReduceKernel(
+                [partials.values, partials.indices],
+                template: [("NT", partials.tiles)],
+                grid: (mRows * 32, 1, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[mRows]], outputDTypes: [.int32]
+            )[0]
+        }
+
         let headKernel: MLXFast.MLXFastKernel
         let plane: MLXArray
         if let relaid = relayoutKernels {
@@ -3632,6 +3726,19 @@ public enum Gemma4MMAQuantizedGEMV {
             relayoutReport("argmax pi", candidate: partials[1], incumbent: reference[1])
         }
 
+        // Keep small admitted vocabularies on the original reduction. The
+        // tied head has 2048 partial records per row and takes this branch.
+        if parallelArgmaxReduceEnabled, threadgroups >= 512, threadgroups % 4 == 0 {
+            CBv2EngageMark.once("head-argmax-reduce-sg8")
+            return parallelArgmaxReduceKernel(
+                [partials[0], partials[1]],
+                template: [("NT", threadgroups), ("SG", 8)],
+                grid: (mRows * 256, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[mRows]],
+                outputDTypes: [.int32]
+            )[0]
+        }
         return argmaxReduceKernel(
             [partials[0], partials[1]],
             template: [("NT", threadgroups)],

@@ -2349,6 +2349,30 @@ private let gemma4QKFuseSlidingEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// Decode attention already has a singleton query axis. In that shape the
+/// head-major result is row-contiguous in the token-major flattening order, so
+/// the transpose is a graph-only permutation with no semantic work. Removing
+/// it keeps the output projection on the same `[B, 1, hidden]` bytes while
+/// avoiding one intermediate graph node per attention layer.
+/// `DARKBLOOM_GEMMA4_ATTN_L1_FLATTEN=0` restores the established transpose.
+private let gemma4AttentionL1FlattenEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_ATTN_L1_FLATTEN"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+@inline(__always)
+private func gemma4FlattenAttentionOutput(
+    _ attention: MLXArray, batch: Int, queryLength: Int
+) -> MLXArray {
+    if gemma4AttentionL1FlattenEnabled, queryLength == 1 {
+        CBv2EngageMark.once("gemma4-attn-l1-flatten")
+        return attention.reshaped(batch, 1, -1)
+    }
+    return attention.transposed(0, 2, 1, 3).reshaped(batch, queryLength, -1)
+}
+
 private class Gemma4Attention: Module {
     let config: Gemma4TextConfiguration
     let layerIdx: Int
@@ -2672,9 +2696,8 @@ private class Gemma4Attention: Module {
             attentionInputDType == .float16
             ? attentionRaw.asType(.float16) : attentionRaw
 
-        let output = attention
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
+        let output = gemma4FlattenAttentionOutput(
+            attention, batch: B, queryLength: L)
 
         return (outputProjection(output), (keys, values), activePositionOffset)
     }
@@ -2779,7 +2802,8 @@ private class Gemma4Attention: Module {
                 outputDType == .float16 ? queries.asType(.float32) : queries
             let attention = layerCache.attendBorrowing(
                 source: source, queries: attentionQueries, scale: scale, sinks: nil)
-            var output = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+            var output = gemma4FlattenAttentionOutput(
+                attention, batch: B, queryLength: L)
             if outputStart > 0 {
                 output = output[0..., outputStart..., 0...]
             }
@@ -2916,7 +2940,8 @@ private class Gemma4Attention: Module {
 
         let residentProducts =
             CBv2RaggedTwoPassDecodeAttentionV1.takeResidentProducts(for: attention)
-        var output = attention.transposed(0, 2, 1, 3).reshaped(B, queryLength, -1)
+        var output = gemma4FlattenAttentionOutput(
+            attention, batch: B, queryLength: queryLength)
         if lastQueryCache == nil && outputStart > 0 {
             output = output[0..., outputStart..., 0...]
         }

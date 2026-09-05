@@ -40,6 +40,15 @@ inline T gemma4_geglu_compiled_tape(T gate, T up) {
   return static_cast<T>(gelu * up);
 }
 
+// EGU-V3 (decode expert gate|up GeGLU epilogue fusion). Under `GEGLU` a
+// `qmv` simdgroup owns four physical rows of the paired16 gate|up plane --
+// two adjacent gate columns and their two matching up columns, sixteen rows
+// away -- instead of four consecutive rows. Accumulator `row` therefore
+// addresses physical row {0, 1, 16, 17}[row] relative to the simdgroup base.
+// With `GEGLU` false the expression is the identity and every incumbent
+// instantiation keeps byte-identical addressing.
+#define GEMMA4_EGU_ROW(r) (GEGLU ? (((r) & 1) + (((r) >> 1) * 16)) : (r))
+
 #define MLX_MTL_CONST static constant constexpr const
 
 MLX_MTL_CONST int SIMD_SIZE = 32;
@@ -4020,6 +4029,593 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   }
 }
 
+// Isolated EGU helpers: incumbent non-fused helper definitions remain verbatim.
+template <typename T, const int group_size, const int bits, bool GEGLU = true>
+METAL_FUNC void qmv_affine4_g64_pair_impl_egu_v1(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    device T* y0,
+    device T* y1,
+    const constant int& in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 8;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x0_thread[values_per_thread];
+  thread float x1_thread[values_per_thread];
+  thread uint packed[results_per_simdgroup];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  // EGU-V3: this simdgroup's two compact GeGLU output columns and the four
+  // paired16 physical rows that feed them (gate, gate+1, up, up+1).
+  const int egu_sg = int(tid.y) * num_simdgroups + int(simd_gid);
+  const int egu_base_row = 32 * (egu_sg / 8) + ((2 * egu_sg) % 16);
+  const int base_row = GEGLU ? egu_base_row : out_row;
+
+  ws += base_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += base_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += base_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  y0 += GEGLU ? (egu_sg * 2) : out_row;
+  y1 += GEGLU ? (egu_sg * 2) : out_row;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] = *((const device uint*)(ws + GEMMA4_EGU_ROW(row) * in_vec_size_w));
+      scale_local[row] = scales[GEMMA4_EGU_ROW(row) * in_vec_size_g];
+      bias_local[row] = biases[GEMMA4_EGU_ROW(row) * in_vec_size_g];
+    }
+
+    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+    float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      float dot0;
+      float dot1;
+      qdot_affine4_pair_word<float, values_per_thread>(
+          packed[row], x0_thread, x1_thread, scale_local[row], bias_local[row], sum0, sum1, dot0, dot1);
+      result0[row] += dot0;
+      result1[row] += dot1;
+    }
+
+    ws += block_size / 2;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+  }
+
+  // Every Gemma 4 caller entering this specialized g64 path has K aligned to
+  // 64.  The final block therefore contains an integral number of complete
+  // eight-value lane packets (32 lanes for K=2816, 24 for expert down_proj
+  // K=704); no active lane needs the generic dynamic safe-tail loops.
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] = *((const device uint*)(ws + GEMMA4_EGU_ROW(row) * in_vec_size_w));
+      scale_local[row] = scales[GEMMA4_EGU_ROW(row) * in_vec_size_g];
+      bias_local[row] = biases[GEMMA4_EGU_ROW(row) * in_vec_size_g];
+    }
+
+    float sum0 =
+        load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+    float sum1 =
+        load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      float dot0;
+      float dot1;
+      qdot_affine4_pair_word<float, values_per_thread>(
+          packed[row], x0_thread, x1_thread, scale_local[row], bias_local[row], sum0, sum1, dot0, dot1);
+      result0[row] += dot0;
+      result1[row] += dot1;
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+  }
+  if (simd_lid == 0) {
+    if (GEGLU) {
+      for (int p = 0; p < 2; p++) {
+        y0[p] = gemma4_geglu_compiled_tape<T>(
+            static_cast<T>(result0[p]), static_cast<T>(result0[p + 2]));
+        y1[p] = gemma4_geglu_compiled_tape<T>(
+            static_cast<T>(result1[p]), static_cast<T>(result1[p + 2]));
+      }
+    } else {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        y0[row] = static_cast<T>(result0[row]);
+        y1[row] = static_cast<T>(result1[row]);
+      }
+    }
+  }
+}
+
+template <typename T, const int group_size, const int bits, bool GEGLU = true>
+METAL_FUNC void qmv_affine4_g64_quad_stream_impl_egu_v1(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    const device T* x2,
+    const device T* x3,
+    device T* y0,
+    device T* y1,
+    device T* y2,
+    device T* y3,
+    const int in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 8;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x_thread[values_per_thread];
+  thread uint packed[results_per_simdgroup];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+  thread float result2[results_per_simdgroup] = {0};
+  thread float result3[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  // EGU-V3: this simdgroup's two compact GeGLU output columns and the four
+  // paired16 physical rows that feed them (gate, gate+1, up, up+1).
+  const int egu_sg = int(tid.y) * num_simdgroups + int(simd_gid);
+  const int egu_base_row = 32 * (egu_sg / 8) + ((2 * egu_sg) % 16);
+  const int base_row = GEGLU ? egu_base_row : out_row;
+
+  ws += base_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += base_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += base_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  x2 += simd_lid * values_per_thread;
+  x3 += simd_lid * values_per_thread;
+  y0 += GEGLU ? (egu_sg * 2) : out_row;
+  y1 += GEGLU ? (egu_sg * 2) : out_row;
+  y2 += GEGLU ? (egu_sg * 2) : out_row;
+  y3 += GEGLU ? (egu_sg * 2) : out_row;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] =
+          *((const device uint*)(ws + GEMMA4_EGU_ROW(row) * in_vec_size_w));
+      scale_local[row] = scales[GEMMA4_EGU_ROW(row) * in_vec_size_g];
+      bias_local[row] = biases[GEMMA4_EGU_ROW(row) * in_vec_size_g];
+    }
+
+    float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result3[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+
+    ws += block_size / 2;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+    x2 += block_size;
+    x3 += block_size;
+  }
+
+  const int remaining = clamp(
+      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
+      0,
+      values_per_thread);
+  if (remaining > 0) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] =
+          *((const device uint*)(ws + GEMMA4_EGU_ROW(row) * in_vec_size_w));
+      scale_local[row] = scales[GEMMA4_EGU_ROW(row) * in_vec_size_g];
+      bias_local[row] = biases[GEMMA4_EGU_ROW(row) * in_vec_size_g];
+    }
+
+    float sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x3, x_thread, remaining);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result3[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+    result2[row] = simd_sum(result2[row]);
+    result3[row] = simd_sum(result3[row]);
+  }
+  if (simd_lid == 0) {
+    if (GEGLU) {
+      for (int p = 0; p < 2; p++) {
+        y0[p] = gemma4_geglu_compiled_tape<T>(
+            static_cast<T>(result0[p]), static_cast<T>(result0[p + 2]));
+        y1[p] = gemma4_geglu_compiled_tape<T>(
+            static_cast<T>(result1[p]), static_cast<T>(result1[p + 2]));
+        y2[p] = gemma4_geglu_compiled_tape<T>(
+            static_cast<T>(result2[p]), static_cast<T>(result2[p + 2]));
+        y3[p] = gemma4_geglu_compiled_tape<T>(
+            static_cast<T>(result3[p]), static_cast<T>(result3[p + 2]));
+      }
+    } else {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        y0[row] = static_cast<T>(result0[row]);
+        y1[row] = static_cast<T>(result1[row]);
+        y2[row] = static_cast<T>(result2[row]);
+        y3[row] = static_cast<T>(result3[row]);
+      }
+    }
+  }
+}
+
+template <typename T, const int group_size, const int bits, bool GEGLU = true>
+METAL_FUNC void qmv_affine4_g64_triple_stream_impl_egu_v1(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    const device T* x2,
+    device T* y0,
+    device T* y1,
+    device T* y2,
+    const int in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 8;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x_thread[values_per_thread];
+  thread uint packed[results_per_simdgroup];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+  thread float result2[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  // EGU-V3: this simdgroup's two compact GeGLU output columns and the four
+  // paired16 physical rows that feed them (gate, gate+1, up, up+1).
+  const int egu_sg = int(tid.y) * num_simdgroups + int(simd_gid);
+  const int egu_base_row = 32 * (egu_sg / 8) + ((2 * egu_sg) % 16);
+  const int base_row = GEGLU ? egu_base_row : out_row;
+
+  ws += base_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += base_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += base_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  x2 += simd_lid * values_per_thread;
+  y0 += GEGLU ? (egu_sg * 2) : out_row;
+  y1 += GEGLU ? (egu_sg * 2) : out_row;
+  y2 += GEGLU ? (egu_sg * 2) : out_row;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] =
+          *((const device uint*)(ws + GEMMA4_EGU_ROW(row) * in_vec_size_w));
+      scale_local[row] = scales[GEMMA4_EGU_ROW(row) * in_vec_size_g];
+      bias_local[row] = biases[GEMMA4_EGU_ROW(row) * in_vec_size_g];
+    }
+
+    float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+
+    ws += block_size / 2;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+    x2 += block_size;
+  }
+
+  const int remaining = clamp(
+      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
+      0,
+      values_per_thread);
+  if (remaining > 0) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] =
+          *((const device uint*)(ws + GEMMA4_EGU_ROW(row) * in_vec_size_w));
+      scale_local[row] = scales[GEMMA4_EGU_ROW(row) * in_vec_size_g];
+      bias_local[row] = biases[GEMMA4_EGU_ROW(row) * in_vec_size_g];
+    }
+
+    float sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+    result2[row] = simd_sum(result2[row]);
+  }
+  if (simd_lid == 0) {
+    if (GEGLU) {
+      for (int p = 0; p < 2; p++) {
+        y0[p] = gemma4_geglu_compiled_tape<T>(
+            static_cast<T>(result0[p]), static_cast<T>(result0[p + 2]));
+        y1[p] = gemma4_geglu_compiled_tape<T>(
+            static_cast<T>(result1[p]), static_cast<T>(result1[p + 2]));
+        y2[p] = gemma4_geglu_compiled_tape<T>(
+            static_cast<T>(result2[p]), static_cast<T>(result2[p + 2]));
+      }
+    } else {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        y0[row] = static_cast<T>(result0[row]);
+        y1[row] = static_cast<T>(result1[row]);
+        y2[row] = static_cast<T>(result2[row]);
+      }
+    }
+  }
+}
+
+template <typename T, int group_size, int bits, int KFIX, bool WVEC, bool PF, bool GEGLU = true>
+METAL_FUNC void qmv_affine4_g64_singles_impl_egu_v1(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int in_vec_size_rt,
+    const int out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 8;
+  constexpr int block_bytes = 128;
+  constexpr int qgroup = 64;
+
+  const int in_vec_size = (KFIX > 0) ? KFIX : in_vec_size_rt;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  typedef float U;
+  thread U x_thread[values_per_thread];
+  thread U result[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / qgroup;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+  const int used_out_row = min(out_vec_size - results_per_simdgroup, out_row);
+  if (out_row >= out_vec_size) {
+    return;
+  }
+
+  // EGU-V3: this simdgroup's two compact GeGLU output columns and the four
+  // paired16 physical rows that feed them (gate, gate+1, up, up+1).
+  const int egu_sg = int(tid.y) * num_simdgroups + int(simd_gid);
+  const int egu_base_row = 32 * (egu_sg / 8) + ((2 * egu_sg) % 16);
+  const int base_row = GEGLU ? egu_base_row : used_out_row;
+
+  ws += base_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += base_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += base_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x += tid.x * in_vec_size + simd_lid * values_per_thread;
+  y += GEGLU ? (egu_sg * 2) : (tid.x * out_vec_size + used_out_row);
+
+  const int nblocks = in_vec_size / block_size;
+  const device uint8_t* ws0 = ws;
+
+  thread uint wpf[results_per_simdgroup];
+  if (PF) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      wpf[row] = *((const device uint*)(ws0 + GEMMA4_EGU_ROW(row) * in_vec_size_w));
+    }
+  }
+
+  for (int blk = 0; blk < nblocks; blk++) {
+    U sum = load_vector<T, U, values_per_thread, 4>(x, x_thread);
+
+    thread uint wcur[results_per_simdgroup];
+    if (PF) {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        wcur[row] = wpf[row];
+      }
+      const int nextblk = (blk + 1 < nblocks) ? (blk + 1) : blk;
+      const device uint8_t* wsn = ws0 + nextblk * block_bytes;
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        wpf[row] = *((const device uint*)(wsn + GEMMA4_EGU_ROW(row) * in_vec_size_w));
+      }
+    }
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device T* sl = scales + GEMMA4_EGU_ROW(row) * in_vec_size_g;
+      const device T* bl = biases + GEMMA4_EGU_ROW(row) * in_vec_size_g;
+      U s = sl[0];
+      U b = bl[0];
+      if (PF) {
+        result[row] += qdot_affine4_g64_word(wcur[row], x_thread, s, b, sum);
+      } else if (WVEC) {
+        const uint v = *((const device uint*)(ws + GEMMA4_EGU_ROW(row) * in_vec_size_w));
+        result[row] += qdot_affine4_g64_word(v, x_thread, s, b, sum);
+      } else {
+        auto wl = (const device uint8_t*)(ws + GEMMA4_EGU_ROW(row) * in_vec_size_w);
+        result[row] += qdot<U, values_per_thread, 4>(wl, x_thread, s, b, sum);
+      }
+    }
+
+    ws += block_bytes;
+    scales += block_size / qgroup;
+    biases += block_size / qgroup;
+    x += block_size;
+  }
+
+  const int tail_values = in_vec_size - nblocks * block_size;
+  if (tail_values > 0) {
+    // Affine callers keep K a whole number of quantization groups and the
+    // block loop advances by whole blocks, so the tail is a whole number of
+    // values_per_thread lane packets (down_proj K = 704 leaves 192 = 24).
+    // The dynamic safe tail below is kept verbatim from `qmv_impl` for the
+    // genuinely partial packet no affine caller presents.
+    if (tail_values % values_per_thread != 0) {
+      const int remaining = clamp(
+          static_cast<int>(tail_values - simd_lid * values_per_thread),
+          0,
+          values_per_thread);
+      if (remaining > 0) {
+        U sum = load_vector_safe<T, U, values_per_thread, 4>(
+            x, x_thread, remaining);
+        for (int row = 0; row < results_per_simdgroup; row++) {
+          auto wl = (const device uint8_t*)(ws + GEMMA4_EGU_ROW(row) * in_vec_size_w);
+          const device T* sl = scales + GEMMA4_EGU_ROW(row) * in_vec_size_g;
+          const device T* bl = biases + GEMMA4_EGU_ROW(row) * in_vec_size_g;
+          U s = sl[0];
+          U b = bl[0];
+          result[row] += qdot_safe<U, values_per_thread, 4>(
+              wl, x_thread, s, b, sum, remaining);
+        }
+      }
+    }
+    const uint active_tail_lanes = uint(tail_values / values_per_thread);
+    if (tail_values % values_per_thread == 0 && simd_lid < active_tail_lanes) {
+      U sum = load_vector<T, U, values_per_thread, 4>(x, x_thread);
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        const device T* sl = scales + GEMMA4_EGU_ROW(row) * in_vec_size_g;
+        const device T* bl = biases + GEMMA4_EGU_ROW(row) * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        if (WVEC || PF) {
+          const uint v = *((const device uint*)(ws + GEMMA4_EGU_ROW(row) * in_vec_size_w));
+          result[row] += qdot_affine4_g64_word(v, x_thread, s, b, sum);
+        } else {
+          auto wl = (const device uint8_t*)(ws + GEMMA4_EGU_ROW(row) * in_vec_size_w);
+          result[row] += qdot<U, values_per_thread, 4>(wl, x_thread, s, b, sum);
+        }
+      }
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result[row] = simd_sum(result[row]);
+  }
+  if (simd_lid == 0) {
+    if (GEGLU) {
+      for (int p = 0; p < 2; p++) {
+        y[p] = gemma4_geglu_compiled_tape<T>(
+            static_cast<T>(result[p]), static_cast<T>(result[p + 2]));
+      }
+    } else {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        y[row] = static_cast<T>(result[row]);
+      }
+    }
+  }
+}
+
 template <typename T, int group_size, int bits>
 [[kernel]] void affine_gather_qmv(
     const device uint32_t* w [[buffer(0)]],
@@ -4051,6 +4647,8 @@ template <typename T, int group_size, int bits>
       group_size == 64 && bits == 4 && M == 1 && batch_ndims == 1 &&
       batch_shape[0] == 64 && x_batch_ndims == 1 && w_batch_ndims == 1 &&
       ((in_vec_size == 2816 && out_vec_size == 704) ||
+       (in_vec_size == 2816 && out_vec_size == 1408 &&
+        metal::is_same_v<T, bfloat> && w_shape[0] == 128) ||
        (in_vec_size == 704 && out_vec_size == 2816));
   if (gemma4_pair_geometry) {
     // KERN-DOWN-TILE gate (strip-walk pattern): compile-time flip; ON
@@ -4080,6 +4678,20 @@ template <typename T, int group_size, int bits>
           simd_lid);
       return;
     }
+    // EGU-V3 (decode expert gate|up GeGLU epilogue fusion). At N = 1408 the
+    // right-hand side is the paired16 gate|up plane and this dispatch owns
+    // BOTH projections plus the GeGLU that used to follow them as a separate
+    // compiled elementwise kernel. Each simdgroup accumulates two gate and two
+    // up columns (identical per-column K-chains, dequant order and simd_sum to
+    // the two split N = 704 gathers it replaces), rounds each accumulator to
+    // bfloat16 at exactly the same boundary the split gathers stored at, then
+    // runs `gemma4_geglu_compiled_tape` -- the same typed tape the validated
+    // prefill epilogue uses -- and stores one bfloat16. The compact
+    // [64, 1, 704] activation plane lands in the first physical half of the
+    // ordinary [64, 1, 1408] output allocation.
+    const bool gemma4_gateup_geglu = (out_vec_size == 1408);
+    const uint gemma4_y_stride =
+        gemma4_gateup_geglu ? uint(out_vec_size) / 2u : uint(out_vec_size);
     const uint assignment = tid.z;
     const uint32_t route_word =
         rhs_indices[assignment * (uint)rhs_strides[0]];
@@ -4126,62 +4738,113 @@ template <typename T, int group_size, int bits>
           x + lhs_indices[assignment * (uint)lhs_strides[0]] * x_strides[0];
       const device T* run_x1 = x +
           lhs_indices[(assignment + 1) * (uint)lhs_strides[0]] * x_strides[0];
-      device T* run_y0 = y + assignment * out_vec_size;
-      device T* run_y1 = y + (assignment + 1) * out_vec_size;
+      device T* run_y0 = y + assignment * gemma4_y_stride;
+      device T* run_y1 = y + (assignment + 1) * gemma4_y_stride;
       if (run_len == 2) {
-        qmv_affine4_g64_pair_impl<T, group_size, bits>(
-            run_w,
-            run_scales,
-            run_biases,
-            run_x0,
-            run_x1,
-            run_y0,
-            run_y1,
-            in_vec_size,
-            tid,
-            simd_gid,
-            simd_lid);
+        if (gemma4_gateup_geglu) {
+          qmv_affine4_g64_pair_impl_egu_v1<T, group_size, bits, true>(
+              run_w,
+              run_scales,
+              run_biases,
+              run_x0,
+              run_x1,
+              run_y0,
+              run_y1,
+              in_vec_size,
+              tid,
+              simd_gid,
+              simd_lid);
+        } else {
+          qmv_affine4_g64_pair_impl<T, group_size, bits>(
+              run_w,
+              run_scales,
+              run_biases,
+              run_x0,
+              run_x1,
+              run_y0,
+              run_y1,
+              in_vec_size,
+              tid,
+              simd_gid,
+              simd_lid);
+            }
         return;
       }
       const device T* run_x2 = x +
           lhs_indices[(assignment + 2) * (uint)lhs_strides[0]] * x_strides[0];
-      device T* run_y2 = y + (assignment + 2) * out_vec_size;
+      device T* run_y2 = y + (assignment + 2) * gemma4_y_stride;
       if (run_len == 3) {
-        qmv_affine4_g64_triple_stream_impl<T, group_size, bits>(
+        if (gemma4_gateup_geglu) {
+          qmv_affine4_g64_triple_stream_impl_egu_v1<T, group_size, bits, true>(
+              run_w,
+              run_scales,
+              run_biases,
+              run_x0,
+              run_x1,
+              run_x2,
+              run_y0,
+              run_y1,
+              run_y2,
+              in_vec_size,
+              tid,
+              simd_gid,
+              simd_lid);
+        } else {
+          qmv_affine4_g64_triple_stream_impl<T, group_size, bits>(
+              run_w,
+              run_scales,
+              run_biases,
+              run_x0,
+              run_x1,
+              run_x2,
+              run_y0,
+              run_y1,
+              run_y2,
+              in_vec_size,
+              tid,
+              simd_gid,
+              simd_lid);
+            }
+        return;
+      }
+      const device T* run_x3 = x +
+          lhs_indices[(assignment + 3) * (uint)lhs_strides[0]] * x_strides[0];
+      device T* run_y3 = y + (assignment + 3) * gemma4_y_stride;
+      if (gemma4_gateup_geglu) {
+        qmv_affine4_g64_quad_stream_impl_egu_v1<T, group_size, bits, true>(
             run_w,
             run_scales,
             run_biases,
             run_x0,
             run_x1,
             run_x2,
+            run_x3,
             run_y0,
             run_y1,
             run_y2,
+            run_y3,
             in_vec_size,
             tid,
             simd_gid,
             simd_lid);
-        return;
-      }
-      const device T* run_x3 = x +
-          lhs_indices[(assignment + 3) * (uint)lhs_strides[0]] * x_strides[0];
-      device T* run_y3 = y + (assignment + 3) * out_vec_size;
-      qmv_affine4_g64_quad_stream_impl<T, group_size, bits>(
-          run_w,
-          run_scales,
-          run_biases,
-          run_x0,
-          run_x1,
-          run_x2,
-          run_x3,
-          run_y0,
-          run_y1,
-          run_y2,
-          run_y3,
-          in_vec_size,
-          tid,
-          simd_gid,
-          simd_lid);
+      } else {
+        qmv_affine4_g64_quad_stream_impl<T, group_size, bits>(
+            run_w,
+            run_scales,
+            run_biases,
+            run_x0,
+            run_x1,
+            run_x2,
+            run_x3,
+            run_y0,
+            run_y1,
+            run_y2,
+            run_y3,
+            in_vec_size,
+            tid,
+            simd_gid,
+            simd_lid);
+}
       return;
     }
 
@@ -4193,12 +4856,19 @@ template <typename T, int group_size, int bits>
     const device uint32_t* single_w = w + expert * w_strides[0];
     const device T* single_scales = scales + expert * s_strides[0];
     const device T* single_biases = biases + expert * b_strides[0];
-    device T* single_y = y + assignment * (uint)out_vec_size;
+    device T* single_y = y + assignment * gemma4_y_stride;
     if (in_vec_size == 2816) {
-      qmv_affine4_g64_singles_impl<
-          T, group_size, bits, 2816, true, false>(
-          single_w, single_scales, single_biases, single_x, single_y,
-          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+      if (gemma4_gateup_geglu) {
+        qmv_affine4_g64_singles_impl_egu_v1<
+            T, group_size, bits, 2816, true, false, true>(
+            single_w, single_scales, single_biases, single_x, single_y,
+            in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+      } else {
+        qmv_affine4_g64_singles_impl<
+            T, group_size, bits, 2816, true, false>(
+            single_w, single_scales, single_biases, single_x, single_y,
+            in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+      }
     } else {
       qmv_impl<T, group_size, bits>(
           single_w, single_scales, single_biases, single_x, single_y,

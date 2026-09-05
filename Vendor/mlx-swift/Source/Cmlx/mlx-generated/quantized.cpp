@@ -3643,6 +3643,21 @@ template <
 }
 
 template <typename T, int group_size, int bits>
+// GATHER-ZORDER: the routed-expert gather's threadgroup grid is dispatched with the N tile as
+// the middle dimension and the (row, expert) assignment as the outer one, so two threadgroups that
+// stream the SAME expert's weights -- the leaders of one run, at assignment a and a+2 -- are a whole
+// N-tile row apart in launch order and each pays DRAM for bytes the other just read. Swapping the two
+// grid dimensions puts them adjacent instead, with no change to the work any threadgroup does: the same
+// threadgroups run, on the same tiles, in the same bodies, with the same accumulator order.
+//
+// The host grid and the kernel's index read MUST be flipped together; the value below and the one in
+// backend/metal/quantized.cpp are one switch in two compilation units.
+//
+// Kill switch: set both to 0 and the grid and the index read fold to the incumbent form.
+#ifndef DARKBLOOM_GEMMA4_GATHER_ZORDER
+#define DARKBLOOM_GEMMA4_GATHER_ZORDER 1
+#endif
+
 [[kernel]] void affine_gather_qmv_fast(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -3665,9 +3680,12 @@ template <typename T, int group_size, int bits>
     const constant int* batch_shape [[buffer(18)]],
     const constant int64_t* lhs_strides [[buffer(19)]],
     const constant int64_t* rhs_strides [[buffer(20)]],
-    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tid_lin [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
+  const uint3 tid = (DARKBLOOM_GEMMA4_GATHER_ZORDER != 0)
+      ? uint3(tid_lin.x, tid_lin.z, tid_lin.y)
+      : tid_lin;
   int M = x_shape[x_batch_ndims];
   adjust_matrix_offsets<T>(
       x,
@@ -4043,9 +4061,12 @@ template <typename T, int group_size, int bits>
     const constant int* batch_shape [[buffer(18)]],
     const constant int64_t* lhs_strides [[buffer(19)]],
     const constant int64_t* rhs_strides [[buffer(20)]],
-    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tid_lin [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
+  const uint3 tid = (DARKBLOOM_GEMMA4_GATHER_ZORDER != 0)
+      ? uint3(tid_lin.x, tid_lin.z, tid_lin.y)
+      : tid_lin;
   int M = x_shape[x_batch_ndims];
   const bool gemma4_pair_geometry =
       group_size == 64 && bits == 4 && M == 1 && batch_ndims == 1 &&

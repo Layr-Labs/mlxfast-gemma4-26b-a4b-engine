@@ -3924,6 +3924,103 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 // per-assignment quantized_matmul oracle and vs the untiled arm at
 // K = 704, N = 2816, 64 assignments over 128 experts, M = 8, spans 4 and
 // 2, 3 seeds, NaN-filled outputs (parity-down-tile, 2026-08-28).
+// KERN-GATEUP-TILE: the KERN-DOWN-TILE strip-walk applied to the
+// K = 2816 gate/up gather planes (out_vec_size = 704, 88 y-groups; 88
+// divides by both spans so no ragged tail). Only every span-th y-group
+// survives the election scan; the survivor walks its span consecutive
+// 8-row y-tiles serially through the verbatim pair impl -- or, for a
+// pairless run position, the verbatim stock qmv_impl -- with tid.y
+// rewritten to the tile index. Tile u is served by survivor (u / span) *
+// span at loop step u % span and by no other group, so every output row
+// keeps the IDENTICAL qdot sequence, accumulator, simd_sum and store the
+// untiled arm produces for it: loads-only rescheduling, registers stay
+// pair-sized. Lab-verified uint16-exact vs the untiled arm at K = 2816,
+// N = 704, 64 assignments over 128 experts, spans 2 and 4.
+template <typename T, int group_size, int bits>
+METAL_FUNC void gather_qmv_gemma4_gateup_tile(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    const device uint32_t* lhs_indices,
+    const device uint32_t* rhs_indices,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const uint lhs_stride,
+    const uint rhs_stride,
+    const int64_t x_stride,
+    const int64_t w_stride,
+    const int64_t s_stride,
+    const int64_t b_stride,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int gemma4_gateup_tile_span = 2;
+  if (tid.y % uint(gemma4_gateup_tile_span) != 0u) {
+    return;
+  }
+  const uint assignment = tid.z;
+  const uint32_t expert = rhs_indices[assignment * rhs_stride];
+  uint run_offset = 0;
+  for (uint prior = assignment; prior > 0; --prior) {
+    if (rhs_indices[(prior - 1) * rhs_stride] != expert) {
+      break;
+    }
+    run_offset++;
+  }
+  // Odd positions are produced by the immediately preceding pair leader.
+  if ((run_offset & 1) != 0) {
+    return;
+  }
+  const device uint32_t* tile_w = w + expert * w_stride;
+  const device T* tile_scales = scales + expert * s_stride;
+  const device T* tile_biases = biases + expert * b_stride;
+  const device T* tile_x0 =
+      x + lhs_indices[assignment * lhs_stride] * x_stride;
+  device T* tile_y0 = y + assignment * out_vec_size;
+  const bool has_pair =
+      assignment + 1 < 64 &&
+      rhs_indices[(assignment + 1) * rhs_stride] == expert;
+  if (has_pair) {
+    const device T* tile_x1 =
+        x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
+    device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+    for (int t = 0; t < gemma4_gateup_tile_span; t++) {
+      uint3 tile_tid = tid;
+      tile_tid.y = tid.y + uint(t);
+      qmv_affine4_g64_pair_impl<T, group_size, bits>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_x1,
+          tile_y0,
+          tile_y1,
+          in_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    }
+    return;
+  }
+  for (int t = 0; t < gemma4_gateup_tile_span; t++) {
+    uint3 tile_tid = tid;
+    tile_tid.y = tid.y + uint(t);
+    qmv_impl<T, group_size, bits>(
+        tile_w,
+        tile_scales,
+        tile_biases,
+        tile_x0,
+        tile_y0,
+        in_vec_size,
+        out_vec_size,
+        tile_tid,
+        simd_gid,
+        simd_lid);
+  }
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device uint32_t* w,
@@ -4054,6 +4151,32 @@ template <typename T, int group_size, int bits>
     // here -- the K = 704 down plane takes the y-tile-coarsened arm above.
     // Flip to false to return every plane to the incumbent per-y-group
     // election below; the two arms are bit-identical by construction.
+    // KERN-GATEUP-TILE gate (strip-walk pattern): the K = 2816 gate/up
+    // planes take the y-tile-coarsened arm; the two arms are bit-identical
+    // by construction.
+    constexpr bool gemma4_gateup_tile = true;
+    if (gemma4_gateup_tile && in_vec_size == 2816) {
+      gather_qmv_gemma4_gateup_tile<T, group_size, bits>(
+          w,
+          scales,
+          biases,
+          x,
+          lhs_indices,
+          rhs_indices,
+          y,
+          in_vec_size,
+          out_vec_size,
+          (uint)lhs_strides[0],
+          (uint)rhs_strides[0],
+          x_strides[0],
+          w_strides[0],
+          s_strides[0],
+          b_strides[0],
+          tid,
+          simd_gid,
+          simd_lid);
+      return;
+    }
     constexpr bool gemma4_down_tile = true;
     if (gemma4_down_tile && in_vec_size == 704) {
       gather_qmv_gemma4_down_tile<T, group_size, bits>(

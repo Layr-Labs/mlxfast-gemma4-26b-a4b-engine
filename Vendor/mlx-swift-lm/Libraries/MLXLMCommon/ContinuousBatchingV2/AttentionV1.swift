@@ -165,6 +165,23 @@ enum CBv2AttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// PREFILL-FULLKV-RESERVE. Preserve the capacity a fresh full row's
+    /// ordinary first `update` would allocate. At the ranked B=8/D=512/bf16
+    /// geometry, one copy dispatch materializes sixteen independent output
+    /// allocations (private K and V for every row), each with the ordinary
+    /// prompt reservation and a committed prefix equal to the prompt length.
+    /// Independent allocations are required: a row slice of one batch-wide
+    /// allocation would pin the whole allocation after another row is
+    /// released or copied on write, while `byteCount` could charge only the
+    /// surviving logical slice. Disabling this switch retains the incumbent
+    /// exact-capacity fresh adoption.
+    static let prefillFullKVReserveEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_FULLKV_RESERVE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Join prompt attention blocks directly into the token-major layout that
     /// the following output projection consumes. The returned value remains a
     /// head-major view, so callers keep the same typed interface while their
@@ -887,6 +904,116 @@ enum CBv2AttentionV1 {
         return (cachedKeys, cachedValues)
     }
 
+    /// PREFILL-FULLKV-RESERVE storage materializer for the ranked full-layer
+    /// geometry. The sixteen outputs are deliberately separate MLX outputs,
+    /// not slices of one `[B, ...]` output: each row's K and V allocation can
+    /// then be released or copied on write independently, and its `nbytes`
+    /// remains an exact physical-accounting unit throughout that lifecycle.
+    ///
+    /// Each 64-thread group copies one 512-element bf16 head row as 64
+    /// `uint4`s, or writes zeroes for a reserved tail row. Packed ushort
+    /// source loads also accept row-contiguous bf16 views with two-byte base
+    /// alignment. Pure bit movement; no floating-point arithmetic occurs.
+    private static let privateFullKVReserveKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_fullkv_private_reserve_b8_h2_d512_v3",
+            inputNames: ["keys", "values", "params"],
+            outputNames: [
+                "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+                "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            ],
+            source: """
+                constexpr int H = 2;
+                constexpr int D = 512;
+
+                const int lane = int(thread_position_in_threadgroup.x);
+                const int n = int(params[0]);
+                const int capacity = int(params[1]);
+                const int token = int(threadgroup_position_in_grid.x);
+                const int head = int(threadgroup_position_in_grid.y);
+                const int row_plane = int(threadgroup_position_in_grid.z);
+                const int batch_index = row_plane >> 1;
+                const int plane = row_plane & 1;
+
+                device T* out;
+                if (plane == 0) {
+                    switch (batch_index) {
+                        case 0: out = k0; break;
+                        case 1: out = k1; break;
+                        case 2: out = k2; break;
+                        case 3: out = k3; break;
+                        case 4: out = k4; break;
+                        case 5: out = k5; break;
+                        case 6: out = k6; break;
+                        case 7: out = k7; break;
+                        default: return;
+                    }
+                } else {
+                    switch (batch_index) {
+                        case 0: out = v0; break;
+                        case 1: out = v1; break;
+                        case 2: out = v2; break;
+                        case 3: out = v3; break;
+                        case 4: out = v4; break;
+                        case 5: out = v5; break;
+                        case 6: out = v6; break;
+                        case 7: out = v7; break;
+                        default: return;
+                    }
+                }
+
+                device uint4* dst =
+                    (device uint4*)(out + (size_t(head) * capacity + token) * D);
+                if (token < n) {
+                    const device T* in = plane == 0 ? keys : values;
+                    const size_t input_row =
+                        (size_t(batch_index) * H + head) * n + token;
+                    // Row contiguity does not promise uint4 alignment: an
+                    // arbitrary bf16 subview may start two bytes into its
+                    // allocation. Packed ushort4 has bf16's two-byte
+                    // alignment, and these bitcasts introduce no conversion.
+                    const device packed_ushort4* src =
+                        (const device packed_ushort4*)(in + input_row * D);
+                    const ushort4 lo = ushort4(src[2 * lane]);
+                    const ushort4 hi = ushort4(src[2 * lane + 1]);
+                    dst[lane] = uint4(as_type<uint2>(lo), as_type<uint2>(hi));
+                } else {
+                    dst[lane] = uint4(0u);
+                }
+                """,
+            header: "#include <metal_stdlib>\nusing namespace metal;\n",
+            ensureRowContiguous: true)
+
+    /// Returns eight independently-owned `(K, V)` capacity buffers, or nil
+    /// outside the exact production geometry. Kept internal for focused tests
+    /// that must prove this route rather than accidentally exercising the
+    /// shape-identical ordinary allocation fallback.
+    static func materializePrivateFullKVReserve(
+        keys: MLXArray, values: MLXArray, capacity: Int
+    ) -> [(keys: MLXArray, values: MLXArray)]? {
+        let B = 8
+        let H = 2
+        let D = 512
+        guard keys.dtype == .bfloat16, values.dtype == .bfloat16,
+            keys.ndim == 4, values.ndim == 4,
+            keys.shape == [B, H, keys.dim(2), D],
+            values.shape == keys.shape,
+            keys.dim(2) > 0,
+            capacity > keys.dim(2)
+        else { return nil }
+        let N = keys.dim(2)
+        let maxCapacity = Int(Int32.max) / (B * 2 * H * (D / 8))
+        guard capacity <= maxCapacity else { return nil }
+        let outputs = privateFullKVReserveKernel(
+            [keys, values, MLXArray([UInt32(N), UInt32(capacity)])],
+            template: [("T", keys.dtype)],
+            grid: (capacity * (D / 8), H, B * 2),
+            threadGroup: (D / 8, 1, 1),
+            outputShapes: Array(repeating: [1, H, capacity, D], count: 16),
+            outputDTypes: Array(repeating: DType.bfloat16, count: 16))
+        return (0 ..< B).map { (outputs[$0], outputs[B + $0]) }
+    }
+
     /// PREFILL-FULLKV-ADOPT: the all-rows-fresh batched commit for a packed
     /// `[B > 1, L > 1]` FULL-attention pass. Admitted only when EVERY row is
     /// a strictly fresh `CBv2FullSequenceKV` (`canAdoptFreshChunk`: no
@@ -900,28 +1027,23 @@ enum CBv2AttentionV1 {
     ///
     /// State equivalence with the per-row loop, for every later consumer:
     /// a fresh row's committed prefix is EXACTLY the chunk, and no view this
-    /// class ever hands out reaches past `absoluteOffset`, so the values
-    /// every reader sees are the per-row path's by construction. The per-row
-    /// `keys`/`values` buffers (shape `[1, kvHeads, capacity, headDim]`, the
-    /// committed prefix at `[0, n)`) become the adopted buffers with
-    /// `capacity == n` — identical bytes, identical `absoluteOffset`,
-    /// identical return-view shapes, `cbv2InnerState()` still exactly two
-    /// arrays, `cohortPool` still nil (the LASTQ-D512 / D512 admissions that
-    /// require `cohortPool == nil` keep passing). `capacity == offset` makes
-    /// the adopted storage read-only for its lifetime: plain appends always
-    /// exceed it and grow by `ensureCapacity`'s doubling reallocation into a
-    /// private buffer, and the fused in-place decode writers (WRITE-022 /
-    /// WRITE-016-D512) refuse rows without `dim(2) >= keyLength` headroom —
-    /// on the first decode step such a row fails closed to D512-SDPA, whose
-    /// per-row `update` performs that same growth; from the next step the
-    /// row is back on the fused path with headroom to spare. ATT-008 pool
-    /// formation reads the rows' buffers and concatenates, unchanged.
-    /// `snapshot`/`rollback`/borrow views are counter- and view-exact. The
-    /// only observable difference anywhere is WHEN the first capacity growth
-    /// happens (first append after the prompt, not `initialSlack` appends
-    /// later) and the truthful `byteCount` in between — which the contiguous
-    /// backend bills as `max(byteCount, reservation)`, so admission never
-    /// sees headroom the row does not hold.
+    /// class ever hands out reaches past `absoluteOffset`, so every reader
+    /// sees the per-row path's bytes. With FULLKV-RESERVE enabled at the exact
+    /// B=8/H=2/D=512/bf16 production geometry, all rows must request one
+    /// identical ordinary-allocation capacity. One custom dispatch emits
+    /// sixteen distinct allocations — private K and V for each row — padded
+    /// to that capacity, and every row adopts its own pair with committed
+    /// length `n`. This preserves the prompt reservation, allowing WRITE-022
+    /// / WRITE-016-D512 to use the first decode slot immediately. Because no
+    /// allocation crosses a row or K/V ownership boundary, partial release
+    /// and a later copy-on-write remain exactly represented by `byteCount`.
+    /// Snapshots remain prefix-bounded, `cbv2InnerState()` remains exactly two
+    /// arrays per row, and `cohortPool` remains nil.
+    ///
+    /// Disabling FULLKV-RESERVE, or any geometry/reservation outside that
+    /// materializer's admission, keeps the established exact-capacity adoption
+    /// (`capacity == absoluteOffset == n`) including its first-decode growth;
+    /// it does not disable FULLKV-ADOPT itself.
     ///
     /// Returns nil — BEFORE touching any row — when any row is not a fresh
     /// full row, the rectangles do not match the batch, or the kill switch
@@ -931,29 +1053,65 @@ enum CBv2AttentionV1 {
         rows: [CBv2SequenceKV], keys: MLXArray, values: MLXArray
     ) -> (keys: [MLXArray], values: [MLXArray])? {
         guard prefillFullKVAdoptEnabled,
+            !rows.isEmpty,
             keys.ndim == 4, values.ndim == 4,
             keys.dim(0) == rows.count, values.dim(0) == rows.count,
-            keys.dim(2) == values.dim(2)
+            keys.dim(1) == values.dim(1),
+            keys.dim(2) > 0,
+            keys.dim(2) == values.dim(2),
+            keys.dim(3) == values.dim(3)
         else { return nil }
+        let committedCount = keys.dim(2)
         var fullRows: [CBv2FullSequenceKV] = []
         fullRows.reserveCapacity(rows.count)
         for row in rows {
-            guard let full = row as? CBv2FullSequenceKV, full.canAdoptFreshChunk
+            guard let full = row as? CBv2FullSequenceKV,
+                full.canAdoptFreshChunk,
+                keys.dim(1) == full.kvHeads,
+                keys.dim(3) == full.headDim,
+                full.freshAllocationCapacity(forCommittedCount: committedCount) != nil
             else { return nil }
             fullRows.append(full)
         }
+
+        var privateStorage: [(keys: MLXArray, values: MLXArray)]?
+        if prefillFullKVReserveEnabled {
+            let capacities = fullRows.compactMap {
+                $0.freshAllocationCapacity(forCommittedCount: committedCount)
+            }
+            if capacities.count == fullRows.count,
+                let commonCapacity = capacities.first,
+                commonCapacity > committedCount,
+                capacities.allSatisfy({ $0 == commonCapacity })
+            {
+                privateStorage = materializePrivateFullKVReserve(
+                    keys: keys, values: values, capacity: commonCapacity)
+            }
+        }
+
+        // Materializer refusal is local to this optimization. Unsupported
+        // geometries, unequal reservations and rows with no spare capacity
+        // keep the incumbent exact-capacity adoption, with no extra dispatch.
         var adoptedKeys: [MLXArray] = []
         var adoptedValues: [MLXArray] = []
         adoptedKeys.reserveCapacity(rows.count)
         adoptedValues.reserveCapacity(rows.count)
         for (index, row) in fullRows.enumerated() {
-            let (rowKeys, rowValues) = row.adoptFreshChunk(
-                keys: contiguous(keys[index ..< (index + 1)]),
-                values: contiguous(values[index ..< (index + 1)]))
-            adoptedKeys.append(rowKeys)
-            adoptedValues.append(rowValues)
+            let rowKeys = privateStorage?[index].keys
+                ?? contiguous(keys[index ..< (index + 1)])
+            let rowValues = privateStorage?[index].values
+                ?? contiguous(values[index ..< (index + 1)])
+            let (cachedRowKeys, cachedRowValues) = row.adoptFreshChunk(
+                keys: rowKeys,
+                values: rowValues,
+                committedCount: committedCount)
+            adoptedKeys.append(cachedRowKeys)
+            adoptedValues.append(cachedRowValues)
         }
         CBv2EngageMark.once("prefill-fullkv-adopt")
+        if privateStorage != nil {
+            CBv2EngageMark.once("prefill-fullkv-reserve")
+        }
         return (adoptedKeys, adoptedValues)
     }
 

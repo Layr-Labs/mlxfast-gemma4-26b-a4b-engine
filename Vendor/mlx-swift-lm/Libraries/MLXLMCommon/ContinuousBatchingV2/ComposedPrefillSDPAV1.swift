@@ -676,11 +676,16 @@ enum CBv2PrefillSoftmaxVecV1 {
     /// optimum of the ranked geometry (any value is exact); other lengths
     /// take about 640 threads per threadgroup.
     static func rowsPerThreadgroup(axisSize: Int, threadgroupSize: Int) -> Int {
-        let table: [Int: Int] = [
-            1024: 2, 896: 2, 768: 3, 640: 4, 512: 6, 384: 6, 256: 10, 128: 16,
-        ]
-        if let rows = table[axisSize] { return rows }
-        return max(1, min(640 / threadgroupSize, 1024 / threadgroupSize))
+        switch axisSize {
+        case 1024, 896: return 2
+        case 768: return 3
+        case 640: return 4
+        case 512, 384: return 6
+        case 256: return 10
+        case 128: return 16
+        default:
+            return max(1, min(640 / threadgroupSize, 1024 / threadgroupSize))
+        }
     }
 
     /// Runs the vectorized softmax, or returns nil to keep the caller on

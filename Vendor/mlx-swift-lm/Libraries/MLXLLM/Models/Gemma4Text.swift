@@ -3345,16 +3345,26 @@ private enum Gemma4RouterFinalistsWeightsV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Native rows use independent SIMD groups and no threadgroup scratch.
+    /// Eight groups share a dispatch group; disable to retain one row/group.
+    private static let rowGroups: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_ROUTE_ROWGROUPS8"]
+        else { return 8 }
+        return ["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased()) ? 1 : 8
+    }()
+
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: orderKeysEnabled
-            ? "gemma4_router_finalists32_weights_bf16_max8_sg1_v1"
+            ? "gemma4_router_finalists32_weights_bf16_max8_rowgroups_v2"
             : "gemma4_router_finalists32_weights_bf16_v1",
         inputNames: ["scores", "pes"],
         outputNames: ["indices", "weights"],
         source: orderKeysEnabled ? """
             constexpr int K = 8;
             constexpr int N_READS = 4;
-            const uint row = threadgroup_position_in_grid.x;
+            const uint row = threadgroup_position_in_grid.x * uint(ROW_GROUPS) + simdgroup_index_in_threadgroup;
             const uint lane = thread_index_in_simdgroup;
             uint a = gemma4_finalists_pack(scores[row * 128u + lane], lane);
             uint b = gemma4_finalists_pack(scores[row * 128u + 32u + lane], 32u + lane);
@@ -3604,11 +3614,15 @@ private enum Gemma4RouterFinalistsWeightsV1 {
         let rows = b * l
         CBv2EngageMark.once("router-weights32-prefill")
         if orderKeysEnabled { CBv2EngageMark.once("router-native-max8-sg1-prefill") }
+        // B is admitted as eight, so rows is always divisible by rowGroups.
+        // The fallback kernel uses shared memory and must remain one row/group.
+        var template: [(String, any KernelTemplateArg)] = [("T", scores.dtype)]
+        if orderKeysEnabled { template.append(("ROW_GROUPS", rowGroups)) }
         let outs = kernel(
             [scores, perExpertScale],
-            template: [("T", scores.dtype)],
+            template: template,
             grid: (rows * (orderKeysEnabled ? 32 : 128), 1, 1),
-            threadGroup: (orderKeysEnabled ? 32 : 128, 1, 1),
+            threadGroup: (orderKeysEnabled ? 32 * rowGroups : 128, 1, 1),
             outputShapes: [[b, l, 8], [b, l, 8]],
             outputDTypes: [.uint32, .bfloat16]
         )
@@ -3616,32 +3630,105 @@ private enum Gemma4RouterFinalistsWeightsV1 {
     }
 }
 
-/// GLUE-FOLD (G2): merge the two ADJACENT single-threadgroup route glue
-/// stages of the pinned B=8 decode cell into one dispatch. On the incumbent
-/// chain the router scores feed `gemma4_router_finalists32_stable_bf16_v1`
-/// (top-8 selection, one 128-thread group per row) and its `[8, 8]` output
-/// then feeds the strictly-serial `mlx_lm_route_simd_rank_scatter_m8_u32_n64`
-/// launch inside `SwitchGLU.projectExperts` (the sorted route table). Both are
-/// launch-drain stages on the layer's DEPENDENT chain: the expert gathers
-/// cannot start until the rank scatter has drained. This kernel runs the
-/// exact top-eight selection and the identical rank scatter back to back in
-/// one threadgroup (8 rows x 32 threads on the enabled path; the selected keys
-/// are staged through threadgroup memory instead of a device round trip), so
-/// one whole dispatch and its barrier stage leave the dependent chain in every
-/// MoE layer of every decode step (x30/step).
+/// GLUE-FOLD (G2): fused top-eight selection, routing weights, and stable
+/// assignment ranking for the pinned B=8 decode cell. Selected expert IDs
+/// are staged through threadgroup memory, avoiding a separate device round
+/// trip before the expert gathers consume the sorted route table.
 ///
-/// The score comparator preserves native BF16 ordering and uses expert ID to
-/// break ties. The optional native-max path encodes that same ordering once per
-/// expert, then reads the original selected score for the unchanged weight
-/// arithmetic. The staged `sel` array holds the selected expert IDs, and the
-/// rank-scatter phase retains stable assignment order for equal IDs.
+/// The promoted native selection uses 256 threads (eight independent
+/// 32-lane groups); its original network fallback uses 1024 threads. Both
+/// preserve their existing BF16 selection semantics and weight arithmetic.
+/// Only the integer rank of the 64 staged expert IDs changes here: seven
+/// bit planes count smaller IDs and equal IDs at earlier positions. The
+/// weight calculations, selection, and existing synchronization are unchanged.
 ///
-/// Any geometry outside the pinned decode cell, a disabled finalists stage,
-/// or a disabled fold returns nil so the caller retains its existing fallback.
-/// `DARKBLOOM_GEMMA4_GLUE_FOLD=0` disables the fused producer;
-/// `DARKBLOOM_GEMMA4_ROUTE_ORDER_KEYS=0` retains its original sorting network.
-/// Engage marks: `glue-fold` and, when enabled, `router-native-max8-sg1-decode`.
+/// Unsupported geometry returns nil for the existing caller fallback.
+/// `DARKBLOOM_GEMMA4_GLUE_FOLD=0` disables the fused producer,
+/// `DARKBLOOM_GEMMA4_ROUTE_ORDER_KEYS=0` restores its selection network, and
+/// `DARKBLOOM_GEMMA4_ROUTE_RANK64_BITPLANES=0` restores its all-pairs rank.
+/// Engage marks: `glue-fold` and the existing native-selection mark.
 private enum Gemma4RouteGlueFoldV1 {
+    /// Exact stable rank of 64 seven-bit expert IDs. Both complete SIMD
+    /// groups build identical bit planes, then count smaller keys and equal
+    /// keys at earlier assignment positions. Selection and weights are untouched.
+    private static let rankBitplanesEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTE_RANK64_BITPLANES"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
+    private static let incumbentRank64Source = """
+            // Phase 2 -- the incumbent simd-rank scatter, verbatim, over the
+            // staged 64 keys. Threads 0..63 are exactly the two complete
+            // SIMD groups the standalone kernel launched; `assignment` and
+            // `lane` reproduce its coordinates.
+            if (tid < 64u) {
+                const uint assignment = tid;
+                const uint key = sel[assignment];
+                const uint key_low = sel[lane];
+                const uint key_high = sel[32u + lane];
+                uint rank = 0;
+                #pragma clang loop unroll(full)
+                for (uint source = 0; source < 32; ++source) {
+                    const uint other_low = simd_broadcast(key_low, ushort(source));
+                    rank += (other_low < key)
+                        || (other_low == key && source < assignment);
+                    const uint other_high = simd_broadcast(key_high, ushort(source));
+                    const uint high_assignment = 32u + source;
+                    rank += (other_high < key)
+                        || (other_high == key && high_assignment < assignment);
+                }
+                row_order[rank] = assignment / 8;
+                sorted_keys[rank] = key;
+                inverse_order[assignment] = rank;
+            }
+        """
+
+    private static let bitplaneRank64Source = """
+            // All 64 assignments rank themselves against seven key bit planes.
+            // Both complete SIMD groups construct the same planes independently.
+            if (tid < 64u) {
+                const uint assignment = tid;
+                const uint key = sel[assignment];
+                const uint key_low = sel[lane];
+                const uint key_high = sel[32u + lane];
+                uint equal_low = 0xffffffffu;
+                uint equal_high = 0xffffffffu;
+                uint less_low = 0u;
+                uint less_high = 0u;
+                #pragma clang loop unroll(full)
+                for (int bit = 6; bit >= 0; --bit) {
+                    const uint plane_low = uint(simd_vote::vote_t(
+                        simd_ballot(((key_low >> bit) & 1u) != 0u)));
+                    const uint plane_high = uint(simd_vote::vote_t(
+                        simd_ballot(((key_high >> bit) & 1u) != 0u)));
+                    const uint ones = 0u - ((key >> bit) & 1u);
+                    less_low |= equal_low & ~plane_low & ones;
+                    less_high |= equal_high & ~plane_high & ones;
+                    equal_low &= ~(plane_low ^ ones);
+                    equal_high &= ~(plane_high ^ ones);
+                }
+                const uint prefix = (1u << lane) - 1u;
+                const uint earlier_low = assignment < 32u ? prefix : 0xffffffffu;
+                const uint earlier_high = assignment < 32u ? 0u : prefix;
+                const uint rank = popcount(less_low | (equal_low & earlier_low))
+                    + popcount(less_high | (equal_high & earlier_high));
+                row_order[rank] = assignment / 8u;
+                sorted_keys[rank] = key;
+                inverse_order[assignment] = rank;
+            }
+        """
+
+    private static func rank64Source(_ source: String) -> String {
+        guard rankBitplanesEnabled else { return source }
+        precondition(source.components(separatedBy: incumbentRank64Source).count == 2,
+                     "route rank64 bitplane source anchor drift")
+        return source.replacingOccurrences(
+            of: incumbentRank64Source, with: bitplaneRank64Source)
+    }
+
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_GLUE_FOLD"]
@@ -3664,12 +3751,13 @@ private enum Gemma4RouteGlueFoldV1 {
     }
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: orderKeysEnabled
+        name: (orderKeysEnabled
             ? "gemma4_route_monolithic_top8_e128_k8_bf16_max8_sg1_v1"
-            : "gemma4_route_monolithic_top8_e128_k8_bf16_v2",
+            : "gemma4_route_monolithic_top8_e128_k8_bf16_v2")
+            + (rankBitplanesEnabled ? "_bp1" : ""),
         inputNames: ["scores", "pes"],
         outputNames: ["indices", "weights", "row_order", "sorted_keys", "inverse_order"],
-        source: orderKeysEnabled ? """
+        source: rank64Source(orderKeysEnabled ? """
             const uint tid = thread_position_in_threadgroup.x;
             const uint row = tid / 32u;
             const uint lane = thread_index_in_simdgroup;
@@ -3838,7 +3926,7 @@ private enum Gemma4RouteGlueFoldV1 {
                 sorted_keys[rank] = key;
                 inverse_order[assignment] = rank;
             }
-        """,
+        """),
         header: """
             constant constexpr bool gemma4_route_order_keys = \(orderKeysEnabled ? "true" : "false");
 
@@ -3910,7 +3998,6 @@ private enum Gemma4RouteGlueFoldV1 {
                 inverseOrder: outs[4]))
     }
 }
-
 
 /// GLUE-003: one-per-forward chain box. Layer L's fused tail deposits the
 /// (output, next-layer-input-norm) pair; layer L+1 consumes the norm instead

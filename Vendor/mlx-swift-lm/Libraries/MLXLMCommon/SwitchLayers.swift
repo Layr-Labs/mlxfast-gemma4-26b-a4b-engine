@@ -762,6 +762,25 @@ private let routeCsortPrefillBitsetEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// The target's 128-expert table needs half the generic bitset storage.
+/// Other expert bounds, or a disabled gate, retain all 256 bins.
+private let routeCsortPrefillBitset128Enabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTE_CSORT_PREFILL_BITSET128"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// Large 128-expert tables reduce histogram/scan traffic with 1024-key blocks.
+/// Smaller tables and disabled bitset paths retain the original 256-key kernels.
+private let routeCsortPrefillBlock1024Enabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTE_CSORT_PREFILL_BLOCK1024"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(
+        raw.trimmingCharacters(in: .whitespaces).lowercased())
+}()
+
 /// Keys per histogram/scatter block.
 private let routeCsortPrefillBlock = 256
 /// Counter-table width; must equal ``routeCountingSortKeyBound`` and the 256
@@ -986,20 +1005,21 @@ private let routeCsortPrefillScatterKernel: MLXFast.MLXFastKernel = MLXFast.meta
 /// disjoint position bits; the barrier makes the final words visible before
 /// any rank is read. Tail positions never set a bit or write an output.
 private let routeCsortPrefillBitsetScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "mlx_lm_route_csort128_scatter_bitset_v1",
+    name: "mlx_lm_route_csort128_scatter_bitset_bins_v2",
     inputNames: ["keys", "block_offset"],
     outputNames: ["row_order", "sorted_keys", "inverse_order"],
     source: """
         constexpr uint BLOCK = \(routeCsortPrefillBlock);
         constexpr uint WIDTH = \(routeCsortPrefillWidth);
         constexpr uint WORDS = BLOCK / 32;
+        constexpr uint BITWIDTH = BINS;
         const uint b = threadgroup_position_in_grid.x;
         const uint k = thread_position_in_threadgroup.x;
         const uint n = keys_shape[0];
         const uint idx = b * BLOCK + k;
         // Each bit names one input position; equal keys occupy distinct bits.
-        threadgroup atomic_uint bitsets[WIDTH * WORDS];
-        for (uint i = k; i < WIDTH * WORDS; i += BLOCK) {
+        threadgroup atomic_uint bitsets[BITWIDTH * WORDS];
+        for (uint i = k; i < BITWIDTH * WORDS; i += BLOCK) {
             atomic_store_explicit(&bitsets[i], 0u, memory_order_relaxed);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1007,7 +1027,7 @@ private let routeCsortPrefillBitsetScatterKernel: MLXFast.MLXFastKernel = MLXFas
         const uint word = k / 32u;
         const uint bit = k & 31u;
         if (idx < n) {
-            atomic_fetch_or_explicit(&bitsets[word * WIDTH + key], 1u << bit, memory_order_relaxed);
+            atomic_fetch_or_explicit(&bitsets[word * BITWIDTH + key], 1u << bit, memory_order_relaxed);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (idx < n) {
@@ -1015,9 +1035,84 @@ private let routeCsortPrefillBitsetScatterKernel: MLXFast.MLXFastKernel = MLXFas
             // The current-word mask is valid even when bit is zero or 31.
             uint rank = 0u;
             for (uint w = 0; w < word; ++w) {
-                rank += popcount(atomic_load_explicit(&bitsets[w * WIDTH + key], memory_order_relaxed));
+                rank += popcount(atomic_load_explicit(&bitsets[w * BITWIDTH + key], memory_order_relaxed));
             }
-            rank += popcount(atomic_load_explicit(&bitsets[word * WIDTH + key], memory_order_relaxed)
+            rank += popcount(atomic_load_explicit(&bitsets[word * BITWIDTH + key], memory_order_relaxed)
+                & ((1u << bit) - 1u));
+            const uint pos = block_offset[b * WIDTH + key] + rank;
+            row_order[pos] = idx / uint(M);
+            sorted_keys[pos] = key;
+            inverse_order[idx] = pos;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// Same integer histogram and bitset scatter over wider blocks. The histogram
+/// still writes all 256 bins; only its first 256 lanes initialize/publish bins.
+/// The bitset uses 128 bins x 32 position words (16 KiB). Tail lanes never
+/// set bits or write outputs. Existing scan kernels consume the new block count.
+private let routeCsortPrefillHist1024Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128_hist_block1024_v1",
+    inputNames: ["keys"],
+    outputNames: ["block_hist"],
+    source: """
+        constexpr uint BLOCK = 1024;
+        constexpr uint WIDTH = \(routeCsortPrefillWidth);
+        uint b = threadgroup_position_in_grid.x;
+        uint k = thread_position_in_threadgroup.x;
+        uint n = keys_shape[0];
+        threadgroup atomic_uint tg_count[WIDTH];
+        if (k < WIDTH) atomic_store_explicit(&tg_count[k], 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint idx = b * BLOCK + k;
+        if (idx < n) {
+            atomic_fetch_add_explicit(
+                &tg_count[keys[idx]], 1u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Integer adds commute, so the table is identical for every
+        // interleaving the hardware picks.
+        if (k < WIDTH) block_hist[b * WIDTH + k] =
+            atomic_load_explicit(&tg_count[k], memory_order_relaxed);
+        """,
+    ensureRowContiguous: true
+)
+
+private let routeCsortPrefillBitset1024ScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128_scatter_bitset_block1024_v1",
+    inputNames: ["keys", "block_offset"],
+    outputNames: ["row_order", "sorted_keys", "inverse_order"],
+    source: """
+        constexpr uint BLOCK = 1024;
+        constexpr uint WIDTH = \(routeCsortPrefillWidth);
+        constexpr uint WORDS = BLOCK / 32;
+        constexpr uint BITWIDTH = BINS;
+        const uint b = threadgroup_position_in_grid.x;
+        const uint k = thread_position_in_threadgroup.x;
+        const uint n = keys_shape[0];
+        const uint idx = b * BLOCK + k;
+        // Each bit names one input position; equal keys occupy distinct bits.
+        threadgroup atomic_uint bitsets[BITWIDTH * WORDS];
+        for (uint i = k; i < BITWIDTH * WORDS; i += BLOCK) {
+            atomic_store_explicit(&bitsets[i], 0u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint key = idx < n ? keys[idx] : 0u;
+        const uint word = k / 32u;
+        const uint bit = k & 31u;
+        if (idx < n) {
+            atomic_fetch_or_explicit(&bitsets[word * BITWIDTH + key], 1u << bit, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (idx < n) {
+            // Count strictly earlier positions, preserving stable tie order.
+            // The current-word mask is valid even when bit is zero or 31.
+            uint rank = 0u;
+            for (uint w = 0; w < word; ++w) {
+                rank += popcount(atomic_load_explicit(&bitsets[w * BITWIDTH + key], memory_order_relaxed));
+            }
+            rank += popcount(atomic_load_explicit(&bitsets[word * BITWIDTH + key], memory_order_relaxed)
                 & ((1u << bit) - 1u));
             const uint pos = block_offset[b * WIDTH + key] + rank;
             row_order[pos] = idx / uint(M);
@@ -1045,12 +1140,19 @@ private func routeCountingSortPrefill(
         n <= routeCsortPrefillMaxKeys
     else { return nil }
     CBv2EngageMark.once("route-csort-prefill")
-    let blocks = (n + routeCsortPrefillBlock - 1) / routeCsortPrefillBlock
+    let useWideBlock = routeCsortPrefillBlock1024Enabled
+        && routeCsortPrefillBitsetEnabled && routeCsortPrefillBitset128Enabled
+        && numExperts == 128 && n >= 32768
+    let block = useWideBlock ? 1024 : routeCsortPrefillBlock
+    let blocks = (n + block - 1) / block
     let width = routeCsortPrefillWidth
-    let hist = routeCsortPrefillHistKernel(
+    let histKernel = useWideBlock
+        ? routeCsortPrefillHist1024Kernel : routeCsortPrefillHistKernel
+    if useWideBlock { CBv2EngageMark.once("route-csort-prefill-block1024") }
+    let hist = histKernel(
         [indices],
-        grid: (blocks * width, 1, 1),
-        threadGroup: (width, 1, 1),
+        grid: (blocks * block, 1, 1),
+        threadGroup: (block, 1, 1),
         outputShapes: [[blocks, width]],
         outputDTypes: [.uint32]
     )[0]
@@ -1093,17 +1195,21 @@ private func routeCountingSortPrefill(
             outputDTypes: [.uint32]
         )[0]
     }
-    // Large route tables amortize the 8 KiB bitset initialization. Smaller
+    // Large route tables amortize the 4/8 KiB bitset initialization. Smaller
     // tables retain the compact incumbent scratch and rank loop.
     let useBitset = routeCsortPrefillBitsetEnabled && n >= 4096
-    let scatter = useBitset
-        ? routeCsortPrefillBitsetScatterKernel : routeCsortPrefillScatterKernel
+    let scatter = useWideBlock ? routeCsortPrefillBitset1024ScatterKernel
+        : (useBitset ? routeCsortPrefillBitsetScatterKernel : routeCsortPrefillScatterKernel)
     if useBitset { CBv2EngageMark.once("route-csort-prefill-bitset") }
+    let bitsetBins = routeCsortPrefillBitset128Enabled && numExperts == 128
+        ? 128 : width
+    let scatterTemplate: [(String, any KernelTemplateArg)] = useBitset
+        ? [("M", m), ("BINS", bitsetBins)] : [("M", m)]
     let outputs = scatter(
         [indices, offsets],
-        template: [("M", m)],
-        grid: (blocks * width, 1, 1),
-        threadGroup: (width, 1, 1),
+        template: scatterTemplate,
+        grid: (blocks * block, 1, 1),
+        threadGroup: (block, 1, 1),
         outputShapes: [[n], [n], [n]],
         outputDTypes: [.uint32, .uint32, .uint32]
     )

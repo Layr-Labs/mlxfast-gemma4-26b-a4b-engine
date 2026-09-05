@@ -887,6 +887,180 @@ enum CBv2AttentionV1 {
         return (cachedKeys, cachedValues)
     }
 
+    /// PREFILL-FULLKV-RESERVE storage materializer for the ranked full-layer
+    /// geometry. The sixteen outputs are deliberately separate MLX outputs,
+    /// not slices of one `[B, ...]` output: each row's K and V allocation can
+    /// then be released or copied on write independently, and its `nbytes`
+    /// remains an exact physical-accounting unit throughout that lifecycle.
+    ///
+    /// Each 64-thread group copies one 512-element bf16 head row as 64
+    /// `uint4`s, or writes zeroes for a reserved tail row. Packed ushort
+    /// source loads accept two-byte base alignment. Runtime input strides
+    /// avoid a prerequisite contiguous copy; an unusual innermost stride
+    /// uses scalar bit gathers. No floating-point arithmetic occurs.
+    private static let privateFullKVReserveKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_lastquery_private_reserve_b8_h2_d512_strided_v1",
+            inputNames: ["keys", "values", "params"],
+            outputNames: [
+                "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+                "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            ],
+            source: """
+                constexpr int H = 2;
+                constexpr int D = 512;
+
+                const int lane = int(thread_position_in_threadgroup.x);
+                const int n = int(params[0]);
+                const int capacity = int(params[1]);
+                const int token = int(threadgroup_position_in_grid.x);
+                const int head = int(threadgroup_position_in_grid.y);
+                const int row_plane = int(threadgroup_position_in_grid.z);
+                const int batch_index = row_plane >> 1;
+                const int plane = row_plane & 1;
+
+                device T* out;
+                if (plane == 0) {
+                    switch (batch_index) {
+                        case 0: out = k0; break;
+                        case 1: out = k1; break;
+                        case 2: out = k2; break;
+                        case 3: out = k3; break;
+                        case 4: out = k4; break;
+                        case 5: out = k5; break;
+                        case 6: out = k6; break;
+                        case 7: out = k7; break;
+                        default: return;
+                    }
+                } else {
+                    switch (batch_index) {
+                        case 0: out = v0; break;
+                        case 1: out = v1; break;
+                        case 2: out = v2; break;
+                        case 3: out = v3; break;
+                        case 4: out = v4; break;
+                        case 5: out = v5; break;
+                        case 6: out = v6; break;
+                        case 7: out = v7; break;
+                        default: return;
+                    }
+                }
+
+                device uint4* dst =
+                    (device uint4*)(out + (size_t(head) * capacity + token) * D);
+                if (token < n) {
+                    const device T* in = plane == 0 ? keys : values;
+                    // MLX supplies evaluated input strides at dispatch,
+                    // rather than guessing layout from a lazy host array.
+                    const constant int64_t* strides =
+                        plane == 0 ? keys_strides : values_strides;
+                    const int64_t input_offset =
+                        int64_t(batch_index) * strides[0]
+                        + int64_t(head) * strides[1]
+                        + int64_t(token) * strides[2];
+                    ushort4 lo, hi;
+                    if (strides[3] == 1) {
+                        // Packed vectors retain bf16's two-byte alignment.
+                        const device packed_ushort4* src =
+                            (const device packed_ushort4*)(in + input_offset);
+                        lo = ushort4(src[2 * lane]);
+                        hi = ushort4(src[2 * lane + 1]);
+                    } else {
+                        const device ushort* src = (const device ushort*)in;
+                        for (int i = 0; i < 4; ++i) {
+                            lo[i] = src[input_offset + int64_t(8 * lane + i) * strides[3]];
+                            hi[i] = src[input_offset + int64_t(8 * lane + i + 4) * strides[3]];
+                        }
+                    }
+                    dst[lane] = uint4(as_type<uint2>(lo), as_type<uint2>(hi));
+                } else {
+                    dst[lane] = uint4(0u);
+                }
+                """,
+            header: "#include <metal_stdlib>\nusing namespace metal;\n",
+            ensureRowContiguous: false)
+
+    /// Returns eight independently-owned `(K, V)` capacity buffers, or nil
+    /// outside the exact production geometry. Kept internal for focused tests
+    /// that must prove this route rather than accidentally exercising the
+    /// shape-identical ordinary allocation fallback.
+    static func materializePrivateFullKVReserve(
+        keys: MLXArray, values: MLXArray, capacity: Int
+    ) -> [(keys: MLXArray, values: MLXArray)]? {
+        let B = 8
+        let H = 2
+        let D = 512
+        guard keys.dtype == .bfloat16, values.dtype == .bfloat16,
+            keys.ndim == 4, values.ndim == 4,
+            keys.shape == [B, H, keys.dim(2), D],
+            values.shape == keys.shape,
+            keys.dim(2) > 0,
+            capacity > keys.dim(2)
+        else { return nil }
+        let N = keys.dim(2)
+        let maxCapacity = Int(Int32.max) / (B * 2 * H * (D / 8))
+        guard capacity <= maxCapacity else { return nil }
+        let outputs = privateFullKVReserveKernel(
+            [keys, values, MLXArray([UInt32(N), UInt32(capacity)])],
+            template: [("T", keys.dtype)],
+            grid: (capacity * (D / 8), H, B * 2),
+            threadGroup: (D / 8, 1, 1),
+            outputShapes: Array(repeating: [1, H, capacity, D], count: 16),
+            outputDTypes: Array(repeating: DType.bfloat16, count: 16))
+        return (0 ..< B).map { (outputs[$0], outputs[B + $0]) }
+    }
+
+    /// Last-query prefill already reserves capacity through ordinary update.
+    /// Batch only that copy, without changing ordinary fresh-chunk adoption.
+    static let lastQueryFullKVCopyEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_LASTQUERY_FULLKV_COPY"] else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static func adoptFreshLastQueryChunks(
+        rows: [CBv2SequenceKV], keys: MLXArray, values: MLXArray
+    ) -> (keys: [MLXArray], values: [MLXArray])? {
+        guard lastQueryFullKVCopyEnabled, rows.count == 8,
+            keys.ndim == 4, values.ndim == 4,
+            keys.shape == [8, 2, keys.dim(2), 512], values.shape == keys.shape,
+            keys.dtype == .bfloat16, values.dtype == .bfloat16,
+            keys.dim(2) > 1
+        else { return nil }
+        let count = keys.dim(2)
+        var fullRows: [CBv2FullSequenceKV] = []
+        fullRows.reserveCapacity(8)
+        var capacity: Int?
+        for row in rows {
+            guard let full = row as? CBv2FullSequenceKV,
+                full.kvHeads == 2, full.headDim == 512,
+                let rowCapacity = full.freshPrivateReservationCapacity(forCommittedCount: count),
+                rowCapacity > count,
+                capacity == nil || capacity == rowCapacity
+            else { return nil }
+            capacity = rowCapacity
+            fullRows.append(full)
+        }
+        guard let capacity,
+            let storage = materializePrivateFullKVReserve(
+                keys: keys, values: values, capacity: capacity)
+        else { return nil }
+        // Every refusal precedes the first state mutation. Each output has
+        // independent ownership; no slice pins a sibling's reserved buffer.
+        var cachedKeys: [MLXArray] = [], cachedValues: [MLXArray] = []
+        cachedKeys.reserveCapacity(8)
+        cachedValues.reserveCapacity(8)
+        for (index, row) in fullRows.enumerated() {
+            let pair = row.adoptFreshPrivateReservation(
+                keys: storage[index].keys, values: storage[index].values,
+                committedCount: count)
+            cachedKeys.append(pair.0)
+            cachedValues.append(pair.1)
+        }
+        CBv2EngageMark.once("lastquery-private-copy")
+        return (cachedKeys, cachedValues)
+    }
+
     /// PREFILL-FULLKV-ADOPT: the all-rows-fresh batched commit for a packed
     /// `[B > 1, L > 1]` FULL-attention pass. Admitted only when EVERY row is
     /// a strictly fresh `CBv2FullSequenceKV` (`canAdoptFreshChunk`: no
@@ -1175,18 +1349,22 @@ enum CBv2AttentionV1 {
 
         let effectiveSinks = dispatchSinks(
             sinks, kind: kind, queries: queries, softcap: softcap)
-        // Commit every row's FULL chunk first — the byte-identical `update`
-        // calls, in the same row order, the per-row loop below has always
-        // made — so every row's cache ends in exactly the state it reached
-        // before this function existed (absoluteOffset advanced by the
-        // chunk length). Only the attends may differ, below.
+        // Keep ordinary update's reserved capacity and committed bytes.
+        // Only fresh eligible last-query rows use the batched private copy;
+        // any refusal retains the original row-update path untouched.
         var committed: [(keys: MLXArray, values: MLXArray)] = []
         committed.reserveCapacity(batch)
-        for (index, row) in rows.enumerated() {
-            let (cachedKeys, cachedValues) = row.update(
-                keys: keys[index ..< index + 1],
-                values: values[index ..< index + 1])
-            committed.append((cachedKeys, cachedValues))
+        if let adopted = adoptFreshLastQueryChunks(rows: rows, keys: keys, values: values) {
+            for index in rows.indices {
+                committed.append((adopted.keys[index], adopted.values[index]))
+            }
+        } else {
+            for (index, row) in rows.enumerated() {
+                let (cachedKeys, cachedValues) = row.update(
+                    keys: keys[index ..< index + 1],
+                    values: values[index ..< index + 1])
+                committed.append((cachedKeys, cachedValues))
+            }
         }
         // LASTQ-D512: when every row is a private `CBv2FullSequenceKV` in
         // lockstep at the committed length (the scored 8×1024 prompt prefill:

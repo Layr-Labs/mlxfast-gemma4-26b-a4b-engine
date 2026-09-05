@@ -311,6 +311,33 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         cohortPool == nil && keys == nil && values == nil && absoluteOffset == 0
     }
 
+    /// Side-effect-free query for the capacity ordinary fresh update uses.
+    func freshPrivateReservationCapacity(forCommittedCount count: Int) -> Int? {
+        guard canAdoptFreshChunk, count > 0, count <= maxLength else { return nil }
+        return min(maxLength, max(capacity, count))
+    }
+
+    /// Adopt independently allocated prefix-plus-zero-tail storage with the
+    /// exact ordinary fresh-update capacity. The original exact-chunk API is
+    /// unchanged; only the last-query batched copy calls this entry point.
+    func adoptFreshPrivateReservation(
+        keys newKeys: MLXArray, values newValues: MLXArray, committedCount: Int
+    ) -> (MLXArray, MLXArray) {
+        precondition(canAdoptFreshChunk)
+        precondition(newKeys.ndim == 4 && newValues.shape == newKeys.shape)
+        precondition(newKeys.dim(0) == 1 && newKeys.dim(1) == kvHeads
+            && newKeys.dim(3) == headDim)
+        precondition(newKeys.dtype == .bfloat16 && newValues.dtype == .bfloat16)
+        precondition(newKeys.dim(2) > committedCount
+            && newKeys.dim(2) == freshPrivateReservationCapacity(forCommittedCount: committedCount))
+        keys = newKeys
+        values = newValues
+        capacity = newKeys.dim(2)
+        absoluteOffset = committedCount
+        return (keys![.ellipsis, ..<absoluteOffset, 0...],
+                values![.ellipsis, ..<absoluteOffset, 0...])
+    }
+
     /// PREFILL-FULLKV-ADOPT: a strictly fresh row's first update, restructured
     /// to ADOPT the chunk tensor as the K/V storage instead of allocating a
     /// zero-filled capacity buffer and copying the chunk into it (the full-KV

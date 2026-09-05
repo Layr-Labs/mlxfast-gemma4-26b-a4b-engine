@@ -51,6 +51,12 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
         guard model is any CBv2LanguageModelDecodeOutputCoversCacheMutations else {
             return nil
         }
+        return compactCacheEvaluationRoots(outputRoot: forwardOutput, caches: caches)
+    }
+
+    private func compactCacheEvaluationRoots(
+        outputRoot: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> [MLXArray]? {
         let contiguous = caches.compactMap { $0 as? CBv2LayerCache }
         guard !contiguous.isEmpty,
             contiguous.count == caches.count,
@@ -70,7 +76,7 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
             })
         else { return nil }
 
-        var roots = [forwardOutput, offsets]
+        var roots = [outputRoot, offsets]
         roots.reserveCapacity(2 + contiguous.count)
         roots.append(contentsOf: contiguous.map(\.decodeRingWriteFenceEvaluationRoot))
         if cbv2CompactDecodeRootMarksArmed {
@@ -218,6 +224,15 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPSteppableModel {
 /// top-1, and `admitsArgmaxDecode` gates every call, so a non-conforming model
 /// keeps the full-logits `forward` contract untouched.
 extension CBv2SteppableLanguageModelAdapter: CBv2ArgmaxDecodeSteppableModel {
+
+    public func compactArgmaxDecodeEvaluationRoots(
+        sampledTokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> [MLXArray]? {
+        guard (model as? CBv2ArgmaxDecodeForwardable)?
+            .cbv2ArgmaxOutputCoversCacheMutations == true
+        else { return nil }
+        return compactCacheEvaluationRoots(outputRoot: sampledTokens, caches: caches)
+    }
 
     public func admitsArgmaxDecode(tokens: MLXArray) -> Bool {
         (model as? CBv2ArgmaxDecodeForwardable)?.cbv2AdmitsArgmaxDecode(tokens) ?? false

@@ -26,10 +26,16 @@ import MLX
 /// head after the trunk must still return the argmax of the logits it would
 /// otherwise have produced.
 public protocol CBv2ArgmaxDecodeForwardable: AnyObject {
+    /// True only if every argmax return path transitively consumes all decode K/V mutations.
+    var cbv2ArgmaxOutputCoversCacheMutations: Bool { get }
     func cbv2AdmitsArgmaxDecode(_ tokens: MLXArray) -> Bool
     /// `[B]` int32 token ids --- the same array `argMax(logits, axis: -1)
     /// .asType(.int32)` would have produced for this step.
     func cbv2DecodeArgmax(_ tokens: MLXArray, caches: [KVCache]) -> MLXArray
+}
+
+extension CBv2ArgmaxDecodeForwardable {
+    public var cbv2ArgmaxOutputCoversCacheMutations: Bool { false }
 }
 
 /// Steppable-model refinement of the above, answered at runtime by the
@@ -37,6 +43,18 @@ public protocol CBv2ArgmaxDecodeForwardable: AnyObject {
 public protocol CBv2ArgmaxDecodeSteppableModel: CBv2SteppableModel {
     func admitsArgmaxDecode(tokens: MLXArray) -> Bool
     func decodeArgmax(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray
+    /// Complete roots including `sampledTokens`, or nil to retain full cache roots.
+    func compactArgmaxDecodeEvaluationRoots(
+        sampledTokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> [MLXArray]?
+}
+
+extension CBv2ArgmaxDecodeSteppableModel {
+    public func compactArgmaxDecodeEvaluationRoots(
+        sampledTokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> [MLXArray]? {
+        nil
+    }
 }
 
 /// Samplers that can hand a whole step to a fused greedy head.

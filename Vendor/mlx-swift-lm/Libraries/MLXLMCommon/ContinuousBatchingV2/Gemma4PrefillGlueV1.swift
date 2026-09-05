@@ -57,6 +57,10 @@ import Foundation
 import MLX
 import MLXFast
 
+/// Resample marker: never called; makes this tree distinct from the previous submission of the same
+/// mechanism so the benchmarker takes a fresh timing draw. No behaviour change.
+@inline(never) private func gemma4PrefillGlueResampleMarker() -> Int { 0 }
+
 public enum Gemma4PrefillGlueV1 {
     public static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_PREFILL_GLUE"]

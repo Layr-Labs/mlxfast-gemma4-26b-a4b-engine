@@ -6908,6 +6908,14 @@ public class Gemma4TextModelInner: Module {
         // GLUE-003: one chain box per forward; layer L's fused tail hands
         // layer L+1 its input norm through it.
         let glueChain = Gemma4GlueChainBox()
+        // HOST-µ (loop iteration 4): loop-invariant prefill predicates,
+        // hoisted out of the per-layer loop. schedulePrefill is a forward
+        // argument, inputLength is bound once above, and isCBv2 is bound
+        // once below -- all fixed for the whole forward, so both values are
+        // identical on every layer iteration.
+        let hoistedIsExpertPrefill = schedulePrefill
+        let hoistedPrefillChunkPrefix =
+            schedulePrefill && isCBv2 && inputLength > 1
         for (idx, layer) in layers.enumerated() {
             let prevIdx = previousKvs[idx]
             let sharedKV = intermediates[prevIdx].kv
@@ -6931,13 +6939,19 @@ public class Gemma4TextModelInner: Module {
             let outputTailRows: Int? =
                 isFinalPromptLayer && gemma4PrefillTailRows > 0
                 ? min(gemma4PrefillTailRows, h.dim(1)) : nil
-            let useLastQueryPrefill = gemma4UseLastQueryPrefill(
-                config,
-                layerIdx: idx,
-                batchSize: h.dim(0),
-                sequenceLength: h.dim(1),
-                outputTailRows: outputTailRows,
-                hasCapableCache: fullCache[idx] is any CBv2LastQueryPrefillLayerCache)
+            // HOST-µ: outputTailRows == 1 is a conjunct of the helper
+            // below, so a false here makes the call's result false for every
+            // value of its other arguments; the two dim queries and the
+            // dynamic cache-conformance check are then skipped. The full
+            // call (with identical arguments) is kept on the eligible arm.
+            let useLastQueryPrefill = outputTailRows == 1
+                && gemma4UseLastQueryPrefill(
+                    config,
+                    layerIdx: idx,
+                    batchSize: h.dim(0),
+                    sequenceLength: h.dim(1),
+                    outputTailRows: outputTailRows,
+                    hasCapableCache: fullCache[idx] is any CBv2LastQueryPrefillLayerCache)
             let (out, kvPair, positionOffset) = layer(
                 h,
                 mask: mask,
@@ -6952,8 +6966,10 @@ public class Gemma4TextModelInner: Module {
                 // Ordinary direct forwards keep the established reduction;
                 // enabling it there regressed the raw-prefill control without
                 // affecting the serving path selected by the benchmark.
-                isExpertPrefill: gemma4AllowsWeightedExpertUnsort(
-                    schedulePrefill: schedulePrefill),
+                // HOST-µ: gemma4AllowsWeightedExpertUnsort returns its
+                // schedulePrefill argument unchanged; the hoisted value is
+                // therefore identical on every layer iteration.
+                isExpertPrefill: hoistedIsExpertPrefill,
                 glueChain: glueChain,
                 nextInputLayernormWeight: idx + 1 < layers.count
                     ? layers[idx + 1].inputLayernorm.weight : nil,
@@ -6985,14 +7001,20 @@ public class Gemma4TextModelInner: Module {
             }
 
             let layerNumber = idx + 1
+            // HOST-µ: gemma4ShouldSubmitPrefillChunkEval conjoins its first
+            // three inputs, so a false prefix forces false for every
+            // interval; the interval helper is then evaluated only where it
+            // can matter. Interval 0 keeps the predicate false, matching
+            // every value the helper could return on the skipped arm.
             if gemma4ShouldSubmitPrefillChunkEval(
                 schedulePrefill: schedulePrefill,
                 isCBv2: isCBv2,
                 inputLength: inputLength,
                 layerNumber: layerNumber,
-                interval: gemma4EffectivePrefillChunkEvalLayers(
-                    configured: gemma4PrefillChunkEvalLayers,
-                    inputLength: inputLength))
+                interval: hoistedPrefillChunkPrefix
+                    ? gemma4EffectivePrefillChunkEvalLayers(
+                        configured: gemma4PrefillChunkEvalLayers,
+                        inputLength: inputLength) : 0)
             {
                 asyncEval(h)
                 CBv2StepProfiler.recordEvent("v2.gemma4.prefill.chunk_eval")

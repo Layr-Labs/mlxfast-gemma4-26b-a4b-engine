@@ -2,6 +2,8 @@ import CoreFoundation
 import Foundation
 import MLXFastCore
 
+/// The layer-type spelling below is fixed by the model's own configuration
+/// document and is read, never derived.
 /// Attention kind of one decoder layer, as spelled in `layer_types`.
 public enum Gemma4A4BLayerType: String, Equatable, Sendable {
     case sliding = "sliding_attention"

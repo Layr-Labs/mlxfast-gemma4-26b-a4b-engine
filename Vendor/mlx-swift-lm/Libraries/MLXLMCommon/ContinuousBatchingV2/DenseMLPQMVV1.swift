@@ -886,11 +886,52 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
               for (int gi = 0; gi < nGroups; ++gi) {
                 const int g = g0 + gi;
             """)
+        // DMLP-GATEUP-CARRY2-5F4B: the two-deep weight-operand register carry
+        // already resident on the dense down plane (DMLP-DOWN-CARRY2-021,
+        // this file), transplanted verbatim onto the gate|up plane. Every
+        // address is a function of the group index alone, the loop count is a
+        // compile-time constant here, and `g` is monotone, so the hand-off is
+        // register renaming: one group's codes/scale/bias stay resident while
+        // the next group's are read an iteration ahead of their use. The
+        // look-aheads are min-clamped to the last valid group, so the final
+        // one re-reads a group already read and discards it. The consuming
+        // statements keep their position, so the emitted arithmetic — and the
+        // floating-point contraction the close depends on — is word for word
+        // what the incumbent emits.
+        replaceOnce(
+            """
+              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+            """,
+            with: """
+              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+              uint4 wv_next = *((const device uint4*)(wrow + 64 * g0));
+              uint4 wv_next2 =
+                  *((const device uint4*)(wrow + 64 * min(g0 + 1, G - 1)));
+              T s_next = srow[g0];
+              T b_next = brow[g0];
+            """)
+        replaceOnce(
+            """
+                const uint4 wv = *((const device uint4*)(wrow + 64 * g));
+                const float s = float(srow[g]);
+                const float b = float(brow[g]);
+            """,
+            with: """
+                const uint4 wv = wv_next;
+                const float s = float(s_next);
+                const float b = float(b_next);
+                const int g_next = min(g + 1, G - 1);
+                wv_next = wv_next2;
+                wv_next2 = *((const device uint4*)(wrow + 64 * min(g + 2, G - 1)));
+                s_next = srow[g_next];
+                b_next = brow[g_next];
+            """)
         return result
     }()
 
     private static let mma8GateUpStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_k2816_u2_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_k2816_carry2_u2_v1",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

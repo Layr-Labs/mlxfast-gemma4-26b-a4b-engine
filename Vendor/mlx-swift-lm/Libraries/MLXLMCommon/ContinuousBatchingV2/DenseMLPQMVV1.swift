@@ -172,6 +172,35 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Build the 8-bit code's float value from the half bit pattern
+    /// `0x6400 | code` minus `1024.0h` instead of converting the integer.
+    /// `0x6400` is `1024.0h` with a zero mantissa and the binade [1024, 2048)
+    /// has a unit ULP in half, so every code 0...255 round-trips exactly.
+    /// `DARKBLOOM_GEMMA4_MLP_MMA8_HALF_DEQUANT=0` restores the incumbent macro
+    /// and the incumbent kernel names byte for byte.
+    public static let halfDequantEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_MMA8_HALF_DEQUANT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// A changed kernel body must take a changed name: MLX caches the compiled
+    /// library by name and would otherwise serve the incumbent binary.
+    private static let halfDequantKey: String = halfDequantEnabled ? "_hd1" : ""
+
+    private static func applyHalfDequant(to header: String) -> String {
+        guard halfDequantEnabled else { return header }
+        let old =
+            "#define MMA8_STEP8(BB, WLO, WHI, SH) A.thread_elements()[0] = float(extract_bits(wv.WLO, (SH), 8)); A.thread_elements()[1] = float(extract_bits(wv.WHI, (SH), 8)); simdgroup_multiply_accumulate(C, A, BB, C);"
+        let new =
+            "#define MMA8_STEP8(BB, WLO, WHI, SH) A.thread_elements()[0] = float(as_type<half>(ushort(0x6400u | extract_bits(wv.WLO, (SH), 8))) - 1024.0h); A.thread_elements()[1] = float(as_type<half>(ushort(0x6400u | extract_bits(wv.WHI, (SH), 8))) - 1024.0h); simdgroup_multiply_accumulate(C, A, BB, C);"
+        precondition(
+            header.components(separatedBy: old).count == 2,
+            "dense MLP half-dequant anchor drift")
+        return header.replacingOccurrences(of: old, with: new)
+    }
+
     private static let batch = 8
     private static let sequence = 1
     private static let groupSize = 64
@@ -494,7 +523,9 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
     /// and the close is the reference's own `s * C + rs * b`. KS = 2 splits
     /// the K/64 groups across the two simdgroups; an odd count (down_proj,
     /// G = 33) gives the extra group to simdgroup 0, deterministically.
-    private static let mma8KernelHeader = """
+    private static let mma8KernelHeader = applyHalfDequant(to: mma8KernelHeaderRaw)
+
+    private static let mma8KernelHeaderRaw = """
 #include <metal_simdgroup_matrix>
 
 #ifndef METAL_FUNC
@@ -715,7 +746,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
 """
 
     private static let mma8Kernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_v1\(halfDequantKey)",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -830,7 +861,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }()
 
     private static let mma8DownStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_bfill_v4",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_bfill_v4\(halfDequantKey)",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -890,7 +921,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }()
 
     private static let mma8GateUpStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_k2816_u2_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_k2816_u2_v1\(halfDequantKey)",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -908,7 +939,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     /// One complete SIMD group per g64 group. Keep all lane results rather
     /// than canonicalizing row sums: the consumer reads its own lane's tree.
     private static let mma8DownLaneSumKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_down_lane_sums_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_down_lane_sums_v1\(halfDequantKey)",
         inputNames: ["x"],
         outputNames: ["laneSums"],
         source: """
@@ -968,7 +999,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }()
 
     private static let mma8DownLaneSumQMVKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_lane_sums_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_lane_sums_v1\(halfDequantKey)",
         inputNames: ["x", "w", "scales", "biases", "laneSums"],
         outputNames: ["y"],
         source: """

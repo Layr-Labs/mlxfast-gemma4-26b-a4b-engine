@@ -4000,10 +4000,15 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     return;
   }
+  // EXPERT-DOWN-SINGLES-7537310: pairless K=704 used stock qmv_impl
+  // even though singles_impl was written for K in {2816, 704} with the
+  // same WVEC+KFIX loads-only reschedule as the live gate/up singleton.
+  // Flags match that arm (WVEC=true, PF=false). Strip-walk tid.y rewrite
+  // is unchanged, so each output row keeps its mapping.
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
+    qmv_affine4_g64_singles_impl<T, group_size, bits, 704, true, false>(
         tile_w,
         tile_scales,
         tile_biases,
@@ -4194,6 +4199,11 @@ template <typename T, int group_size, int bits>
     if (in_vec_size == 2816) {
       qmv_affine4_g64_singles_impl<
           T, group_size, bits, 2816, true, false>(
+          single_w, single_scales, single_biases, single_x, single_y,
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    } else if (in_vec_size == 704) {
+      qmv_affine4_g64_singles_impl<
+          T, group_size, bits, 704, true, false>(
           single_w, single_scales, single_biases, single_x, single_y,
           in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
     } else {

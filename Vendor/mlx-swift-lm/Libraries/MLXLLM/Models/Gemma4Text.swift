@@ -907,7 +907,6 @@ private struct Gemma4QKVRopeParameters {
     let log2Base: MLXArray
     let frequencies: MLXArray
     let usesFrequencies: Bool
-    let inverseFrequencies: MLXArray?
 }
 
 private let gemma4QKVNormRopeEnabled: Bool = {
@@ -2423,13 +2422,9 @@ private class Gemma4Attention: Module {
             self.rope = initializeRope(
                 dims: effectiveHeadDim, base: config.slidingRopeTheta, traditional: false,
                 scalingConfig: nil, maxPositionEmbeddings: nil)
-            let log2Base = MLXArray([log2f(config.slidingRopeTheta)])
             self.qkvRopeParameters = Gemma4QKVRopeParameters(
-                log2Base: log2Base,
-                frequencies: MLXArray([Float.infinity]), usesFrequencies: false,
-                inverseFrequencies: CBv2RaggedTwoPassDecodeAttentionV1
-                    .makeBaseRopeInverseFrequencies(
-                        log2Base: log2Base, dimensions: effectiveHeadDim))
+                log2Base: MLXArray([log2f(config.slidingRopeTheta)]),
+                frequencies: MLXArray([Float.infinity]), usesFrequencies: false)
         } else {
             let fullRope = initializeRope(
                 dims: effectiveHeadDim, base: config.fullRopeTheta, traditional: false,
@@ -2446,7 +2441,7 @@ private class Gemma4Attention: Module {
             self.rope = proportional
             self.qkvRopeParameters = Gemma4QKVRopeParameters(
                 log2Base: MLXArray([Float.zero]), frequencies: frequencies,
-                usesFrequencies: true, inverseFrequencies: nil)
+                usesFrequencies: true)
         }
 
         super.init()
@@ -2887,7 +2882,6 @@ private class Gemma4Attention: Module {
                 qWeight: qNorm.weight, kWeight: kNorm.weight,
                 positionOffsets: capturedOffsets,
                 ropeLog2Base: qkvRopeParameters.log2Base,
-                ropeInverseFrequencies: qkvRopeParameters.inverseFrequencies,
                 eps: config.rmsNormEps, appliedRope: appliedRope)
         } else if vProj == nil, qkvRopeParameters.usesFrequencies {
             // NORMROPE-D512: the full layers' store dispatch takes the raw
@@ -3308,19 +3302,45 @@ private enum Gemma4RouterFinalistsV1 {
 /// → bf16 `multiply` (four dispatches x 30 MoE layers per prefill, plus
 /// a re-read of the whole `[8, L, 128]` score plane) — into the
 /// finalists32 selection kernel that already holds the eight winners.
-/// Select the same ascending top eight as the incumbent finalists32 network.
-/// The enabled path encodes native BF16 comparison order once, then uses
-/// eight integer SIMD maxima over four keys per lane in one group. Original
-/// score values are loaded for the weight tail; the ordering keys never enter
-/// floating-point arithmetic. The disabled path retains the bitonic network.
+/// The selection network is the incumbent
+/// `gemma4_router_finalists32_stable_bf16_v1` verbatim; the weight tail
+/// is the decode cell's adversarially verified `Gemma4FusedRouterTop8`
+/// tail — the bit-exact transcription of
+/// `softmax_single_row<bfloat16_t, float, N_READS=4>` (softmax.h) plus
+/// the stock bf16 per-expert-scale multiply — ported onto the packed
+/// winners this kernel already holds in its group-0 lanes 24-31. The
+/// O(E^2)-per-row selection of `Gemma4FusedRouterTop8` itself stays
+/// decode-only; this kernel keeps the finalists32 selection network.
 ///
-/// The weight tail preserves the stock axis-eight softmax lane layout: four
-/// values per lane, float accumulation, -infinity padding, fast::exp, both
-/// SIMD reduction stages, reciprocal, and BF16 rounding before BF16 scaling.
-/// Only group zero computes weights. The second reduction receives the first
-/// reduction in lane zero and the stock sentinel in every other lane, exactly
-/// reproducing the old shared-array operands without their barriers.
-/// `pes[topi[p]]` still loads the same BF16 scale at the same selected index.
+/// Exactness, op by op against the stock chain:
+/// 1. `takeAlong` is a pure gather of the bf16 scores at the selected
+///    indices (no arithmetic). The winners ride the selection network as
+///    unchanged BF16 bits inside the packed payload, so
+///    `float(uint16_to_bfloat16(bits))` is the bit-identical float32 of
+///    the bit-identical bf16 score, staged in the same ascending-rank
+///    order `takeAlong` emits (position p = rank - kth, lane 24 + p).
+/// 2. `softmax(precise: true)` on bf16 dispatches the single kernel
+///    `block_softmax_precise_bfloat16` =
+///    `softmax_single_row<bfloat16_t, float, N_READS=4>`: float32
+///    accumulation throughout, with exactly one bf16 rounding, at the
+///    output write `T(ld[i] * normalizer)`. The stock axis-8 launch is
+///    ONE 32-thread simdgroup per row; this kernel's group 0 is exactly
+///    that simdgroup (its lanes are threadgroup positions 0-31), so the
+///    transcribed lane layout (lanes 0-1 hold the 8 values, 4 reads
+///    each), the `Limits<float>::min` (-inf) padding, `fast::exp`, the
+///    `simd_max`/`simd_sum` reduction order and the `1 / normalizer`
+///    division all execute on the same lanes with the same values.
+///    Every write to the shared max/normalizer slots is gated to group
+///    0 — in the stock one-simdgroup launch only slot 0 is ever
+///    written — so slots 1-31 keep their -inf / 0 init values exactly
+///    as the stock launch leaves them, and the cross-simdgroup
+///    `simd_max(local_max[lane])` / `simd_sum(local_normalizer[lane])`
+///    combines identical operands. Groups 1-3 only meet the barriers.
+/// 3. The per-expert-scale gather is a pure bf16 copy; `pes[topi[p]]`
+///    loads the identical element of the identical vector.
+/// 4. The stock `Multiply` on bfloat16 is MSL `x * y` (binary_ops.h),
+///    so `w * pes[topi[p]]` is the same expression on the same types
+///    with the same single bf16 rounding as the stock binary kernel.
 ///
 /// Fail-closed: any shape, dtype, topK, or kth outside the pinned
 /// prefill geometry, a disabled finalists stage (either of its two kill
@@ -3338,73 +3358,11 @@ private enum Gemma4RouterFinalistsWeightsV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    private static let orderKeysEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_PREFILL_ROUTE_ORDER_KEYS"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: orderKeysEnabled
-            ? "gemma4_router_finalists32_weights_bf16_max8_sg1_v1"
-            : "gemma4_router_finalists32_weights_bf16_v1",
+        name: "gemma4_router_finalists32_weights_bf16_v1",
         inputNames: ["scores", "pes"],
         outputNames: ["indices", "weights"],
-        source: orderKeysEnabled ? """
-            constexpr int K = 8;
-            constexpr int N_READS = 4;
-            const uint row = threadgroup_position_in_grid.x;
-            const uint lane = thread_index_in_simdgroup;
-            uint a = gemma4_finalists_pack(scores[row * 128u + lane], lane);
-            uint b = gemma4_finalists_pack(scores[row * 128u + 32u + lane], 32u + lane);
-            uint c = gemma4_finalists_pack(scores[row * 128u + 64u + lane], 64u + lane);
-            uint d = gemma4_finalists_pack(scores[row * 128u + 96u + lane], 96u + lane);
-            uint item = 0u;
-            // Each key is unique and positive; zero removes exactly one winner.
-            // Rank zero belongs in lane 31, preserving ascending output order.
-            #pragma clang loop unroll(full)
-            for (uint rank = 0u; rank < 8u; ++rank) {
-                const uint winner = simd_max(max(max(a, b), max(c, d)));
-                if (lane == 31u - rank) item = winner;
-                if (a == winner) a = 0u;
-                if (b == winner) b = 0u;
-                if (c == winner) c = 0u;
-                if (d == winner) d = 0u;
-            }
-            if (lane >= 24u) indices[row * 8u + lane - 24u] = item & 127u;
-            uint chosen[N_READS];
-            float ld[N_READS];
-            // Every lane participates in each shuffle. Lanes 0 and 1 receive the
-            // same four original values as the incumbent axis-eight softmax.
-            for (int i = 0; i < N_READS; ++i) {
-                chosen[i] = simd_shuffle(item,
-                    ushort(24u + (lane & 1u) * 4u + uint(i))) & 127u;
-                ld[i] = lane < 2u ? float(scores[row * 128u + chosen[i]]) : Limits<float>::min;
-            }
-            float maxval = Limits<float>::finite_min;
-            for (int i = 0; i < N_READS; ++i) {
-                maxval = (maxval < ld[i]) ? ld[i] : maxval;
-            }
-            maxval = simd_max(maxval);
-            // Retain both stock reduction stages and their exact operands.
-            maxval = simd_max(lane == 0u ? maxval : Limits<float>::min);
-            float normalizer = 0;
-            for (int i = 0; i < N_READS; ++i) {
-                float exp_x = fast::exp(ld[i] - maxval);
-                ld[i] = exp_x;
-                normalizer += exp_x;
-            }
-            normalizer = simd_sum(normalizer);
-            normalizer = simd_sum(lane == 0u ? normalizer : 0.0f);
-            normalizer = 1 / normalizer;
-            if (lane < 2u) {
-                for (int i = 0; i < N_READS; ++i) {
-                    const T w = T(ld[i] * normalizer);
-                    weights[row * 8u + lane * 4u + uint(i)] = w * pes[chosen[i]];
-                }
-            }
-        """ : """
+        source: """
             constexpr int SIMD_SIZE = 32;
             constexpr int N_READS = 4;
             constexpr int K = 8;
@@ -3546,28 +3504,7 @@ private enum Gemma4RouterFinalistsWeightsV1 {
             }
         """,
         header: """
-            constant constexpr bool gemma4_route_order_keys = \(orderKeysEnabled ? "true" : "false");
-
-            inline uint gemma4_finalists_pack(bfloat16_t value, uint expert) {
-                const uint bits = uint(bfloat16_to_uint16(value));
-                if (!gemma4_route_order_keys) return (bits << 7) | expert;
-                // Use the native equality operation here: under Metal's flush-
-                // to-zero mode, BF16 subnormals must tie with signed zero too.
-                const uint ordinal = metal::isnan(value) ? 0xffffu
-                    : (value == bfloat16_t(0.0f) ? 0x8000u
-                       : ((bits & 0x8000u) ? ((~bits) & 0xffffu) : (bits ^ 0x8000u)));
-                return (ordinal << 7) | expert;
-            }
-
-            inline bfloat16_t gemma4_finalists_value(
-                uint item, const device bfloat16_t* row_scores)
-            {
-                return gemma4_route_order_keys ? row_scores[item & 127u]
-                    : uint16_to_bfloat16(uint16_t(item >> 7));
-            }
-
             inline bool gemma4_finalists_before(uint a, uint b) {
-                if (gemma4_route_order_keys) return a < b;
                 const bfloat16_t av = uint16_to_bfloat16(uint16_t(a >> 7));
                 const bfloat16_t bv = uint16_to_bfloat16(uint16_t(b >> 7));
                 const bool an = metal::isnan(av);
@@ -3603,12 +3540,11 @@ private enum Gemma4RouterFinalistsWeightsV1 {
         let l = scores.dim(1)
         let rows = b * l
         CBv2EngageMark.once("router-weights32-prefill")
-        if orderKeysEnabled { CBv2EngageMark.once("router-native-max8-sg1-prefill") }
         let outs = kernel(
             [scores, perExpertScale],
             template: [("T", scores.dtype)],
-            grid: (rows * (orderKeysEnabled ? 32 : 128), 1, 1),
-            threadGroup: (orderKeysEnabled ? 32 : 128, 1, 1),
+            grid: (rows * 128, 1, 1),
+            threadGroup: (128, 1, 1),
             outputShapes: [[b, l, 8], [b, l, 8]],
             outputDTypes: [.uint32, .bfloat16]
         )
@@ -3624,35 +3560,31 @@ private enum Gemma4RouterFinalistsWeightsV1 {
 /// launch inside `SwitchGLU.projectExperts` (the sorted route table). Both are
 /// launch-drain stages on the layer's DEPENDENT chain: the expert gathers
 /// cannot start until the rank scatter has drained. This kernel runs the
-/// exact top-eight selection and the identical rank scatter back to back in
-/// one threadgroup (8 rows x 32 threads on the enabled path; the selected keys
+/// identical selection network and the identical rank scatter back to back in
+/// ONE 1024-thread threadgroup (8 rows x 128 threads; the 64 selected keys
 /// are staged through threadgroup memory instead of a device round trip), so
 /// one whole dispatch and its barrier stage leave the dependent chain in every
 /// MoE layer of every decode step (x30/step).
 ///
-/// The score comparator preserves native BF16 ordering and uses expert ID to
-/// break ties. The optional native-max path encodes that same ordering once per
-/// expert, then reads the original selected score for the unchanged weight
-/// arithmetic. The staged `sel` array holds the selected expert IDs, and the
-/// rank-scatter phase retains stable assignment order for equal IDs.
+/// Exactness by construction: every operation in both phases is integer or
+/// raw-bit work -- the comparator reads the unchanged BF16 score bits as a
+/// packed word exactly like the incumbent finalists kernel, the selection
+/// bitonic and the rank loop are copied verbatim (only the threadgroup-memory
+/// indexing gains a `row` offset), and no floating-point value is produced,
+/// re-associated or re-rounded anywhere. There is no accumulation and no
+/// reduction-tree change to reason about: outputs are bit-identical to the
+/// incumbent pair of kernels for every input. The staged `sel` array holds
+/// exactly the values the incumbent chain would have written to the `[8, 8]`
+/// indices buffer, and phase 2 reads them at the same flattened positions.
 ///
-/// Any geometry outside the pinned decode cell, a disabled finalists stage,
-/// or a disabled fold returns nil so the caller retains its existing fallback.
-/// `DARKBLOOM_GEMMA4_GLUE_FOLD=0` disables the fused producer;
-/// `DARKBLOOM_GEMMA4_ROUTE_ORDER_KEYS=0` retains its original sorting network.
-/// Engage marks: `glue-fold` and, when enabled, `router-native-max8-sg1-decode`.
+/// Fail-closed: any geometry other than the pinned decode cell, a disabled
+/// finalists stage, plan != 1, or the kill switch selects the incumbent
+/// two-dispatch chain unchanged. `DARKBLOOM_GEMMA4_GLUE_FOLD=0` is the kill
+/// switch (off = exact incumbent chain). Engage mark: `glue-fold`.
 private enum Gemma4RouteGlueFoldV1 {
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_GLUE_FOLD"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    // Encode native comparison order once, then select with integer maxima.
-    private static let orderKeysEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_ROUTE_ORDER_KEYS"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
@@ -3664,83 +3596,10 @@ private enum Gemma4RouteGlueFoldV1 {
     }
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: orderKeysEnabled
-            ? "gemma4_route_monolithic_top8_e128_k8_bf16_max8_sg1_v1"
-            : "gemma4_route_monolithic_top8_e128_k8_bf16_v2",
+        name: "gemma4_route_monolithic_top8_e128_k8_bf16_v2",
         inputNames: ["scores", "pes"],
         outputNames: ["indices", "weights", "row_order", "sorted_keys", "inverse_order"],
-        source: orderKeysEnabled ? """
-            const uint tid = thread_position_in_threadgroup.x;
-            const uint row = tid / 32u;
-            const uint lane = thread_index_in_simdgroup;
-            uint a = gemma4_finalists_pack(scores[row * 128u + lane], lane);
-            uint b = gemma4_finalists_pack(scores[row * 128u + 32u + lane], 32u + lane);
-            uint c = gemma4_finalists_pack(scores[row * 128u + 64u + lane], 64u + lane);
-            uint d = gemma4_finalists_pack(scores[row * 128u + 96u + lane], 96u + lane);
-            uint item = 0u;
-            threadgroup uint sel[64];
-            // Unique positive keys make zero a safe removal sentinel.
-            // Store the eight winners in ascending lanes 24 through 31.
-            #pragma clang loop unroll(full)
-            for (uint rank = 0u; rank < 8u; ++rank) {
-                const uint winner = simd_max(max(max(a, b), max(c, d)));
-                if (lane == 31u - rank) item = winner;
-                if (a == winner) a = 0u;
-                if (b == winner) b = 0u;
-                if (c == winner) c = 0u;
-                if (d == winner) d = 0u;
-            }
-            {
-                float score = (lane >= 24u) ? float(gemma4_finalists_value(item, scores + row * 128u)) : -1e38f;
-                float max_score = score;
-                max_score = metal::max(max_score, simd_shuffle_xor(max_score, 4));
-                max_score = metal::max(max_score, simd_shuffle_xor(max_score, 2));
-                max_score = metal::max(max_score, simd_shuffle_xor(max_score, 1));
-
-                float exp_score = (lane >= 24u) ? metal::precise::exp(score - max_score) : 0.0f;
-                float sum_exp = exp_score;
-                sum_exp += simd_shuffle_xor(sum_exp, 4);
-                sum_exp += simd_shuffle_xor(sum_exp, 2);
-                sum_exp += simd_shuffle_xor(sum_exp, 1);
-
-                if (lane >= 24u) {
-                    const uint selected = item & 127u;
-                    const uint out_idx = row * 8u + (lane - 24u);
-                    indices[out_idx] = selected;
-                    sel[out_idx] = selected;
-
-                    float weight = (sum_exp > 0.0f) ? (exp_score / sum_exp) : 0.0f;
-                    float scale = float(pes[selected]);
-                    weights[out_idx] = bfloat16_t(weight * scale);
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // Phase 2 -- the incumbent simd-rank scatter, verbatim, over the
-            // staged 64 keys. Threads 0..63 are exactly the two complete
-            // SIMD groups the standalone kernel launched; `assignment` and
-            // `lane` reproduce its coordinates.
-            if (tid < 64u) {
-                const uint assignment = tid;
-                const uint key = sel[assignment];
-                const uint key_low = sel[lane];
-                const uint key_high = sel[32u + lane];
-                uint rank = 0;
-                #pragma clang loop unroll(full)
-                for (uint source = 0; source < 32; ++source) {
-                    const uint other_low = simd_broadcast(key_low, ushort(source));
-                    rank += (other_low < key)
-                        || (other_low == key && source < assignment);
-                    const uint other_high = simd_broadcast(key_high, ushort(source));
-                    const uint high_assignment = 32u + source;
-                    rank += (other_high < key)
-                        || (other_high == key && high_assignment < assignment);
-                }
-                row_order[rank] = assignment / 8;
-                sorted_keys[rank] = key;
-                inverse_order[assignment] = rank;
-            }
-        """ : """
+        source: """
             const uint tid = thread_position_in_threadgroup.x;
             const uint row = tid / 128u;
             const uint lane = thread_index_in_simdgroup;
@@ -3840,28 +3699,7 @@ private enum Gemma4RouteGlueFoldV1 {
             }
         """,
         header: """
-            constant constexpr bool gemma4_route_order_keys = \(orderKeysEnabled ? "true" : "false");
-
-            inline uint gemma4_finalists_pack(bfloat16_t value, uint expert) {
-                const uint bits = uint(bfloat16_to_uint16(value));
-                if (!gemma4_route_order_keys) return (bits << 7) | expert;
-                // Use the native equality operation here: under Metal's flush-
-                // to-zero mode, BF16 subnormals must tie with signed zero too.
-                const uint ordinal = metal::isnan(value) ? 0xffffu
-                    : (value == bfloat16_t(0.0f) ? 0x8000u
-                       : ((bits & 0x8000u) ? ((~bits) & 0xffffu) : (bits ^ 0x8000u)));
-                return (ordinal << 7) | expert;
-            }
-
-            inline bfloat16_t gemma4_finalists_value(
-                uint item, const device bfloat16_t* row_scores)
-            {
-                return gemma4_route_order_keys ? row_scores[item & 127u]
-                    : uint16_to_bfloat16(uint16_t(item >> 7));
-            }
-
             inline bool gemma4_finalists_before(uint a, uint b) {
-                if (gemma4_route_order_keys) return a < b;
                 const bfloat16_t av = uint16_to_bfloat16(uint16_t(a >> 7));
                 const bfloat16_t bv = uint16_to_bfloat16(uint16_t(b >> 7));
                 const bool an = metal::isnan(av);
@@ -3893,11 +3731,10 @@ private enum Gemma4RouteGlueFoldV1 {
             perExpertScale.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-fold")
-        if orderKeysEnabled { CBv2EngageMark.once("router-native-max8-sg1-decode") }
         let outs = kernel(
             [scores, perExpertScale],
-            grid: (orderKeysEnabled ? 256 : 1024, 1, 1),
-            threadGroup: (orderKeysEnabled ? 256 : 1024, 1, 1),
+            grid: (1024, 1, 1),
+            threadGroup: (1024, 1, 1),
             outputShapes: [[8, 1, 8], [8, 1, 8], [64], [64], [64]],
             outputDTypes: [.uint32, .bfloat16, .uint32, .uint32, .uint32]
         )
@@ -3910,7 +3747,6 @@ private enum Gemma4RouteGlueFoldV1 {
                 inverseOrder: outs[4]))
     }
 }
-
 
 /// GLUE-003: one-per-forward chain box. Layer L's fused tail deposits the
 /// (output, next-layer-input-norm) pair; layer L+1 consumes the norm instead
@@ -6801,7 +6637,7 @@ public class Gemma4TextModelInner: Module {
         }
 
         // Compute per-layer inputs (PLE)
-        var perLayerInputs: [MLXArray?]
+        let perLayerInputs: [MLXArray]?
         if hiddenSizePerLayerInput > 0,
             let embedPerLayer = embedTokensPerLayer,
             let modelProj = perLayerModelProjection,
@@ -6831,7 +6667,7 @@ public class Gemma4TextModelInner: Module {
                 combined[.ellipsis, i, 0...]
             }
         } else {
-            perLayerInputs = Array(repeating: nil, count: config.numHiddenLayers)
+            perLayerInputs = nil
         }
 
         // Extend cache array for shared layers (which get nil caches)
@@ -6942,7 +6778,7 @@ public class Gemma4TextModelInner: Module {
                 h,
                 mask: mask,
                 cache: fullCache[idx],
-                perLayerInput: perLayerInputs[idx],
+                perLayerInput: perLayerInputs?[idx],
                 sharedKV: sharedKV,
                 positionOffset: unifiedCBv2PositionOffset ?? sharedPositionOffset,
                 v2SharedSource: v2SharedSource,

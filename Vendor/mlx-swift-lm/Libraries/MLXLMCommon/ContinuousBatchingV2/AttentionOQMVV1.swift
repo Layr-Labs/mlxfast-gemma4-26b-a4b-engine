@@ -422,18 +422,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// Carry affine metadata two groups ahead alongside the packed weights.
-    /// Each iteration still consumes the same group's float scale and bias;
-    /// only the issue position of the immutable metadata loads changes.
-    private static let affineCarry2Enabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_OPROJ_AFFINE_CARRY2"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    private static let carry2KeySuffix = oprojCarry2Enabled
-        ? (affineCarry2Enabled ? "_carry2_affine2" : "_carry2") : ""
+    private static let carry2KeySuffix = oprojCarry2Enabled ? "_carry2" : ""
 
     private static func applyOprojCarry2(to header: String, occurrences: Int) -> String {
         var result = header
@@ -449,24 +438,6 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         replace(
             "    const uint2 wv = *((const device uint2*)(wrow + 32 * g));\n    const float s = float(srow[g]);\n    const float b = float(brow[g]);",
             with: "    const uint2 wv = wv_next;\n    const float s = s_next;\n    const float b = b_next;\n    const int g_next = g0 + min(gi + 1, nGroups - 1);\n    const int g_next2 = g0 + min(gi + 2, nGroups - 1);\n    wv_next = wv_next2;\n    wv_next2 = *((const device uint2*)(wrow + 32 * g_next2));\n    s_next = float(srow[g_next]);\n    b_next = float(brow[g_next]);")
-        if affineCarry2Enabled {
-            replace(
-                "  float s_next = float(srow[g0]);\n  float b_next = float(brow[g0]);",
-                with: """
-                  float s_next = float(srow[g0]);
-                  float b_next = float(brow[g0]);
-                  float s_next2 = float(srow[g0 + min(1, nGroups - 1)]);
-                  float b_next2 = float(brow[g0 + min(1, nGroups - 1)]);
-                """)
-            replace(
-                "    s_next = float(srow[g_next]);\n    b_next = float(brow[g_next]);",
-                with: """
-                    s_next = s_next2;
-                    b_next = b_next2;
-                    s_next2 = float(srow[g_next2]);
-                    b_next2 = float(brow[g_next2]);
-                """)
-        }
         return result
     }
 

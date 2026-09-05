@@ -889,6 +889,267 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         return result
     }()
 
+    /// GATEUP-GEGLU-EPILOGUE. The dense MLP's gate and up projections already
+    /// share one dispatch over the joined `[4224, 2816]` plane (gate rows
+    /// `0 ..< 2112`, up rows `2112 ..< 4224`), and its `[8, 1, 4224]` result is
+    /// then read back by a separate compiled GeGLU kernel whose product feeds
+    /// the down projection. That GeGLU is a true read-after-write stage: it
+    /// cannot start until the joined projection has landed and the down
+    /// projection cannot start until it has, so on the concurrent encoder it is
+    /// a barrier with a ~2 us kernel inside it, thirty times per decode step.
+    ///
+    /// This body closes it in the projection's own epilogue. One threadgroup
+    /// now owns an eight-column tile of the ACTIVATED `[8, 1, 2112]` output and
+    /// walks BOTH of that tile's contraction chains -- the gate rows
+    /// `n0 ..< n0 + 8` and the up rows `2112 + n0 ..< 2112 + n0 + 8` -- before
+    /// applying the product. The joined plane is never written or read back.
+    ///
+    /// EXACTNESS. Each of the two chains is the shipped
+    /// `gemma4_qmv_mma8_affine8_g64_gateup_k2816_impl` body statement for
+    /// statement: the same `g0`/`nGroups` split across the two simdgroups, the
+    /// same `uint4` activation loads, the same `mma8_runsum8` pair and its three
+    /// xor-butterfly steps, the same BFILL order of the eight `B` operands, the
+    /// same eight `simdgroup_multiply_accumulate` steps into a zero-initialised
+    /// `C`, the same `s * C.thread_elements()[i] + rs * b` close, and the same
+    /// `KS == 2` cross-simdgroup addition. The two chains are independent, so
+    /// interleaving them adds no term to either. Both accumulators are then
+    /// rounded to `T` with the SAME `static_cast<T>` the shipped store applies
+    /// before writing the joined plane, so the two operands handed to the tape
+    /// are bit-for-bit the words the incumbent wrote to memory.
+    ///
+    /// `gemma4_geglu_compiled_tape` is the transcription of the compiled decode
+    /// GeGLU (`gemma4SafeGeluProductShaped`) that the prompt-plane expert
+    /// gather epilogue already ships: every intermediate is cast to `T` in the
+    /// compiled tape's own order, `metal::precise::tanh` runs on the bf16
+    /// operand, and the constants are the tape's own. It is reproduced here
+    /// rather than referenced because this header is a standalone string.
+    ///
+    /// The activation-sum carrier is not consumed on this road (the MMA close
+    /// builds its own `rs`), exactly as on the incumbent gate/up arm.
+    private static let mma8GateUpGeGLUHeader: String = mma8KernelHeader + """
+
+    template <typename T>
+    inline T gemma4_geglu_compiled_tape(T gate, T up) {
+      const T cubic_0 = static_cast<T>(static_cast<T>(0.044715f) * gate);
+      const T cubic_1 = static_cast<T>(cubic_0 * gate);
+      const T cubic_2 = static_cast<T>(cubic_1 * gate);
+      const T inner = static_cast<T>(gate + cubic_2);
+      const T scaled =
+          static_cast<T>(static_cast<T>(0.7978845608028654f) * inner);
+      const T curved = metal::precise::tanh(scaled);
+      const T shifted = static_cast<T>(static_cast<T>(1.0f) + curved);
+      const T half_gate = static_cast<T>(static_cast<T>(0.5f) * gate);
+      const T gelu = static_cast<T>(half_gate * shifted);
+      return static_cast<T>(gelu * up);
+    }
+
+    template <typename T, int KS>
+    METAL_FUNC void gemma4_qmv_mma8_affine8_g64_gateup_geglu_k2816_impl(
+        const device uint32_t* w,
+        const device T* scales,
+        const device T* biases,
+        const device T* x,
+        device T* y,
+        const int NA,
+        const int n0,
+        threadgroup float2* redG,
+        threadgroup float2* redU,
+        uint simd_gid,
+        uint simd_lid) {
+      constexpr int K = 2816;
+      constexpr int G = K / 64;
+      constexpr int gh = (G + 1) / 2;
+      constexpr int nGroups = (KS == 2) ? gh : G;
+      const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
+      const mma8_coord c = mma8_lane(simd_lid);
+
+      const device T* x0 = x + c.fn * K + 8 * c.fm;
+      const device T* x1 = x0 + K;
+
+      const int gateRow = n0 + c.fm;
+      const int upRow = NA + n0 + c.fm;
+      const device uint8_t* wrowG =
+          (const device uint8_t*)w + gateRow * K + 8 * c.fn;
+      const device T* srowG = scales + gateRow * G;
+      const device T* browG = biases + gateRow * G;
+      const device uint8_t* wrowU =
+          (const device uint8_t*)w + upRow * K + 8 * c.fn;
+      const device T* srowU = scales + upRow * G;
+      const device T* browU = biases + upRow * G;
+
+      float gacc0 = 0.0f;
+      float gacc1 = 0.0f;
+      float uacc0 = 0.0f;
+      float uacc1 = 0.0f;
+      simdgroup_float8x8 A;
+      simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+      #pragma clang loop unroll_count(2)
+      for (int gi = 0; gi < nGroups; ++gi) {
+        const int g = g0 + gi;
+        const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+        const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+        float2 rs = float2(mma8_runsum8<T>(r0), mma8_runsum8<T>(r1));
+        rs += simd_shuffle_xor(rs, 2u);
+        rs += simd_shuffle_xor(rs, 4u);
+        rs += simd_shuffle_xor(rs, 16u);
+
+        {
+          const uint4 wv = *((const device uint4*)(wrowG + 64 * g));
+          const float s = float(srowG[g]);
+          const float b = float(browG[g]);
+          simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+          MMA8_SETB(B0, x, lo)
+          MMA8_STEP8(B0, x, z, 0)
+          MMA8_SETB(B1, x, hi)
+          MMA8_STEP8(B1, x, z, 8)
+          MMA8_SETB(B2, y, lo)
+          MMA8_STEP8(B2, x, z, 16)
+          MMA8_SETB(B3, y, hi)
+          MMA8_STEP8(B3, x, z, 24)
+          MMA8_SETB(B4, z, lo)
+          MMA8_STEP8(B4, y, w, 0)
+          MMA8_SETB(B5, z, hi)
+          MMA8_STEP8(B5, y, w, 8)
+          MMA8_SETB(B6, w, lo)
+          MMA8_STEP8(B6, y, w, 16)
+          MMA8_SETB(B7, w, hi)
+          MMA8_STEP8(B7, y, w, 24)
+          gacc0 += s * C.thread_elements()[0] + rs.x * b;
+          gacc1 += s * C.thread_elements()[1] + rs.y * b;
+        }
+        {
+          const uint4 wv = *((const device uint4*)(wrowU + 64 * g));
+          const float s = float(srowU[g]);
+          const float b = float(browU[g]);
+          simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+          MMA8_SETB(B0, x, lo)
+          MMA8_STEP8(B0, x, z, 0)
+          MMA8_SETB(B1, x, hi)
+          MMA8_STEP8(B1, x, z, 8)
+          MMA8_SETB(B2, y, lo)
+          MMA8_STEP8(B2, x, z, 16)
+          MMA8_SETB(B3, y, hi)
+          MMA8_STEP8(B3, x, z, 24)
+          MMA8_SETB(B4, z, lo)
+          MMA8_STEP8(B4, y, w, 0)
+          MMA8_SETB(B5, z, hi)
+          MMA8_STEP8(B5, y, w, 8)
+          MMA8_SETB(B6, w, lo)
+          MMA8_STEP8(B6, y, w, 16)
+          MMA8_SETB(B7, w, hi)
+          MMA8_STEP8(B7, y, w, 24)
+          uacc0 += s * C.thread_elements()[0] + rs.x * b;
+          uacc1 += s * C.thread_elements()[1] + rs.y * b;
+        }
+      }
+
+      if (KS == 2) {
+        if (simd_gid == 1) {
+          redG[simd_lid] = float2(gacc0, gacc1);
+          redU[simd_lid] = float2(uacc0, uacc1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_gid == 1) {
+          return;
+        }
+        const float2 otherG = redG[simd_lid];
+        const float2 otherU = redU[simd_lid];
+        gacc0 = gacc0 + otherG.x;
+        gacc1 = gacc1 + otherG.y;
+        uacc0 = uacc0 + otherU.x;
+        uacc1 = uacc1 + otherU.y;
+      }
+
+      const T g0w = static_cast<T>(gacc0);
+      const T g1w = static_cast<T>(gacc1);
+      const T u0w = static_cast<T>(uacc0);
+      const T u1w = static_cast<T>(uacc1);
+      y[c.fn * NA + n0 + c.fm] = gemma4_geglu_compiled_tape<T>(g0w, u0w);
+      y[(c.fn + 1) * NA + n0 + c.fm] = gemma4_geglu_compiled_tape<T>(g1w, u1w);
+    }
+    """
+
+    /// Kill switch for GATEUP-GEGLU-EPILOGUE. Off restores the joined
+    /// projection plus the standalone compiled GeGLU byte for byte: this
+    /// kernel is never built, no dispatch presents its geometry, and the
+    /// incumbent registration name is the only one the pipeline cache sees.
+    static let mma8GateUpGeGLUEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DENSE_GATEUP_GEGLU"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
+    private static let mma8GateUpGeGLUKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_geglu_k2816_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 redG[32];
+            threadgroup float2 redU[32];
+            gemma4_qmv_mma8_affine8_g64_gateup_geglu_k2816_impl<T, 2>(
+                w, scales, biases, x, y,
+                w_shape[0] / 2, int(tid.y) * 8, redG, redU,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            """,
+        header: mma8GateUpGeGLUHeader,
+        ensureRowContiguous: true)
+
+    /// The joined gate|up projection with the dense GeGLU closed in its own
+    /// epilogue: `[8, 1, 2112]` activated rows, no `[8, 1, 4224]` intermediate
+    /// and no second dispatch. Returns nil for anything that is not the pinned
+    /// decode geometry, and the caller then takes the incumbent two-step road.
+    public static func matmulGateUpGeGLU(
+        x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> MLXArray? {
+        guard enabled,
+            mma8GateUpEnabled,
+            mma8GateUpStaticKEnabled,
+            mma8GateUpGeGLUEnabled,
+            groupSize == Self.groupSize,
+            bits == Self.bits,
+            mode == .affine,
+            let biases,
+            x.dtype == .bfloat16,
+            scales.dtype == x.dtype,
+            biases.dtype == x.dtype,
+            weight.dtype == .uint32,
+            x.ndim == 3,
+            x.dim(0) == batch,
+            x.dim(1) == sequence,
+            x.dim(2) == 2816,
+            weight.ndim == 2,
+            weight.dim(0) == 4224,
+            weight.dim(1) == 2816 * Self.bits / 32,
+            scales.shape == [4224, 2816 / Self.groupSize],
+            biases.shape == scales.shape,
+            x.size == batch * sequence * 2816
+        else { return nil }
+
+        let activatedDim = 2112
+        let yTiles = activatedDim / outputsPerGroup
+        CBv2EngageMark.once("dense-gateup-geglu")
+        return mma8GateUpGeGLUKernel(
+            [x, weight, scales, biases],
+            template: [("T", x.dtype)],
+            grid: (simdWidth, yTiles * simdGroups, 1),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [[batch, sequence, activatedDim]],
+            outputDTypes: [x.dtype]
+        )[0]
+    }
+
     private static let mma8GateUpStaticKKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_k2816_u2_v1",
         inputNames: ["x", "w", "scales", "biases"],

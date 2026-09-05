@@ -916,9 +916,20 @@ private let gemma4QKVNormRopeEnabled: Bool = {
     else { return true }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
+/// The full-attention K-eq-V row computes the same BF16 RMS value once for
+/// K and V. Default ON folds V's duplicate normalization loop into the K
+/// weighted-store loop; `DARKBLOOM_GEMMA4_QKV_NORM_SHARED_VALUE_FOLD=0`
+/// restores the separate loop.
+private let gemma4QKVNormSharedValueFoldEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_QKV_NORM_SHARED_VALUE_FOLD"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 
 private let gemma4QKVNormKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_qkv_rms_norm_rope_v2_vec1",
+        name: "gemma4_b8_qkv_rms_norm_rope_v2_vec2",
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base", "rope_freqs",
@@ -935,6 +946,8 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
         const bool is_query = row < Q_ROWS;
         const bool is_key = row >= Q_ROWS && row < Q_ROWS + K_ROWS;
         const bool weighted = is_query || is_key;
+        constexpr bool gemma4_fold_shared_value =
+            \(gemma4QKVNormSharedValueFoldEnabled ? "true" : "false");
         const device T* input = q;
         const device T* weight = q_weight;
         device T* output_row = q_out;
@@ -987,10 +1000,14 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
 
         if (weighted) {
             const T4 wv = *reinterpret_cast<const device T4*>(weight);
+            T4 sharedv;
             if (APPLY_ROPE) {
                 for (uint i = 0; i < reads; ++i) {
                     const uint element = lid * reads + i;
                     const T normalized = T(float(vin[i]) * inverse_rms);
+                    if (gemma4_fold_shared_value && KEY_VALUE_SHARED && is_key) {
+                        sharedv[i] = T(1) * normalized;
+                    }
                     // Reproduce the separate norm kernel's BF16 output-store
                     // boundary before any RoPE arithmetic reads the value.
                     rounded[element] = T(wv[i] * normalized);
@@ -999,20 +1016,24 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
                 T4 outv;
                 for (uint i = 0; i < reads; ++i) {
                     const T normalized = T(float(vin[i]) * inverse_rms);
+                    if (gemma4_fold_shared_value && KEY_VALUE_SHARED && is_key) {
+                        sharedv[i] = T(1) * normalized;
+                    }
                     outv[i] = wv[i] * normalized;
                 }
                 *reinterpret_cast<device T4*>(output) = outv;
             }
             // Gemma's full-attention K-eq-V layers feed the same raw key
             // projection to K RMSNorm and V RMSNormNoScale. The reduction
-            // above is therefore identical for both outputs; keep each
-            // output's established final expression, but write V while the
-            // exact normalizer and input value are live.
+            // above is therefore identical for both outputs. The default arm
+            // writes V while that value is live; the disabled arm keeps the
+            // old second normalization loop for an exact bisect.
             if (KEY_VALUE_SHARED && is_key) {
-                T4 sharedv;
-                for (uint i = 0; i < reads; ++i) {
-                    const T normalized = T(float(vin[i]) * inverse_rms);
-                    sharedv[i] = T(1) * normalized;
+                if (!gemma4_fold_shared_value) {
+                    for (uint i = 0; i < reads; ++i) {
+                        const T normalized = T(float(vin[i]) * inverse_rms);
+                        sharedv[i] = T(1) * normalized;
+                    }
                 }
                 *reinterpret_cast<device T4*>(shared_value_output) = sharedv;
             }
@@ -2021,6 +2042,9 @@ private func gemma4FusedQKVNorm(
         outputDTypes: [q.dtype, k.dtype, v.dtype]
     )
     if fusedRope { CBv2EngageMark.once("qkv-norm-rope") }
+    if (gemma4QKVNormSharedValueFoldEnabled && keyValueShared) {
+        CBv2EngageMark.once("qkv-norm-shared-value-fold")
+    }
     return (outputs[0], outputs[1], outputs[2], fusedRope)
 }
 

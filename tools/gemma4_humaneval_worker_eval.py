@@ -52,9 +52,12 @@ PROTOCOL FACTS THIS DRIVER IS BUILT AROUND (verified in
    ``RuntimeWorkerFreeRunError.stopTokenBeforeTarget``, surfaced as
    ``{"ok": false, "error": "free_decode_run dflash leg committed stop token
    <id> at committed position <p> of N=<n>; ..."}``. ``<p>`` counts the stop
-   token, so a re-run with ``count = p`` commits exactly the same prefix and
-   completes cleanly (greedy decoding is deterministic and the committed
-   stream is the target's argmax chain regardless of block width).
+   token, so a re-run with ``count = p`` USUALLY commits the same prefix and
+   completes cleanly. Not always: N clamps the last rounds' block width
+   (``maxEmitCount``), and a DFlash block verify is not bit-identical to a
+   width-1 step, so a near-tie argmax can move the stop by a position. The
+   depth-15 receipt has one -- HumanEval/112 reported position 453 at N=474 and
+   452 at N=453 -- so the re-run is iterated, bounded by ``STOP_RERUN_LIMIT``.
 
 The cost of fact 5: on a 164-problem HumanEval run nearly every dflash problem
 stops on EOS well before 768 tokens, so the naive "ask for max_tokens, recover
@@ -143,6 +146,21 @@ DEFAULT_MAX_TOKENS = 768
 #: `free_decode_run.count` ceiling
 #: (MLXFastConstants.experimentalDFlashMaxConfiguredTotalTokens).
 FREE_RUN_COUNT_CEILING = 1_536
+
+#: Retries a dflash problem gets after an engine error that is NOT the early-EOS
+#: failure (`untrimmableCache` is the one this has been seen for). One: the
+#: worker is restarted and the identical request re-issued once, then the
+#: problem is recorded as failed. Greedy decoding is deterministic, so a retry
+#: can only reproduce the failure or succeed -- it can never change the tokens a
+#: successful run records.
+ENGINE_ERROR_RETRY_LIMIT = 1
+
+#: Re-runs a dflash problem gets after an early-EOS failure, each at the
+#: position the engine reported. More than one is needed because a narrower N
+#: reshapes the last blocks and a DFlash block is not bit-identical to a width-1
+#: step, so the stop position can move by a token (HumanEval/112, depth-15
+#: receipt). Bounded, and never at a count already attempted.
+STOP_RERUN_LIMIT = 3
 
 #: RuntimeWorkerFreeRunError.stopTokenBeforeTarget's rendered description.
 STOP_BEFORE_TARGET_RE = re.compile(
@@ -581,8 +599,26 @@ def generate_dflash(
     2. Otherwise (or if the hinted run came back short of a stop token and
        under budget) ask for the full budget.
     3. An early-EOS failure names the committed position ``p``; the worker is
-       restarted (it is poisoned) and re-run with ``count = p``, which commits
-       the identical prefix and ends ON the stop token.
+       restarted (it is poisoned) and re-run with ``count = p``, which usually
+       commits the same prefix and ends ON the stop token. USUALLY, not always:
+       a narrower N clamps the last rounds to a different block shape, and a
+       DFlash block is not bit-identical to a width-1 step, so a near-tie argmax
+       can move the stop token by a position (HumanEval/112 in the depth-15
+       receipt: position 453 at N=474, then 452 at N=453). A re-run that reports
+       a NEW position is therefore re-run again, up to
+       ``STOP_RERUN_LIMIT`` times and never at a count already tried.
+    4. Any OTHER engine error -- ``untrimmableCache`` is the one this has
+       actually happened for -- gets exactly one retry of the IDENTICAL request
+       on the fresh process. Greedy decoding is deterministic and the retry
+       re-prefills the same prompt, so a retry can only reproduce the failure or
+       succeed; it can never change the recorded tokens. Every attempt, failed
+       ones included, stays in ``attempts``.
+
+    This function returns a verdict for every path it can take and NEVER raises
+    on a worker or protocol failure: an eval that aborts at problem 143 of 164
+    loses the 143 rows it already had. The one exception is the client-side
+    budget check below, which is a configuration error identical for every
+    problem and so is worth failing loudly on.
     """
 
     budget = max(int(max_tokens) - 1, 0)
@@ -594,6 +630,10 @@ def generate_dflash(
     attempts: list[dict[str, Any]] = []
     respawned = False
     rerun_position: int | None = None
+    reruns = 0
+    engine_error_retries = 0
+    attempted_counts: set[int] = set()
+    last_success: tuple[dict[str, Any], list[int], int | None] | None = None
 
     counts: list[int] = []
     if hint_tokens is not None:
@@ -603,10 +643,58 @@ def generate_dflash(
     if not counts or counts[-1] != budget:
         counts.append(budget)
 
+    def _failed(error_text: str) -> dict[str, Any]:
+        return {
+            "tokens": [],
+            "prefill_s": None,
+            "decode_s": None,
+            "stopped_on": None,
+            "truncated": False,
+            "rounds": 0,
+            "acceptance_lengths": None,
+            "drafted_total": None,
+            "accepted_total": None,
+            "committed_total": None,
+            "effective_spec": None,
+            "attempts": attempts,
+            "rerun": rerun_position is not None,
+            "rerun_position": rerun_position,
+            "engine_error_retries": engine_error_retries,
+            "respawned": respawned,
+            "failed": True,
+            "failure": error_text,
+        }
+
+    def _succeeded(
+        outcome: Mapping[str, Any], tokens: list[int], stopped_on: int | None
+    ) -> dict[str, Any]:
+        run = outcome.get("run") or {}
+        return {
+            "tokens": tokens,
+            "prefill_s": outcome["prefill_s"],
+            "decode_s": outcome["decode_s"],
+            "stopped_on": stopped_on,
+            "truncated": stopped_on is None,
+            "rounds": len(run.get("acceptance_lengths", []) or []),
+            "acceptance_lengths": run.get("acceptance_lengths"),
+            "drafted_total": run.get("drafted_total"),
+            "accepted_total": run.get("accepted_total"),
+            "committed_total": run.get("committed_total"),
+            "physical_verifier_width": run.get("physical_verifier_width"),
+            "effective_spec": outcome.get("effective_spec"),
+            "attempts": attempts,
+            "rerun": rerun_position is not None,
+            "rerun_position": rerun_position,
+            "engine_error_retries": engine_error_retries,
+            "respawned": respawned,
+            "failed": False,
+        }
+
     attempt_index = 0
     while attempt_index < len(counts):
         count = counts[attempt_index]
         attempt_index += 1
+        attempted_counts.add(count)
         started = time.perf_counter()
         outcome = _dflash_attempt(
             handle, seed_tokens=seed_tokens, count=count, depth=depth
@@ -623,65 +711,58 @@ def generate_dflash(
         if outcome.get("ok"):
             tokens = [outcome["seed_token"], *outcome["tokens"]]
             stopped_on = next((t for t in tokens if t in stop_ids), None)
-            if stopped_on is None and count < budget:
-                # The hint was short: no stop token and budget left. Fall
-                # through to the full-budget attempt. Nothing is poisoned, so
-                # no restart is needed.
+            last_success = (outcome, tokens, stopped_on)
+            if stopped_on is None and count < budget and attempt_index < len(counts):
+                # The hint was short: no stop token, budget left, and another
+                # attempt already queued. Fall through to it. Nothing is
+                # poisoned, so no restart is needed.
                 continue
-            run = outcome.get("run") or {}
-            return {
-                "tokens": tokens,
-                "prefill_s": outcome["prefill_s"],
-                "decode_s": outcome["decode_s"],
-                "stopped_on": stopped_on,
-                "truncated": stopped_on is None,
-                "rounds": len(run.get("acceptance_lengths", []) or []),
-                "acceptance_lengths": run.get("acceptance_lengths"),
-                "drafted_total": run.get("drafted_total"),
-                "accepted_total": run.get("accepted_total"),
-                "committed_total": run.get("committed_total"),
-                "physical_verifier_width": run.get("physical_verifier_width"),
-                "effective_spec": outcome.get("effective_spec"),
-                "attempts": attempts,
-                "rerun": rerun_position is not None,
-                "rerun_position": rerun_position,
-                "respawned": respawned,
-                "failed": False,
-            }
+            return _succeeded(outcome, tokens, stopped_on)
 
         # Failure. The session is poisoned either way, so the process goes.
-        early = parse_stop_before_target(str(outcome.get("error") or ""))
-        handle.restart(
-            reason=str(outcome.get("error") or "worker request failed"),
-            task_id=task_id,
-        )
-        respawned = True
-        if early is None or early["position"] <= 0 or rerun_position is not None:
-            # Not an early EOS, an unusable position, or a re-run that failed
-            # again: record a failed generation rather than looping.
-            return {
-                "tokens": [],
-                "prefill_s": None,
-                "decode_s": None,
-                "stopped_on": None,
-                "truncated": False,
-                "rounds": 0,
-                "acceptance_lengths": None,
-                "drafted_total": None,
-                "accepted_total": None,
-                "committed_total": None,
-                "effective_spec": None,
-                "attempts": attempts,
-                "rerun": rerun_position is not None,
-                "rerun_position": rerun_position,
-                "respawned": True,
-                "failed": True,
-                "failure": str(outcome.get("error") or "worker request failed"),
-            }
-        rerun_position = early["position"]
-        counts = counts[:attempt_index] + [rerun_position]
+        error_text = str(outcome.get("error") or "worker request failed")
+        early = parse_stop_before_target(error_text)
+        try:
+            handle.restart(reason=error_text, task_id=task_id)
+            respawned = True
+        except Exception as restart_error:  # noqa: BLE001 -- verdict, not raise
+            # The worker did not come back. Record it against THIS problem and
+            # let the caller decide whether the run can go on.
+            return _failed(f"{error_text} (worker restart failed: {restart_error})")
 
-    raise AssertionError("dflash attempt loop exhausted without a verdict")
+        if early is None:
+            # An ENGINE error, not an early EOS: `untrimmableCache` is the one
+            # this has been seen for. One retry of the identical request on the
+            # fresh process, then it is recorded as a failure. The retry is
+            # queued AHEAD of whatever counts remain so a hinted run still falls
+            # through to its full-budget attempt afterwards.
+            if engine_error_retries < ENGINE_ERROR_RETRY_LIMIT:
+                engine_error_retries += 1
+                counts.insert(attempt_index, count)
+                continue
+            return _failed(error_text)
+        position = early["position"]
+        if (
+            position <= 0
+            or position in attempted_counts
+            or reruns >= STOP_RERUN_LIMIT
+        ):
+            # An unusable position, a count already tried (so re-running it
+            # would loop), or too many re-runs: record a failed generation.
+            return _failed(error_text)
+        reruns += 1
+        rerun_position = position
+        counts = counts[:attempt_index] + [position]
+
+    # The queue ran out without a return. Reachable when a re-run at the
+    # reported stop position comes back SHORT of the budget with no stop token
+    # in it -- real output, just not the whole completion, so it is recorded
+    # rather than thrown away. (This is where the depth-15 receipt died with
+    # `AssertionError: dflash attempt loop exhausted without a verdict`, taking
+    # 143 recorded rows with it.)
+    if last_success is not None:
+        return _succeeded(*last_success)
+    return _failed("dflash attempt queue exhausted without a verdict")
 
 
 # --------------------------------------------------------------------------
@@ -710,6 +791,43 @@ def select_task_ids(task_ids: Sequence[str], n: int) -> list[str]:
     if n not in (20, HUMANEVAL_TASK_COUNT):
         raise ValueError(f"--n must be 20 or {HUMANEVAL_TASK_COUNT}, got {n}")
     return ordered[:n]
+
+
+def parse_task_ids(raw: str) -> list[str]:
+    """Split a comma-separated ``--task-ids`` value, in the order given.
+
+    Order is the CALLER's, not the dataset's: re-running a handful of problems
+    is the point of the flag, and the samples file is padded to all 164 before
+    scoring either way, so selection order changes nothing a score depends on.
+    """
+
+    requested = [part.strip() for part in str(raw).split(",")]
+    requested = [part for part in requested if part]
+    if not requested:
+        raise ValueError("--task-ids listed no problems")
+    seen: set[str] = set()
+    for task_id in requested:
+        if task_id in seen:
+            raise ValueError(f"--task-ids repeats {task_id}")
+        seen.add(task_id)
+    return requested
+
+
+def select_explicit_task_ids(
+    task_ids: Sequence[str], requested: Sequence[str]
+) -> list[str]:
+    """The named problems, refusing any id the dataset does not carry."""
+
+    ordered = list(task_ids)
+    if len(ordered) != HUMANEVAL_TASK_COUNT:
+        raise ValueError(
+            f"expected {HUMANEVAL_TASK_COUNT} HumanEval problems, got {len(ordered)}"
+        )
+    known = set(ordered)
+    unknown = [task_id for task_id in requested if task_id not in known]
+    if unknown:
+        raise ValueError(f"--task-ids names unknown problems: {', '.join(unknown)}")
+    return list(requested)
 
 
 def write_scoring_file(
@@ -850,7 +968,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--n", type=int, choices=(20, HUMANEVAL_TASK_COUNT),
-                        default=HUMANEVAL_TASK_COUNT)
+                        default=None,
+                        help=f"first n problems in dataset order (default "
+                             f"{HUMANEVAL_TASK_COUNT}). Mutually exclusive with "
+                             f"--task-ids.")
+    parser.add_argument(
+        "--task-ids",
+        default=None,
+        help=(
+            "comma-separated problem ids to run instead of the first n, e.g. "
+            "'HumanEval/94,HumanEval/123'. Run in the order given. Scoring "
+            "still pads to all "
+            f"{HUMANEVAL_TASK_COUNT} problems, so a partial run's pass@1 is "
+            "the fraction of the WHOLE benchmark and is not comparable to a "
+            "full run's. Mutually exclusive with --n."
+        ),
+    )
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument("--worker", type=Path, default=DEFAULT_WORKER)
     parser.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS)
@@ -888,6 +1021,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.route == "serial" and args.dflash_depth is not None:
         raise SystemExit("--dflash-depth is meaningful only on --route dflash")
+    if args.task_ids is not None and args.n is not None:
+        raise SystemExit("--task-ids and --n select the same thing; pass one")
+    try:
+        requested_task_ids = (
+            parse_task_ids(args.task_ids) if args.task_ids is not None else None
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     if args.fake_worker is None and not os.environ.get("MTPLX_GUARD_ATTEST_FD"):
         raise RuntimeError(
             "canonical guard attestation is required: MTPLX_GUARD_ATTEST_FD is "
@@ -909,7 +1050,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     get_humaneval, sanitize = load_evalplus()
     dataset = get_humaneval()
     all_task_ids = list(dataset)
-    task_ids = select_task_ids(all_task_ids, args.n)
+    if requested_task_ids is not None:
+        task_ids = select_explicit_task_ids(all_task_ids, requested_task_ids)
+        selection = "explicit --task-ids, in the order given"
+    else:
+        task_ids = select_task_ids(
+            all_task_ids, HUMANEVAL_TASK_COUNT if args.n is None else args.n
+        )
+        selection = "first n in dataset order"
 
     stop_ids = resolve_stop_tokens(Path(args.weights))
     if not stop_ids:
@@ -942,7 +1090,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "started_at_utc": utc_now(),
         "route": args.route,
         "dflash_depth_requested": args.dflash_depth,
-        "n": args.n,
+        "n": len(task_ids),
         "max_tokens": args.max_tokens,
         "sampler": {
             "temperature": 0.0,
@@ -957,7 +1105,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "name": "humaneval",
             "evalplus_version": EVALPLUS_VERSION,
             "total_problems": HUMANEVAL_TASK_COUNT,
-            "selection": "first n in dataset order",
+            "selection": selection,
+            "task_ids_requested": requested_task_ids,
         },
         "worker": {
             "path": str(args.worker),
@@ -1025,24 +1174,56 @@ def main(argv: Sequence[str] | None = None) -> int:
         for index, task_id in enumerate(task_ids, start=1):
             task = dataset[task_id]
             seed_tokens, prompt_text = encode_prompt(tokenizer, str(task["prompt"]))
-            if args.route == "serial":
-                outcome = generate_serial(
-                    handle,
-                    seed_tokens=seed_tokens,
-                    max_tokens=args.max_tokens,
-                    stop_ids=stop_ids,
-                )
-                outcome.setdefault("failed", False)
-            else:
-                outcome = generate_dflash(
-                    handle,
-                    seed_tokens=seed_tokens,
-                    max_tokens=args.max_tokens,
-                    stop_ids=stop_ids,
-                    depth=args.dflash_depth,
-                    task_id=task_id,
-                    hint_tokens=hints.get(task_id),
-                )
+            # ONE PROBLEM NEVER TAKES THE RUN DOWN. A worker or protocol
+            # failure is that problem's verdict, recorded like any other failed
+            # generation, and the loop moves on -- the depth-15 run stopped at
+            # problem 143 of 164 over a single unhandled AssertionError.
+            # Programming and configuration errors (ValueError from the
+            # client-side budget check, anything from evalplus) are NOT caught:
+            # they are identical for every problem and are worth failing loudly
+            # on.
+            try:
+                if handle.worker is None:
+                    handle.start()
+                if args.route == "serial":
+                    outcome = generate_serial(
+                        handle,
+                        seed_tokens=seed_tokens,
+                        max_tokens=args.max_tokens,
+                        stop_ids=stop_ids,
+                    )
+                    outcome.setdefault("failed", False)
+                else:
+                    outcome = generate_dflash(
+                        handle,
+                        seed_tokens=seed_tokens,
+                        max_tokens=args.max_tokens,
+                        stop_ids=stop_ids,
+                        depth=args.dflash_depth,
+                        task_id=task_id,
+                        hint_tokens=hints.get(task_id),
+                    )
+            except (RuntimeError, OSError) as error:
+                outcome = {
+                    "tokens": [],
+                    "prefill_s": None,
+                    "decode_s": None,
+                    "stopped_on": None,
+                    "truncated": False,
+                    "rounds": 0,
+                    "acceptance_lengths": None,
+                    "drafted_total": None,
+                    "accepted_total": None,
+                    "committed_total": None,
+                    "effective_spec": None,
+                    "attempts": None,
+                    "rerun": False,
+                    "rerun_position": None,
+                    "engine_error_retries": 0,
+                    "respawned": False,
+                    "failed": True,
+                    "failure": f"{type(error).__name__}: {error}",
+                }
             tokens = list(outcome["tokens"])
             text, raw_text = decode_completion(tokenizer, tokens, stop_ids)
             solution = sanitize(text, entrypoint=str(task["entry_point"]))
@@ -1082,6 +1263,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "attempts": outcome.get("attempts"),
                 "rerun": bool(outcome.get("rerun")),
                 "rerun_position": outcome.get("rerun_position"),
+                "engine_error_retries": outcome.get("engine_error_retries") or 0,
                 "worker_respawned": bool(outcome.get("respawned")),
                 "generation_failed": bool(outcome.get("failed")),
                 "failure": outcome.get("failure"),
@@ -1125,6 +1307,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 1 for r in rows if r["truncated_at_max_tokens"]
             ),
             "reruns": sum(1 for r in rows if r["rerun"]),
+            "engine_error_retries": sum(
+                int(r.get("engine_error_retries") or 0) for r in rows
+            ),
             "worker_respawns": len(handle.restarts),
             "decode_wall_s": sum(
                 float(r["decode_wall_s"] or 0.0) for r in rows

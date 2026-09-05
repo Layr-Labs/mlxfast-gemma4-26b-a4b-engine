@@ -581,6 +581,20 @@ dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
   }
 }
 
+// DARKBLOOM GEMMA4 NAX GATHER LOADER-VEC.
+// QuantizedBlockLoader::load_unsafe for 4-bit weights staged along the
+// reduction dimension (sixteen packed bytes per thread): when the packed row
+// stride and this thread's source address are 16-byte multiples, the sixteen
+// bytes are read as one 16-byte word, the thirty-two values are formed by the
+// dequantize expressions of the byte loop (scale * low nibble + bias,
+// scale / 16 * high nibble field + bias) and written to the same threadgroup
+// slots as eight 4-element vectors. Any other geometry runs the byte loop.
+// Kill switch: DARKBLOOM_GEMMA4_NAX_GATHER_LOADER_VEC 0 leaves only the byte
+// loop.
+#ifndef DARKBLOOM_GEMMA4_NAX_GATHER_LOADER_VEC
+#define DARKBLOOM_GEMMA4_NAX_GATHER_LOADER_VEC 1
+#endif
+
 template <
     typename T,
     short BROWS,
@@ -653,6 +667,29 @@ struct QuantizedBlockLoader {
 
     T scale = *scales;
     T bias = *biases;
+    if constexpr (
+        (DARKBLOOM_GEMMA4_NAX_GATHER_LOADER_VEC != 0) && bits == 4 &&
+        reduction_dim == 1 && n_reads == 16 && bytes_per_pack == 1 &&
+        pack_factor == 2) {
+      if (((src_ld & 31) == 0) &&
+          ((reinterpret_cast<ulong>(src) & 15) == 0)) {
+        const uint4 packed = *reinterpret_cast<const device uint4*>(src);
+        T s[2] = {scale, scale / static_cast<T>(16.0f)};
+        metal::vec<T, 4> out[8];
+        STEEL_PRAGMA_UNROLL
+        for (int i = 0; i < 16; i++) {
+          const uint8_t w = uint8_t((packed[i >> 2] >> (8 * (i & 3))) & 0xffu);
+          out[i >> 1][2 * (i & 1)] = s[0] * (w & 0x0f) + bias;
+          out[i >> 1][2 * (i & 1) + 1] = s[1] * (w & 0xf0) + bias;
+        }
+        STEEL_PRAGMA_UNROLL
+        for (int q = 0; q < 8; q++) {
+          *reinterpret_cast<threadgroup metal::vec<T, 4>*>(dst + 4 * q) =
+              out[q];
+        }
+        return;
+      }
+    }
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
@@ -1619,6 +1656,17 @@ METAL_FUNC void gather_rhs_mma_frag_row(
 #define DARKBLOOM_GEMMA4_NAX_GATHER_TILING 0
 #endif
 
+// DARKBLOOM GEMMA4 NAX GATHER SK64.
+// The K sub-step of affine_gather_qmm_rhs_nax is 64 wide instead of 32: one
+// load-and-multiply step per staged weight tile holds four 16-wide K
+// fragments of A and of B and issues the multiply-accumulate for all four; the
+// K blocks enter every accumulator fragment in the same ascending order as
+// before, two steps of two having become one step of four.
+// Kill switch: DARKBLOOM_GEMMA4_NAX_GATHER_SK64 0 restores SK = 32.
+#ifndef DARKBLOOM_GEMMA4_NAX_GATHER_SK64
+#define DARKBLOOM_GEMMA4_NAX_GATHER_SK64 1
+#endif
+
 template <
     typename T,
     int group_size,
@@ -1708,7 +1756,8 @@ template <
 
   constexpr short SM = BM / SGM;
   constexpr short SN = BN / SGN;
-  constexpr short SK = 32;
+  constexpr short SK = (DARKBLOOM_GEMMA4_NAX_GATHER_SK64 != 0) ? 64 : 32;
+  static_assert(BK % SK == 0, "BK must be a multiple of the K sub-step");
 
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;

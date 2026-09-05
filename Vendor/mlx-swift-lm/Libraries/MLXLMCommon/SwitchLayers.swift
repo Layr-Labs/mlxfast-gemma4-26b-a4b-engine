@@ -1640,6 +1640,24 @@ public class SwitchGLU: Module {
             guard let gateProj, let upProj else {
                 preconditionFailure("SwitchGLU requires gate_up_proj or gate_proj/up_proj")
             }
+            // Explicit split-weight decode primitive: preserve the two original
+            // quantized planes and each projection's rounding, then close the
+            // typed GeGLU inside the same group. The large prefill fusion and
+            // every generic/non-production or tagged-index path stay below.
+            if Gemma4ExpertSplitGeGLUV1.enabled,
+                weightedReductionProfile == .gemma4ProductionGeGLU,
+                activationProduct == nil, isGeluActivation,
+                inputDims == 2816, hiddenDims == 704, numExperts == 128,
+                doSort, useLhsIndices, !useExpertPrefixBounds,
+                let lhsIndices, let fused = fusedGateUpDispatch(),
+                let activated = Gemma4ExpertSplitGeGLUV1.apply(
+                    x: x, lhs: lhsIndices, rhs: idx, storage: fused.storage)
+            {
+                x = downProj(
+                    activated, idx, lhsIndices: switchDownIdentity64,
+                    sortedIndices: true)
+                return (x, inverseOrder, true)
+            }
             // GATEUP-FUSE-PREFILL: the sorted right-hand-side plane (the
             // production prefill) reads its gathered activations once through
             // one gather over the concatenated gate|up storage. Same kernel

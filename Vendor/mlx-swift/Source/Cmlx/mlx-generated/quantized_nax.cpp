@@ -594,6 +594,110 @@ dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
   }
 }
 
+// DARKBLOOM GEMMA4 NAX GATHER-PIPE: dequantize's twin over packed bytes held
+// in thread registers; the expressions and the store positions are those of
+// dequantize.
+template <typename U, int N, int bits>
+inline void
+dequantize_thread(
+    const thread uint8_t* w,
+    U scale,
+    U bias,
+    threadgroup U* w_local) {
+  static_assert(
+      bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
+          bits == 8,
+      "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
+
+  if (bits == 2) {
+    U s[4] = {
+        scale,
+        scale / static_cast<U>(4.0f),
+        scale / static_cast<U>(16.0f),
+        scale / static_cast<U>(64.0f)};
+    for (int i = 0; i < (N / 4); i++) {
+      w_local[4 * i] = s[0] * (w[i] & 0x03) + bias;
+      w_local[4 * i + 1] = s[1] * (w[i] & 0x0c) + bias;
+      w_local[4 * i + 2] = s[2] * (w[i] & 0x30) + bias;
+      w_local[4 * i + 3] = s[3] * (w[i] & 0xc0) + bias;
+    }
+  }
+
+  else if (bits == 3) {
+    for (int i = 0; i < (N / 8); i++) {
+      w_local += 8 * i;
+      w += 3 * i;
+
+      w_local[0] = (w[0] & 0x7) * scale + bias;
+      w_local[1] = ((w[0] & 0x38) >> 3) * scale + bias;
+      w_local[2] = (((w[0] & 0xc0) >> 6) + ((w[1] & 0x1) << 2)) * scale + bias;
+      w_local[3] = ((w[1] & 0xe) >> 1) * scale + bias;
+      w_local[4] = ((w[1] & 0x70) >> 4) * scale + bias;
+      w_local[5] = (((w[1] & 0x80) >> 7) + ((w[2] & 0x3) << 1)) * scale + bias;
+      w_local[6] = ((w[2] & 0x1c) >> 2) * scale + bias;
+      w_local[7] = ((w[2] & 0xe0) >> 5) * scale + bias;
+    }
+  }
+
+  else if (bits == 4) {
+    U s[2] = {scale, scale / static_cast<U>(16.0f)};
+    for (int i = 0; i < (N / 2); i++) {
+      w_local[2 * i] = s[0] * (w[i] & 0x0f) + bias;
+      w_local[2 * i + 1] = s[1] * (w[i] & 0xf0) + bias;
+    }
+  }
+
+  else if (bits == 5) {
+    for (int i = 0; i < (N / 8); i++) {
+      w_local += 8 * i;
+      w += 5 * i;
+
+      w_local[0] = (w[0] & 0x1f) * scale + bias;
+      w_local[1] = (((w[0] & 0xe0) >> 5) + ((w[1] & 0x3) << 3)) * scale + bias;
+      w_local[2] = ((w[1] & 0x7c) >> 2) * scale + bias;
+      w_local[3] = (((w[1] & 0x80) >> 7) + ((w[2] & 0xf) << 1)) * scale + bias;
+      w_local[4] = (((w[2] & 0xf0) >> 4) + ((w[3] & 0x1) << 4)) * scale + bias;
+      w_local[5] = ((w[3] & 0x3e) >> 1) * scale + bias;
+      w_local[6] = (((w[3] & 0xc0) >> 6) + ((w[4] & 0x7) << 2)) * scale + bias;
+      w_local[7] = ((w[4] & 0xf8) >> 3) * scale + bias;
+    }
+  }
+
+  else if (bits == 6) {
+    for (int i = 0; i < (N / 4); i++) {
+      w_local += 4 * i;
+      w += 3 * i;
+      w_local[0] = (w[0] & 0x3f) * scale + bias;
+      w_local[1] = (((w[0] >> 6) & 0x03) + ((w[1] & 0x0f) << 2)) * scale + bias;
+      w_local[2] = (((w[1] >> 4) & 0x0f) + ((w[2] & 0x03) << 4)) * scale + bias;
+      w_local[3] = ((w[2] >> 2) & 0x3f) * scale + bias;
+    }
+  }
+
+  else if (bits == 8) {
+    for (int i = 0; i < N; i++) {
+      w_local[i] = scale * w[i] + bias;
+    }
+  }
+}
+
+// DARKBLOOM GEMMA4 NAX GATHER-PIPE.
+// affine_gather_qmm_rhs_nax stages its weight tiles through two threadgroup
+// slots. Iteration k of the K loop first reads the packed bytes, scale and
+// bias of tile k + 1 into registers (prefetch), then runs the multiply steps
+// of tile k from slot k % 2, then dequantizes the held registers into slot
+// (k + 1) % 2 (commit); one threadgroup barrier per iteration, at its top,
+// orders the commit of tile k before its reads and the reads of tile k - 1
+// before the slot is written again. prefetch + commit perform exactly
+// load_unsafe's reads, expressions and stores. Tile 0 is staged by
+// load_unsafe before the loop; the unaligned-K remainder keeps its own
+// staging. Only the aligned-N dispatch takes this path.
+// Kill switch: DARKBLOOM_GEMMA4_NAX_GATHER_PIPE 0 restores the single slot
+// and the two-barrier staging of the incumbent loop.
+#ifndef DARKBLOOM_GEMMA4_NAX_GATHER_PIPE
+#define DARKBLOOM_GEMMA4_NAX_GATHER_PIPE 1
+#endif
+
 template <
     typename T,
     short BROWS,
@@ -669,6 +773,38 @@ struct QuantizedBlockLoader {
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
+    }
+  }
+
+  MLX_MTL_CONST short prefetch_bytes = n_reads * bytes_per_pack;
+
+  void prefetch(thread uint8_t* wbuf, thread T& scale, thread T& bias) const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    scale = *scales;
+    bias = *biases;
+    for (int i = 0; i < prefetch_bytes; i++) {
+      wbuf[i] = src[i];
+    }
+  }
+
+  void commit(
+      const thread uint8_t* wbuf,
+      T scale,
+      T bias,
+      const int slot_offset) const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    for (int i = 0; i < n_reads; i++) {
+      dequantize_thread<T, pack_factor, bits>(
+          wbuf + i * bytes_per_pack,
+          scale,
+          bias,
+          dst + slot_offset + i * pack_factor);
     }
   }
 
@@ -809,6 +945,38 @@ struct QuantizedBlockLoader<
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
+    }
+  }
+
+  MLX_MTL_CONST short prefetch_bytes = n_reads * bytes_per_pack;
+
+  void prefetch(thread uint8_t* wbuf, thread T& scale, thread T& bias) const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    scale = *scales;
+    bias = *biases;
+    for (int i = 0; i < prefetch_bytes; i++) {
+      wbuf[i] = src[i];
+    }
+  }
+
+  void commit(
+      const thread uint8_t* wbuf,
+      T scale,
+      T bias,
+      const int slot_offset) const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    for (int i = 0; i < n_reads; i++) {
+      dequantize_thread<T, pack_factor, bits>(
+          wbuf + i * bytes_per_pack,
+          scale,
+          bias,
+          dst + slot_offset + i * pack_factor);
     }
   }
 
@@ -1670,7 +1838,9 @@ template <
       group_size,
       bits>;
 
-  threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
+  threadgroup T Ws
+      [((DARKBLOOM_GEMMA4_NAX_GATHER_PIPE != 0) ? 2 : 1) *
+       (transpose ? BN * BK_padded : BK * BN_padded)];
 
   // Compute the block
   const int K_w = K * bytes_per_pack / pack_factor;
@@ -1808,16 +1978,38 @@ template <
 
     dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
       dispatch_bool(align_N || !is_unaligned_bn, [&](auto kAlignedN) {
+        constexpr int kWsSlot = transpose ? BN * BK_padded : BK * BN_padded;
+        constexpr bool kPipe =
+            (DARKBLOOM_GEMMA4_NAX_GATHER_PIPE != 0) && kAlignedN.value;
+        if constexpr (kPipe) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (K_it > 0) {
+            loader_w.load_unsafe();
+          }
+        }
         for (int k = 0; k < K_it; k++) {
           threadgroup_barrier(mem_flags::mem_threadgroup);
-          if constexpr (kAlignedN.value) {
-            loader_w.load_unsafe();
+          const threadgroup T* Wk = Ws;
+          uint8_t pipe_bytes[loader_w_t::prefetch_bytes];
+          T pipe_scale = T(0);
+          T pipe_bias = T(0);
+          const bool pipe_next = kPipe && (k + 1 < K_it);
+          if constexpr (kPipe) {
+            Wk = Ws + (k & 1) * kWsSlot;
+            if (pipe_next) {
+              loader_w.next();
+              loader_w.prefetch(pipe_bytes, pipe_scale, pipe_bias);
+            }
           } else {
-            loader_w.load_safe(
-                transpose ? short2(BK, tgp_bn) : short2(tgp_bn, BK));
-          }
+            if constexpr (kAlignedN.value) {
+              loader_w.load_unsafe();
+            } else {
+              loader_w.load_safe(
+                  transpose ? short2(BK, tgp_bn) : short2(tgp_bn, BK));
+            }
 
-          threadgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
 
           if (seg_partial && kAlignedM.value) {
             // 16-row fragment-row granularity: only fragment rows that
@@ -1832,10 +2024,10 @@ template <
 
               if constexpr (transpose) {
                 Btile.template load<T, BK_padded, 1>(
-                    Ws + tn * BK_padded + kk1);
+                    Wk + tn * BK_padded + kk1);
               } else {
                 Btile.template load<T, BN_padded, 1>(
-                    Ws + tn + kk1 * BN_padded);
+                    Wk + tn + kk1 * BN_padded);
               }
 
               STEEL_PRAGMA_UNROLL
@@ -1870,10 +2062,10 @@ template <
 
               if constexpr (transpose) {
                 Btile.template load<T, BK_padded, 1>(
-                    Ws + tn * BK_padded + kk1);
+                    Wk + tn * BK_padded + kk1);
               } else {
                 Btile.template load<T, BN_padded, 1>(
-                    Ws + tn + kk1 * BN_padded);
+                    Wk + tn + kk1 * BN_padded);
               }
 
               tile_matmad_nax(
@@ -1887,8 +2079,21 @@ template <
             }
           }
 
+          if constexpr (kPipe) {
+            if (pipe_next) {
+              loader_w.commit(
+                  pipe_bytes, pipe_scale, pipe_bias, ((k + 1) & 1) * kWsSlot);
+            }
+          }
           xn += BK;
-          loader_w.next();
+          if constexpr (!kPipe) {
+            loader_w.next();
+          }
+        }
+        if constexpr (kPipe) {
+          if (K_it > 0) {
+            loader_w.next();
+          }
         }
 
         if (!align_K) {

@@ -20,6 +20,10 @@
 import Foundation
 import MLX
 
+/// Control redraw of crown 58b251d. Never called; exists only so the submitted tree differs
+/// from the crown by a real (dead) code change and the benchmarker takes a fresh timing sample.
+@inline(never) private func engineLoopV2RedrawControlMarker() -> Int { 0 }
+
 // MARK: - Model interface (WS-F adapters / WS-G fixtures conform)
 
 /// Minimal steppable-model surface the loop drives. `tokens` is [B, L] int32

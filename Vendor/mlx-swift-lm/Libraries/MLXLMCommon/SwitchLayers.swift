@@ -1427,6 +1427,16 @@ public class SwitchGLU: Module {
     private var fusedGateUpResolved = false
     private var fusedGateUpContract: (groupSize: Int, bits: Int, mode: QuantizationMode)?
 
+    /// Reuse the existing primary gate|up plane for sorted decode gathers.
+    /// Only the exact production contract below is admitted. Off leaves the
+    /// two split module calls and all their original strides unchanged.
+    private static let decodeGateUpJoinEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_EXPERT_GATEUP_JOIN"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Bind the concatenated gate|up storage whose slices the split
     /// projections were (or will be) loaded with. Load-time only.
     public func bindFusedGateUpStorage(_ storage: SwitchGateUpFusedStorage) {
@@ -1677,6 +1687,34 @@ public class SwitchGLU: Module {
                 x = downProj(
                     activated, idx, lhsIndices: downLhs, sortedIndices: true)
                 return (x, inverseOrder, true)
+            } else if Self.decodeGateUpJoinEnabled,
+                weightedReductionProfile == .gemma4ProductionGeGLU,
+                activationProduct == nil, isGeluActivation,
+                useLhsIndices, !useExpertPrefixBounds,
+                inputDims == 2816, hiddenDims == 704, numExperts == 128,
+                x.dtype == .bfloat16, idx.dtype == .uint32,
+                let decodeLhs = lhsIndices,
+                let fused = fusedGateUpDispatch()
+            {
+                // The load-time storage interleaves 16 gate columns with
+                // 16 up columns, repeated 44 times. Keep that physical order
+                // through the gather; each column retains its original
+                // K-chain and BF16 store boundary.
+                let joined = MLX.gatherQuantizedMM(
+                    x, fused.storage.weight,
+                    scales: fused.storage.scales, biases: fused.storage.biases,
+                    lhsIndices: decodeLhs, rhsIndices: idx, transpose: true,
+                    groupSize: fused.groupSize, bits: fused.bits,
+                    mode: fused.mode, sortedIndices: true)
+                let blocks = joined.reshaped(64, hiddenDims / 16, 2, 16)
+                xGate = blocks[.ellipsis, 0, 0...]
+                xUp = blocks[.ellipsis, 1, 0...]
+                // These [64, 44, 16] operands are views, not flattened
+                // copies. Apply the identical shaped GeGLU expression and
+                // reshape its compact result for the unchanged down gather.
+                promptActivated = compiledGeGLUShaped(xGate, xUp)
+                    .reshaped(64, 1, hiddenDims)
+                CBv2EngageMark.once("expert-gateup-join")
             } else {
                 xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
                 xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)

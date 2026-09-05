@@ -4047,7 +4047,7 @@ template <typename T, int group_size, int bits>
   const bool gemma4_pair_geometry =
       group_size == 64 && bits == 4 && M == 1 && batch_ndims == 1 &&
       batch_shape[0] == 64 && x_batch_ndims == 1 && w_batch_ndims == 1 &&
-      ((in_vec_size == 2816 && out_vec_size == 704) ||
+      ((in_vec_size == 2816 && (out_vec_size == 704 || out_vec_size == 1408)) ||
        (in_vec_size == 704 && out_vec_size == 2816));
   if (gemma4_pair_geometry) {
     // KERN-DOWN-TILE gate (strip-walk pattern): compile-time flip; ON

@@ -1558,6 +1558,25 @@ public class SwitchGLU: Module {
         sortedPlane: SwitchSortedPlaneProducer? = nil,
         routeTable: SwitchRouteTable? = nil
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
+        // An explicit prefill producer establishes that x is the original
+        // normalized token plane. Preserve it and gather only its row addresses
+        // inside the same NAX contraction; the 8x scatter is never evaluated.
+        if sortedPlane != nil,
+            weightedReductionProfile == .gemma4ProductionGeGLU,
+            activationProduct == nil, isGeluActivation,
+            Gemma4IndirectPrefillGateUpV1.admits(x: x, indices: indices),
+            let fused = fusedGateUpDispatch()
+        {
+            let order = gatherSortOrder(indices: indices, numExperts: numExperts)
+            let activated = Gemma4IndirectPrefillGateUpV1.call(
+                x: x, weight: fused.storage.weight,
+                scales: fused.storage.scales, biases: fused.storage.biases,
+                rowOrder: order.rowOrder, sortedKeys: order.sortedKeys)
+            CBv2EngageMark.once("prefill-indirect-a")
+            let output = downProj(
+                activated, order.sortedKeys, lhsIndices: nil, sortedIndices: true)
+            return (output, order.inverseOrder, true)
+        }
         let useLhsIndices =
             indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
             && x.ndim == 2 && x.shape == [8, inputDims]

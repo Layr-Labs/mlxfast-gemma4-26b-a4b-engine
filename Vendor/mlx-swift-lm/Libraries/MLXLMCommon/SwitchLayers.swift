@@ -2,8 +2,11 @@ import Foundation
 import MLX
 import MLXNN
 
-/// Identity gather table for the sorted 64-assignment decode geometry.
-nonisolated(unsafe) private let switchDownIdentity64 = MLXArray((0..<64).map { UInt32($0) })
+nonisolated(unsafe) private let switchDownIdentity64: MLXArray = {
+    let arr = MLXArray((0..<64).map { UInt32($0) })
+    eval(arr)
+    return arr
+}()
 
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
 
@@ -1081,7 +1084,7 @@ public func gatherSort(
         (indices.shape == [8, 8] || (indices.ndim == 1 && indices.size == 64)),
         indices.dtype == .uint32
     {
-        let flat = indices.flattened()
+        let flat = indices.ndim == 1 ? indices : indices.flattened()
         let outputs = routeSimdRank64Kernel(
             [flat],
             grid: (64, 1, 1),
@@ -1164,7 +1167,7 @@ public func gatherSortIndices(
         if expertPrefixBounds {
             CBv2EngageMark.once("expert-prefix-bounds")
         }
-        let flat = indices.flattened()
+        let flat = indices.ndim == 1 ? indices : indices.flattened()
         let kernel = expertPrefixBounds
             ? routeSimdRank64PrefixBoundsKernel : routeSimdRank64Kernel
         let outputs = kernel(

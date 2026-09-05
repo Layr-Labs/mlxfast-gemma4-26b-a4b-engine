@@ -311,6 +311,19 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         cohortPool == nil && keys == nil && values == nil && absoluteOffset == 0
     }
 
+    /// The capacity `update` would allocate for a fresh row committing
+    /// `committedCount` tokens. Exposed to the batched fresh-adoption path so
+    /// it can preserve the row's original prompt reservation while one
+    /// batched materializer emits private K and V allocations for every row.
+    /// Nil means adoption is not legal.
+    func freshAllocationCapacity(forCommittedCount committedCount: Int) -> Int? {
+        guard canAdoptFreshChunk,
+            committedCount >= 0,
+            committedCount <= maxLength
+        else { return nil }
+        return min(maxLength, max(capacity, committedCount))
+    }
+
     /// PREFILL-FULLKV-ADOPT: a strictly fresh row's first update, restructured
     /// to ADOPT the chunk tensor as the K/V storage instead of allocating a
     /// zero-filled capacity buffer and copying the chunk into it (the full-KV
@@ -319,50 +332,60 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
     /// holds byte-for-byte the values the incumbent path writes; the
     /// differences are all in unobservable or self-correcting territory:
     ///
-    /// - `capacity` is `n`, the adopted buffer's true extent (it MUST track
-    ///   the buffer: `ensureCapacity` skips growth on `needed <= capacity`,
-    ///   and slice appends index into the real dims). The incumbent path's
-    ///   `promptLength + initialSlack` headroom is gone, so the FIRST later
-    ///   append — append `n'` makes `offset + n' > capacity == offset` always
-    ///   — grows by the same doubling reallocation `ensureCapacity` always
-    ///   performs, into a fresh PRIVATE buffer. The growth mechanism, policy
-    ///   and cap are unchanged; only its first firing moves earlier.
-    /// - Because `capacity == absoluteOffset` for as long as the adopted
-    ///   buffer lives, the adopted storage is read-only by construction:
-    ///   every plain append takes the growth branch (write lands in the new
-    ///   private buffer), and every fused in-place writer (WRITE-022 /
-    ///   WRITE-016-D512) is admitted only on `dim(2) >= keyLength` headroom
-    ///   this buffer never has — the aliased chunk bytes can never be
-    ///   mutated through the row.
-    /// - `byteCount` reports the adopted buffers' `nbytes` — truthful for
-    ///   what is actually held (the caller's rectangle, kept alive by the
-    ///   eight row slices) and never smaller than what admission charged:
-    ///   the contiguous backend bills `max(byteCount, reservation)`.
+    /// - Storage capacity and committed length are independent. `capacity`
+    ///   tracks the adopted arrays' true dim(2), while `absoluteOffset`
+    ///   tracks only the committed prefix. The ranked batched caller may
+    ///   therefore preserve `promptLength + initialSlack` headroom in a
+    ///   private K and a private V allocation for each row, without exposing
+    ///   the zero-filled tail through any returned view.
+    /// - A later plain append writes or grows exactly as `update` would for a
+    ///   normally allocated row. Fused in-place writers may use reserved tail
+    ///   slots because their capacity gate sees the true storage extent.
+    /// - When storage has spare capacity, the caller MUST supply independent
+    ///   private K and V allocations. `byteCount` then reports their complete
+    ///   reserved extent, so releasing one row or copying either side on
+    ///   write cannot retain another row's uncharged allocation. Exact-capacity
+    ///   chunk-slice adoption keeps its established aliasing and first-growth
+    ///   behavior.
     ///
     /// Return views, `absoluteOffset`, `retainedCount`, `snapshot`,
     /// `rollback` and `cbv2InnerState` (still exactly two arrays) are the
     /// incumbent path's, with identical values.
-    func adoptFreshChunk(keys newKeys: MLXArray, values newValues: MLXArray)
+    func adoptFreshChunk(
+        keys newKeys: MLXArray, values newValues: MLXArray,
+        committedCount: Int
+    )
         -> (MLXArray, MLXArray)
     {
         precondition(
             canAdoptFreshChunk,
             "CBv2FullSequenceKV: fresh-chunk adoption requires a strictly fresh row")
-        let n = newKeys.dim(2)
+        precondition(
+            newKeys.ndim == 4 && newValues.ndim == 4,
+            "CBv2FullSequenceKV: adopted K/V storage must be rank four")
         precondition(newKeys.dim(0) == 1 && newValues.dim(0) == 1,
             "CBv2FullSequenceKV holds ONE sequence; got batch \(newKeys.dim(0))")
-        precondition(newKeys.dim(1) == kvHeads,
-            "CBv2FullSequenceKV: kvHeads mismatch (\(newKeys.dim(1)) != \(kvHeads))")
-        precondition(newValues.dim(2) == n,
-            "CBv2FullSequenceKV: keys/values token count mismatch")
         precondition(
-            absoluteOffset + n <= maxLength,
-            "CBv2FullSequenceKV: append past maxLength (\(absoluteOffset) + \(n) > \(maxLength)) — admission bug"
-        )
+            newKeys.dim(1) == kvHeads && newValues.dim(1) == kvHeads,
+            "CBv2FullSequenceKV: adopted K/V kvHeads mismatch")
+        precondition(
+            newKeys.dim(3) == headDim && newValues.dim(3) == headDim,
+            "CBv2FullSequenceKV: adopted K/V headDim mismatch")
+        let storageCapacity = newKeys.dim(2)
+        precondition(
+            newValues.dim(2) == storageCapacity,
+            "CBv2FullSequenceKV: adopted K/V capacity mismatch")
+        precondition(
+            storageCapacity > 0 && storageCapacity <= maxLength,
+            "CBv2FullSequenceKV: adopted storage capacity \(storageCapacity) exceeds bounds")
+        precondition(
+            committedCount >= 0 && committedCount <= storageCapacity,
+            "CBv2FullSequenceKV: committed prefix \(committedCount) exceeds adopted "
+                + "capacity \(storageCapacity)")
         keys = newKeys
         values = newValues
-        capacity = n
-        absoluteOffset = n
+        capacity = storageCapacity
+        absoluteOffset = committedCount
         return (
             keys![.ellipsis, ..<absoluteOffset, 0...],
             values![.ellipsis, ..<absoluteOffset, 0...]

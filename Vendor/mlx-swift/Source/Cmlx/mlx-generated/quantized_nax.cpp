@@ -985,7 +985,7 @@ METAL_FUNC void adjust_matrix_offsets(
 // Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_TILING=0 and SGM/SGN fold
 // back to WM/WN, which reproduces the shipped expressions byte for byte.
 #ifndef DARKBLOOM_GEMMA4_NAX_TILING
-#define DARKBLOOM_GEMMA4_NAX_TILING 0
+#define DARKBLOOM_GEMMA4_NAX_TILING 1
 #endif
 
 template <
@@ -1629,7 +1629,7 @@ METAL_FUNC void gather_rhs_mma_frag_row(
 // fold back to WM/WN, reproducing the shipped expressions byte for byte.
 // Independent of the qmm-t family's switch.
 #ifndef DARKBLOOM_GEMMA4_NAX_GATHER_TILING
-#define DARKBLOOM_GEMMA4_NAX_GATHER_TILING 0
+#define DARKBLOOM_GEMMA4_NAX_GATHER_TILING 1
 #endif
 
 template <

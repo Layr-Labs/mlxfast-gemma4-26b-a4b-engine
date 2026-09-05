@@ -137,6 +137,24 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// DA3-DECODE kill switch. Default ON. `0`/`false`/`no`/`off` makes
+    /// `matmulGeGLU` return nil, which sends the caller back to `zipGateUp`
+    /// plus the standalone GeLU product; the fused pipeline is never built and
+    /// its geometry never reaches the device, so the restoration is byte for
+    /// byte in the same binary.
+    ///
+    /// NOT `DARKBLOOM_GEMMA4_DENSE_GEGLU_EPILOGUE`, which is the promoted
+    /// PREFILL arm's switch (`Gemma4Text.swift`, engage mark
+    /// `dense-geglu-epilogue-prefill`). The two mechanisms are independent and
+    /// each needs its own switch flipped.
+    public static let mma8GateUpGeGLUEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DENSE_GEGLU_EPILOGUE_DECODE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
     /// W4-LOAD (engage mark `mlp-w4-load`). The four packed affine-8 codes a
     /// lane owns for one output row are four CONTIGUOUS bytes at a 4-byte
     /// aligned address, so they can be fetched as ONE aligned 32-bit load
@@ -905,6 +923,239 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         header: mma8GateUpStaticKHeader,
         ensureRowContiguous: true)
 
+    /// The paired A fill, and the tape. `MMA8_STEP8P`'s first three statements
+    /// are `MMA8_STEP8`'s expansion character for character; the three that
+    /// follow are the same statements with the up tile's codes and the up
+    /// tile's accumulator. `A` is written twice per step, exactly as the
+    /// incumbent writes it once per step, and neither `C` nor `Cu` is read
+    /// between them.
+    ///
+    /// `gemma4_dense_geglu_compiled_tape` is copied character for character
+    /// from the promoted prefill epilogue's copy in
+    /// `Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/steel/gemm/gemm.h`,
+    /// which is itself byte-identical to the expert path's
+    /// `gemma4_geglu_compiled_tape` in `kernels/quantized.h`. It reproduces the
+    /// Swift tape `gemma4SafeGeluProductShaped` node for node with one bfloat16
+    /// rounding per elementary operation, which is what the Compiled primitive
+    /// emits. GeGLU is elementwise, so there is no reduction order to match.
+    private static let geGLUPairedPreamble = """
+#define MMA8_STEP8P(BB, WLO, WHI, SH) A.thread_elements()[0] = float(extract_bits(wv.WLO, (SH), 8)); A.thread_elements()[1] = float(extract_bits(wv.WHI, (SH), 8)); simdgroup_multiply_accumulate(C, A, BB, C); A.thread_elements()[0] = float(extract_bits(wvu.WLO, (SH), 8)); A.thread_elements()[1] = float(extract_bits(wvu.WHI, (SH), 8)); simdgroup_multiply_accumulate(Cu, A, BB, Cu);
+
+// Match the Compiled primitive's typed tape exactly. Swift converts every
+// scalar literal to the array dtype, and each primitive writes a bfloat16
+// temporary before the next primitive reads it.
+template <typename T>
+inline T gemma4_dense_geglu_compiled_tape(T gate, T up) {
+  const T cubic_0 = static_cast<T>(static_cast<T>(0.044715f) * gate);
+  const T cubic_1 = static_cast<T>(cubic_0 * gate);
+  const T cubic_2 = static_cast<T>(cubic_1 * gate);
+  const T inner = static_cast<T>(gate + cubic_2);
+  const T scaled =
+      static_cast<T>(static_cast<T>(0.7978845608028654f) * inner);
+  const T curved = metal::precise::tanh(scaled);
+  const T shifted = static_cast<T>(static_cast<T>(1.0f) + curved);
+  const T half_gate = static_cast<T>(static_cast<T>(0.5f) * gate);
+  const T gelu = static_cast<T>(half_gate * shifted);
+  return static_cast<T>(gelu * up);
+}
+
+"""
+
+    /// DA3-DECODE. The dense MLP's GeGLU closed inside the store epilogue of
+    /// the joined gate|up MMA8 body, so the standalone product dispatch that
+    /// reads both halves back out of device memory disappears.
+    ///
+    /// Geometry. The incumbent gate/up body owns ONE eight-column output tile
+    /// per threadgroup, `n0 = tid.y * 8`, over the joined `[4224, 2816]` plane
+    /// whose rows `[0, 2112)` are gate and rows `[2112, 4224)` are up
+    /// (`Gemma4DenseGateUpStorage`, a plain concatenation). This body walks TWO
+    /// tiles per threadgroup, the second at `n0 + 2112`; `2112 / 8 == 264` is
+    /// exact, so `tid.y in [0, 264)` covers both halves once. The tile offset
+    /// is the only thing that changes: lane `(fm, fn)` already holds the two
+    /// cohort rows `fn` and `fn + 1` of ONE output column, so after the second
+    /// walk the same lane holds gate and up for the same column and the same
+    /// two rows. No shuffle, no threadgroup exchange, no relayout, no storage
+    /// change. The precedent is MMA-MT-001 (`AttentionQKVMMA8V1`), which runs
+    /// two arbitrary output tiles per simdgroup off one build of the x-side
+    /// operands.
+    ///
+    /// `N` is the half-plane column count 2112, not `w_shape[0]`: it is both
+    /// the up tile's row offset in the joined plane and the compact output's
+    /// row stride, so the two store statements stay text-for-text the
+    /// incumbent's.
+    ///
+    /// Exactness. The impl below is the promoted `..._gateup_k2816_impl` text
+    /// with additive transforms only; every statement the incumbent executes
+    /// for the gate tile is still executed, in order, on the same operands.
+    /// The x-side loads, the `mma8_runsum8` trees and the three-step shuffle
+    /// chain are functions of `(fm, fn, g)` alone and carry no dependence on
+    /// `n0`, so sharing them across the two tiles reproduces the value the
+    /// incumbent's second dispatch would have built. Each `C` still receives
+    /// its own eight `simdgroup_multiply_accumulate` steps in the incumbent
+    /// order; `MMA8_STEP8P` appends the up tile's step after the gate tile's
+    /// and never writes the gate accumulator. The KS = 2 close is widened from
+    /// `float2` to `float4` and adds `accu0/accu1` with the same one-term
+    /// `acc = acc + other` form, behind the same single barrier. Both
+    /// accumulators are rounded with `static_cast<T>` at exactly the boundary
+    /// the two device stores round at today, and the tape is then applied to
+    /// those two bfloat16 words -- the same two words the deleted dispatch
+    /// would have read back.
+    private static let mma8GateUpGeGLUHeader: String = {
+        let base = mma8GateUpStaticKHeader
+        let marker =
+            "// x is [8, K] with K % 64 == 0, w is packed [N, K / 4] uint32"
+        precondition(base.components(separatedBy: marker).count == 2)
+        let cut = base.range(of: marker)!.lowerBound
+        let prefix = String(base[..<cut])
+        var impl = String(base[cut...])
+
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(impl.components(separatedBy: old).count == 2)
+            impl = impl.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            "METAL_FUNC void gemma4_qmv_mma8_affine8_g64_gateup_k2816_impl(",
+            with:
+                "METAL_FUNC void gemma4_qmv_mma8_affine8_g64_gateup_k2816_geglu_impl("
+        )
+        replaceOnce(
+            "    threadgroup float2* red,",
+            with: "    threadgroup float4* red,")
+        replaceOnce(
+            """
+            // the first of the eight output rows this threadgroup owns. KS = 2 splits the
+            """,
+            with: """
+            // the first of the eight GATE output rows this threadgroup owns; it also owns
+            // the eight UP rows at `n0 + N`, where `N` is the half-plane width 2112 -- both
+            // that offset and the compact output's row stride. KS = 2 splits the
+            """)
+        replaceOnce(
+            """
+            // of scheduling. `red` is 32 float2 of threadgroup memory for the KS = 2 close.
+            """,
+            with: """
+            // of scheduling. `red` is 32 float4 of threadgroup memory: the KS = 2 close
+            // carries both tiles' pairs through the one barrier the incumbent already has.
+            """)
+        replaceOnce(
+            """
+              const device uint8_t* wrow =
+                  (const device uint8_t*)w + (n0 + c.fm) * K + 8 * c.fn;
+              const device T* srow = scales + (n0 + c.fm) * G;
+              const device T* brow = biases + (n0 + c.fm) * G;
+            """,
+            with: """
+              const device uint8_t* wrow =
+                  (const device uint8_t*)w + (n0 + c.fm) * K + 8 * c.fn;
+              const device T* srow = scales + (n0 + c.fm) * G;
+              const device T* brow = biases + (n0 + c.fm) * G;
+              const device uint8_t* wrowu =
+                  (const device uint8_t*)w + (n0 + N + c.fm) * K + 8 * c.fn;
+              const device T* srowu = scales + (n0 + N + c.fm) * G;
+              const device T* browu = biases + (n0 + N + c.fm) * G;
+            """)
+        replaceOnce(
+            """
+              float acc0 = 0.0f;
+              float acc1 = 0.0f;
+            """,
+            with: """
+              float acc0 = 0.0f;
+              float acc1 = 0.0f;
+              float accu0 = 0.0f;
+              float accu1 = 0.0f;
+            """)
+        replaceOnce(
+            """
+                const uint4 wv = *((const device uint4*)(wrow + 64 * g));
+                const float s = float(srow[g]);
+                const float b = float(brow[g]);
+            """,
+            with: """
+                const uint4 wv = *((const device uint4*)(wrow + 64 * g));
+                const float s = float(srow[g]);
+                const float b = float(brow[g]);
+                const uint4 wvu = *((const device uint4*)(wrowu + 64 * g));
+                const float su = float(srowu[g]);
+                const float bu = float(browu[g]);
+            """)
+        replaceOnce(
+            "    simdgroup_float8x8 C = simdgroup_float8x8(0.0f);",
+            with: """
+                simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+                simdgroup_float8x8 Cu = simdgroup_float8x8(0.0f);
+            """)
+        precondition(impl.components(separatedBy: "MMA8_STEP8(").count == 9)
+        impl = impl.replacingOccurrences(
+            of: "MMA8_STEP8(", with: "MMA8_STEP8P(")
+        replaceOnce(
+            """
+                acc0 += s * C.thread_elements()[0] + rs.x * b;
+                acc1 += s * C.thread_elements()[1] + rs.y * b;
+            """,
+            with: """
+                acc0 += s * C.thread_elements()[0] + rs.x * b;
+                acc1 += s * C.thread_elements()[1] + rs.y * b;
+                accu0 += su * Cu.thread_elements()[0] + rs.x * bu;
+                accu1 += su * Cu.thread_elements()[1] + rs.y * bu;
+            """)
+        replaceOnce(
+            """
+                  red[simd_lid] = float2(acc0, acc1);
+            """,
+            with: """
+                  red[simd_lid] = float4(acc0, acc1, accu0, accu1);
+            """)
+        replaceOnce(
+            """
+                const float2 other = red[simd_lid];
+                acc0 = acc0 + other.x;
+                acc1 = acc1 + other.y;
+            """,
+            with: """
+                const float4 other = red[simd_lid];
+                acc0 = acc0 + other.x;
+                acc1 = acc1 + other.y;
+                accu0 = accu0 + other.z;
+                accu1 = accu1 + other.w;
+            """)
+        replaceOnce(
+            """
+              y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
+              y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
+            """,
+            with: """
+              const T gate0 = static_cast<T>(acc0);
+              const T gate1 = static_cast<T>(acc1);
+              const T up0 = static_cast<T>(accu0);
+              const T up1 = static_cast<T>(accu1);
+              y[c.fn * N + n0 + c.fm] =
+                  gemma4_dense_geglu_compiled_tape<T>(gate0, up0);
+              y[(c.fn + 1) * N + n0 + c.fm] =
+                  gemma4_dense_geglu_compiled_tape<T>(gate1, up1);
+            """)
+
+        return prefix + Self.geGLUPairedPreamble + impl
+    }()
+
+    private static let mma8GateUpGeGLUKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_k2816_geglu_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float4 red[32];
+            gemma4_qmv_mma8_affine8_g64_gateup_k2816_geglu_impl<T, 2>(
+                w, scales, biases, x, y,
+                w_shape[0] / 2, int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            """,
+        header: mma8GateUpGeGLUHeader,
+        ensureRowContiguous: true)
+
     /// One complete SIMD group per g64 group. Keep all lane results rather
     /// than canonicalizing row sums: the consumer reads its own lane's tree.
     private static let mma8DownLaneSumKernel = MLXFast.metalKernel(
@@ -1397,6 +1648,64 @@ inline U qdot_affine8_registered_v4(
             inputs,
             template: [("T", x.dtype)],
             grid: (xGroups * simdWidth, yGroups * simdGroups, 1),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [[batch, sequence, outDim]],
+            outputDTypes: [x.dtype]
+        )[0]
+    }
+
+    /// DA3-DECODE. One dispatch over the joined `[4224, 2816]` gate|up plane
+    /// that returns the GeGLU-activated `[8, 1, 2112]` dense plane directly.
+    /// Returns nil unless every pin of the incumbent gate/up MMA8 arm holds
+    /// AND the joined 4,224-row geometry is the one presented, so the only
+    /// caller that can reach it is the decode joined-plane site; the split
+    /// 2,112-row gate and up projections, the down plane, prefill and every
+    /// other rectangle keep `matmul` untouched.
+    ///
+    /// The two upstream bisection knobs are pins, not defaults: with
+    /// `DARKBLOOM_GEMMA4_MLP_MMA8_GATEUP=0` or
+    /// `DARKBLOOM_GEMMA4_MLP_GATEUP_STATIC_K=0` this arm falls closed too, so
+    /// those switches keep bisecting exactly what they bisect today.
+    public static func matmulGeGLU(
+        x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> MLXArray? {
+        let inDim = 2816
+        let outDim = 2112
+        guard enabled,
+            mma8GateUpGeGLUEnabled,
+            mma8GateUpEnabled,
+            mma8GateUpStaticKEnabled,
+            groupSize == Self.groupSize,
+            bits == Self.bits,
+            mode == .affine,
+            let biases,
+            x.dtype == .bfloat16,
+            scales.dtype == x.dtype,
+            biases.dtype == x.dtype,
+            weight.dtype == .uint32,
+            x.ndim == 3,
+            x.dim(0) == batch,
+            x.dim(1) == sequence,
+            x.dim(2) == inDim,
+            x.size == batch * sequence * inDim,
+            weight.ndim == 2,
+            weight.dim(0) == 2 * outDim,
+            weight.dim(1) == inDim * Self.bits / 32,
+            scales.shape == [2 * outDim, inDim / Self.groupSize],
+            biases.shape == scales.shape
+        else { return nil }
+        CBv2EngageMark.once("dense-geglu-epilogue-decode")
+        let yTiles = outDim / outputsPerGroup
+        return mma8GateUpGeGLUKernel(
+            [x, weight, scales, biases],
+            template: [("T", x.dtype)],
+            grid: (simdWidth, yTiles * simdGroups, 1),
             threadGroup: (simdWidth, simdGroups, 1),
             outputShapes: [[batch, sequence, outDim]],
             outputDTypes: [x.dtype]

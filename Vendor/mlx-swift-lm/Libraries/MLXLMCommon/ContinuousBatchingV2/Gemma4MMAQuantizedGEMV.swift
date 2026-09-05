@@ -3280,6 +3280,12 @@ public enum Gemma4MMAQuantizedGEMV {
                     outputDTypes: [.float32]
                 )[0]
             }
+            if version == 27, !relayoutXCheck,
+                let logits = Gemma4TensorHeadV1.projection(
+                    x: flatX, w: w, scales: scales, biases: biases, sums: xSums)
+            {
+                return logits
+            }
             switch version {
             case 27:
                 if carryEnabled {
@@ -3598,6 +3604,18 @@ public enum Gemma4MMAQuantizedGEMV {
                 threadGroup: (sumThreads, 1, 1),
                 outputShapes: [[sumCells]],
                 outputDTypes: [.float32]
+            )[0]
+        }
+
+        if !relayoutXCheck,
+            let partials = Gemma4TensorHeadV1.partialArgmax(
+                x: flatX, w: w, scales: scales, biases: biases, sums: xSums)
+        {
+            return argmaxReduceKernel(
+                [partials.values, partials.indices],
+                template: [("NT", partials.tiles)],
+                grid: (mRows * 32, 1, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[mRows]], outputDTypes: [.int32]
             )[0]
         }
 

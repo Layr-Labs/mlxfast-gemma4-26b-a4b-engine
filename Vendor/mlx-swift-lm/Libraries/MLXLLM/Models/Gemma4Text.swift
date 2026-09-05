@@ -7711,6 +7711,8 @@ private let gemma4DecodeHeadNormXSumFoldEnabled: Bool = {
 /// first-index-wins tie rule. See `Gemma4MMAQuantizedGEMV.applyArgmax`.
 extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
 
+    public var cbv2ArgmaxOutputCoversCacheMutations: Bool { true }
+
     public func cbv2AdmitsArgmaxDecode(_ tokens: MLXArray) -> Bool {
         guard tokens.ndim == 2, tokens.dim(1) == 1 else { return false }
         guard config.finalLogitSoftcapping >= 0 else { return false }

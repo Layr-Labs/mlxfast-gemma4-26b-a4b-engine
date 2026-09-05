@@ -1550,6 +1550,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // falls through to the established logits-then-sample chain below.
         let sampled: MLXArray
         let cacheInnerState: [MLXArray]
+        var sampledInCacheRoots = false
         let stepLogprobs: CBv2StepLogprobs?
         if let fusedSampler = sampler as? CBv2FusedGreedySampler,
             let fusedModel = model as? CBv2ArgmaxDecodeSteppableModel,
@@ -1558,7 +1559,15 @@ public final class EngineLoopV2: @unchecked Sendable {
         {
             let caches = eagerCaches(rowStates: rowStates)
             sampled = fusedModel.decodeArgmax(tokens: inputs, caches: caches)
-            cacheInnerState = eagerCacheInnerState(caches)
+            if cbv2CompactDecodeRootsEnabled,
+                let compact = fusedModel.compactArgmaxDecodeEvaluationRoots(
+                    sampledTokens: sampled, caches: caches)
+            {
+                cacheInnerState = compact
+                sampledInCacheRoots = true
+            } else {
+                cacheInnerState = eagerCacheInnerState(caches)
+            }
             stepLogprobs = nil
             fusedSampler.noteFusedGreedySample()
             if CBv2StepProfiler.enabled {
@@ -1592,7 +1601,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
         }
         scheduler.markPendingSamples(ids: ids)
-        var toEval = [sampled]
+        var toEval = sampledInCacheRoots ? [] : [sampled]
         if let stepLogprobs { toEval.append(contentsOf: stepLogprobs.evalTargets) }
         // Collapse the eager caches' lazy offset/KV chains this step (DAR-325).
         if !cacheInnerState.isEmpty {

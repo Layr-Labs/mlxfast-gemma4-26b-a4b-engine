@@ -683,6 +683,32 @@ enum CBv2PrefillSoftmaxVecV1 {
         return max(1, min(640 / threadgroupSize, 1024 / threadgroupSize))
     }
 
+    /// SOFTMAX-PARAMS-5F4B: the parameter buffer holds two words that are a
+    /// pure function of the score rectangle's last axis. The ranked prompt
+    /// widths are a closed set, so their arrays are built and evaluated once
+    /// at first touch and handed to the kernel by reference afterwards.
+    /// A width outside the table falls through to the incumbent construction,
+    /// so the words the kernel reads are identical either way.
+    nonisolated(unsafe) private static let precomputedParams: [Int: MLXArray] = {
+        var table: [Int: MLXArray] = [:]
+        for axis in [128, 256, 384, 512, 640, 768, 896, 1024] {
+            let tg = ((axis + 3) / 4 + 31) / 32 * 32
+            let numSimdgroups = tg / 32
+            let arr = MLXArray([UInt32(axis), UInt32(numSimdgroups)])
+            eval(arr)
+            table[axis] = arr
+        }
+        return table
+    }()
+
+    @inline(__always)
+    private static func getParams(axisSize: Int, numSimdgroups: Int) -> MLXArray {
+        if let hit = precomputedParams[axisSize] {
+            return hit
+        }
+        return MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+    }
+
     /// Runs the vectorized softmax, or returns nil to keep the caller on
     /// the stock `MLX.softmax(scores, axis: -1, precise: true)` call.
     /// `scores` may be any contiguous rank; it is treated as a flat
@@ -700,7 +726,7 @@ enum CBv2PrefillSoftmaxVecV1 {
         let threadgroupSize = ((axisSize + 3) / 4 + 31) / 32 * 32
         guard threadgroupSize > 0, threadgroupSize <= 1024 else { return nil }
         let numSimdgroups = threadgroupSize / 32
-        let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        let paramsArray = getParams(axisSize: axisSize, numSimdgroups: numSimdgroups)
 
         // PROMPT-GLUE2 (pg2): prompt-width score rectangles take the
         // rows-per-threadgroup twin; the incumbent computes the identical

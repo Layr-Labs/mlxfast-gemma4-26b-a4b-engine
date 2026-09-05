@@ -10,7 +10,6 @@ import MLXLMCommon
 import MLXNN
 
 // Yukon executable-equivalent frontier sample: delordemm1 / e8f / de1.
-// Yukon bounded redraw: a9f26610 preserved 4/4 parity and reached 1.649436375 s decode.
 
 // MARK: - vMLX decode hot-path helpers (ported from osaurus/main Gemma4Text)
 //
@@ -1080,7 +1079,6 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
     source: """
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
-        constexpr uint row_simds = row_threads / 32;
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
         const uint lid = tid - slot * row_threads;
@@ -1089,6 +1087,7 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
         const uint row_simd = lid / 32;
 
         threadgroup float partials[RPT][32];
+        threadgroup float inv_rms[RPT];
         threadgroup T rounded[RPT][D];
         threadgroup uint row_position[RPT];
 
@@ -1139,22 +1138,22 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        // Lanes at or above row_simds contribute exactly zero, so the 32-lane
-        // combine returns the simdgroup partials' sum whatever order the tree
-        // adds them in.
+        // Slots 2..31 stay exactly zero, so the 32-lane combine returns the
+        // two simdgroup partials' sum whatever order the tree adds them in.
+        if (row_simd == 0) partials[slot][lane] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // pg2's combine. Every simdgroup of the row reduces the same
-        // thirty-two operands the incumbent's first simdgroup reduced: the
-        // partials below row_simds, and the zero-fill's 0.0f from a register
-        // above it. Each therefore holds the bit-identical inverse rms with
-        // no zero-fill pass and no publish-back barrier.
-        sum = simd_sum(lane < row_simds ? partials[slot][lane] : 0.0f);
-        const float row_inverse_rms =
-            metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+        if (row_simd == 0) {
+            sum = simd_sum(partials[slot][lane]);
+            if (lane == 0) {
+                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (row >= TOTAL_ROWS) return;
-        const float inverse_rms = row_inverse_rms;
+        const float inverse_rms = inv_rms[slot];
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
             if (APPLY_ROPE) {
@@ -1280,7 +1279,6 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
     source: """
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
-        constexpr uint row_simds = row_threads / 32;
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
         const uint lid = tid - slot * row_threads;
@@ -1289,6 +1287,7 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
         const uint row_simd = lid / 32;
 
         threadgroup float partials[RPT][32];
+        threadgroup float inv_rms[RPT];
         threadgroup T rounded[RPT][D];
         threadgroup uint row_position[RPT];
 
@@ -1343,19 +1342,20 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
+        if (row_simd == 0) partials[slot][lane] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // pg2's combine. Every simdgroup of the row reduces the same
-        // thirty-two operands the incumbent's first simdgroup reduced: the
-        // partials below row_simds, and the zero-fill's 0.0f from a register
-        // above it. Each therefore holds the bit-identical inverse rms with
-        // no zero-fill pass and no publish-back barrier.
-        sum = simd_sum(lane < row_simds ? partials[slot][lane] : 0.0f);
-        const float row_inverse_rms =
-            metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+        if (row_simd == 0) {
+            sum = simd_sum(partials[slot][lane]);
+            if (lane == 0) {
+                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (row >= TOTAL_ROWS) return;
-        const float inverse_rms = row_inverse_rms;
+        const float inverse_rms = inv_rms[slot];
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
             if (APPLY_ROPE && weighted) {
@@ -1419,7 +1419,6 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
     source: """
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
-        constexpr uint row_simds = row_threads / 32;
         constexpr uint mirror_row_words = D / 8 + D / 64;
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
@@ -1429,6 +1428,7 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
         const uint row_simd = lid / 32;
 
         threadgroup float partials[RPT][32];
+        threadgroup float inv_rms[RPT];
         threadgroup T rounded[RPT][D];
         threadgroup uint row_position[RPT];
         threadgroup T final_vals[RPT][D];
@@ -1491,19 +1491,20 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
+        if (row_simd == 0) partials[slot][lane] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // pg2's combine. Every simdgroup of the row reduces the same
-        // thirty-two operands the incumbent's first simdgroup reduced: the
-        // partials below row_simds, and the zero-fill's 0.0f from a register
-        // above it. Each therefore holds the bit-identical inverse rms with
-        // no zero-fill pass and no publish-back barrier.
-        sum = simd_sum(lane < row_simds ? partials[slot][lane] : 0.0f);
-        const float row_inverse_rms =
-            metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+        if (row_simd == 0) {
+            sum = simd_sum(partials[slot][lane]);
+            if (lane == 0) {
+                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (valid) {
-            const float inverse_rms = row_inverse_rms;
+            const float inverse_rms = inv_rms[slot];
             for (uint i = 0; i < reads; ++i) {
                 const T normalized = T(float(input[i]) * inverse_rms);
                 if (APPLY_ROPE && weighted) {
@@ -5189,8 +5190,7 @@ private class Gemma4MLP: Module {
     /// Swift admission mirrors the kernel-side uniform predicate exactly;
     /// a nil keeps the incumbent split road untouched.
     fileprivate func zipPrefillGateUpGeGLU(_ x: MLXArray) -> MLXArray? {
-        guard x.ndim >= 2, x.dim(-2) >= 512, x.dim(-1) == 2816,
-            gemma4DenseGeGLUEpilogueEnabled,
+        guard gemma4DenseGeGLUEpilogueEnabled,
             Gemma4PrefillDeqGEMMV1.enabled,
             let gate = gateProj as? QuantizedLinear,
             let up = upProj as? QuantizedLinear,
@@ -5254,7 +5254,7 @@ private class Gemma4MLP: Module {
     ) -> MLXArray {
         // DENSE-GEGLU-EPILOGUE: the exact prefill geometry closes GeGLU inside
         // the single paired GEMM; every other rectangle falls through.
-        if x.ndim >= 2 && x.dim(-2) >= 512, let activated = zipPrefillGateUpGeGLU(x) {
+        if let activated = zipPrefillGateUpGeGLU(x) {
             return denseProjection(downProj, activated)
         }
         // DMLP-002: one exact activation-sum prepass feeds both fallback
@@ -6418,6 +6418,7 @@ public class Gemma4TextModelInner: Module {
 
     // KV sharing mapping: for each layer, which earlier layer provides KVs
     let previousKvs: [Int]
+    let hasCrossLayerKVSharing: Bool
     let firstKvSharedLayerIdx: Int
 
     /// Index of the last non-shared full-attention layer (-1 if none).
@@ -6472,6 +6473,7 @@ public class Gemma4TextModelInner: Module {
             }
         }
         self.previousKvs = kvMap
+        self.hasCrossLayerKVSharing = kvMap.enumerated().contains { $0.offset != $0.element }
 
         // Capture indices for MTP drafter: the last layer of each type that
         // still has its own K/V (not shared from an earlier layer).
@@ -6739,15 +6741,16 @@ public class Gemma4TextModelInner: Module {
 
         // Forward through layers, tracking intermediate KV pairs for sharing
         var intermediates = [(kv: (MLXArray, MLXArray)?, positionOffset: Gemma4.PositionOffset?)](
-            repeating: (nil, nil), count: config.numHiddenLayers)
+            repeating: (nil, nil), count: hasCrossLayerKVSharing ? config.numHiddenLayers : 0)
 
         // GLUE-003: one chain box per forward; layer L's fused tail hands
         // layer L+1 its input norm through it.
         let glueChain = Gemma4GlueChainBox()
         for (idx, layer) in layers.enumerated() {
             let prevIdx = previousKvs[idx]
-            let sharedKV = intermediates[prevIdx].kv
-            let sharedPositionOffset = intermediates[prevIdx].positionOffset
+            let sharedKV = hasCrossLayerKVSharing ? intermediates[prevIdx].kv : nil
+            let sharedPositionOffset =
+                hasCrossLayerKVSharing ? intermediates[prevIdx].positionOffset : nil
 
             // CBv2: KV-shared layers attend by borrowing the SOURCE layer's
             // cache object (attendBorrowing) instead of consuming raw K/V
@@ -6767,14 +6770,13 @@ public class Gemma4TextModelInner: Module {
             let outputTailRows: Int? =
                 isFinalPromptLayer && gemma4PrefillTailRows > 0
                 ? min(gemma4PrefillTailRows, h.dim(1)) : nil
-            let useLastQueryPrefill = outputTailRows == 1
-                && gemma4UseLastQueryPrefill(
-                    config,
-                    layerIdx: idx,
-                    batchSize: h.dim(0),
-                    sequenceLength: h.dim(1),
-                    outputTailRows: outputTailRows,
-                    hasCapableCache: fullCache[idx] is any CBv2LastQueryPrefillLayerCache)
+            let useLastQueryPrefill = gemma4UseLastQueryPrefill(
+                config,
+                layerIdx: idx,
+                batchSize: h.dim(0),
+                sequenceLength: h.dim(1),
+                outputTailRows: outputTailRows,
+                hasCapableCache: fullCache[idx] is any CBv2LastQueryPrefillLayerCache)
             let (out, kvPair, positionOffset) = layer(
                 h,
                 mask: mask,
@@ -6800,7 +6802,9 @@ public class Gemma4TextModelInner: Module {
                     && !capturePreNorm && dFlashHiddenCapture == nil
             )
             h = out
-            intermediates[idx] = (kvPair, positionOffset)
+            if hasCrossLayerKVSharing {
+                intermediates[idx] = (kvPair, positionOffset)
+            }
             captureHook?(idx, kvPair)
             dFlashHiddenCapture?.capture(h, layer: idx)
 

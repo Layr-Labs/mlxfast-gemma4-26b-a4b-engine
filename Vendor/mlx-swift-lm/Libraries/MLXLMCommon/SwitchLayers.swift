@@ -378,7 +378,10 @@ private func geGLUClaimsPrefill(_ gate: MLXArray, _ up: MLXArray) -> Bool {
 
 @inline(__always)
 private func geGLUProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
-    if geGLUClaimsPinnedDecode(gate, up) || geGLUClaimsPrefill(gate, up) {
+    if geGLUClaimsPinnedDecode(gate, up) {
+        return Gemma4DecodeGeluLookupV1.apply(gate, up) ?? compiledGeGLUShaped(gate, up)
+    }
+    if geGLUClaimsPrefill(gate, up) {
         return compiledGeGLUShaped(gate, up)
     }
     return compiledGeGLU(gate, up)

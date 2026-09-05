@@ -137,6 +137,15 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Close the joined dense gate/up projection with its exact BF16 GeGLU
+    /// product. Off restores the joined projection and separate activation.
+    public static let gateUpGeGLUEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_GATEUP_GELU_FUSE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// W4-LOAD (engage mark `mlp-w4-load`). The four packed affine-8 codes a
     /// lane owns for one output row are four CONTIGUOUS bytes at a 4-byte
     /// aligned address, so they can be fetched as ONE aligned 32-bit load
@@ -905,6 +914,104 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         header: mma8GateUpStaticKHeader,
         ensureRowContiguous: true)
 
+    /// Four SIMD groups: the original two K halves for gate, and the
+    /// original two K halves for up. Each projection retains its 22+22 group
+    /// accumulation and final two-part add. A small shared gate tile permits
+    /// the up owner to emit the BF16 activation product without two device
+    /// intermediate planes or a separate activation dispatch.
+    private static let gateUpGeGLUHeader: String = {
+        var result = mma8GateUpStaticKHeader
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(
+            "gemma4_qmv_mma8_affine8_g64_gateup_k2816_impl(",
+            with: "gemma4_qmv_mma8_affine8_g64_gateup_geglu_impl(")
+        replaceOnce(
+            """
+                const device T* x,
+                device T* y,
+            """,
+            with: """
+                const device T* x,
+                const device T* table,
+                threadgroup T* gateStaging,
+                device T* y,
+            """)
+        replaceOnce(
+            "  const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;",
+            with: """
+              const uint projection = simd_gid >> 1;
+              const uint kPart = simd_gid & 1;
+              const int g0 = kPart == 1 ? gh : 0;
+            """)
+        replaceOnce(
+            "(const device uint8_t*)w + (n0 + c.fm) * K + 8 * c.fn",
+            with: "(const device uint8_t*)w + (projection * N + n0 + c.fm) * K + 8 * c.fn")
+        replaceOnce(
+            "scales + (n0 + c.fm) * G",
+            with: "scales + (projection * N + n0 + c.fm) * G")
+        replaceOnce(
+            "biases + (n0 + c.fm) * G",
+            with: "biases + (projection * N + n0 + c.fm) * G")
+        replaceOnce(
+            """
+              if (KS == 2) {
+                if (simd_gid == 1) {
+                  red[simd_lid] = float2(acc0, acc1);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_gid == 1) {
+                  return;
+                }
+                const float2 other = red[simd_lid];
+                acc0 = acc0 + other.x;
+                acc1 = acc1 + other.y;
+              }
+
+              y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
+              y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
+            """,
+            with: """
+              if (kPart == 1) red[projection * 32 + simd_lid] = float2(acc0, acc1);
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              if (kPart == 0) {
+                const float2 other = red[projection * 32 + simd_lid];
+                acc0 = acc0 + other.x;
+                acc1 = acc1 + other.y;
+                if (projection == 0) {
+                  gateStaging[c.fn * 8 + c.fm] = T(acc0);
+                  gateStaging[(c.fn + 1) * 8 + c.fm] = T(acc1);
+                }
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              if (projection == 1 && kPart == 0) {
+                const T g0v = gateStaging[c.fn * 8 + c.fm];
+                const T g1v = gateStaging[(c.fn + 1) * 8 + c.fm];
+                y[c.fn * N + n0 + c.fm] = table[uint(bfloat16_to_uint16(g0v))] * T(acc0);
+                y[(c.fn + 1) * N + n0 + c.fm] = table[uint(bfloat16_to_uint16(g1v))] * T(acc1);
+              }
+            """)
+        return result
+    }()
+
+    private static let gateUpGeGLUKernel = MLXFast.metalKernel(
+        name: "cbv2_dense_gateup_geglu_cooperative_bf16_v1",
+        inputNames: ["x", "w", "scales", "biases", "table"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            threadgroup T gateStaging[64];
+            gemma4_qmv_mma8_affine8_g64_gateup_geglu_impl<T, 2>(
+                w, scales, biases, x, table, gateStaging, y,
+                2112, int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+            """,
+        header: gateUpGeGLUHeader,
+        ensureRowContiguous: true)
+
     /// One complete SIMD group per g64 group. Keep all lane results rather
     /// than canonicalizing row sums: the consumer reads its own lane's tree.
     private static let mma8DownLaneSumKernel = MLXFast.metalKernel(
@@ -1277,6 +1384,28 @@ inline U qdot_affine8_registered_v4(
             values.size == blocks * simdWidth * batch
         else { return nil }
         return ActivationSums(values: values)
+    }
+
+    /// Joined affine8 gate/up storage -> compact activated dense plane.
+    /// Every admission check precedes table initialization or graph creation.
+    public static func gateUpGeGLU(
+        x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray?,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) -> MLXArray? {
+        guard enabled, gateUpGeGLUEnabled,
+            mma8GateUpEnabled, mma8GateUpStaticKEnabled,
+            groupSize == 64, bits == 8, mode == .affine,
+            x.dtype == .bfloat16, x.shape == [8, 1, 2816],
+            weight.dtype == .uint32, weight.shape == [4224, 704],
+            scales.dtype == .bfloat16, scales.shape == [4224, 44],
+            let biases, biases.dtype == .bfloat16, biases.shape == scales.shape,
+            let table = Gemma4DecodeGeluLookupV1.denseFusionTable()
+        else { return nil }
+        CBv2EngageMark.once("dense-gateup-gelu-fuse")
+        return gateUpGeGLUKernel(
+            [x, weight, scales, biases, table], template: [("T", DType.bfloat16)],
+            grid: (32, (2112 / 8) * 4, 1), threadGroup: (32, 4, 1),
+            outputShapes: [[8, 1, 2112]], outputDTypes: [.bfloat16], stream: .gpu)[0]
     }
 
     /// Returns `nil` unless every production pin holds. The caller then invokes

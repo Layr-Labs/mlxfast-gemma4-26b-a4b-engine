@@ -586,6 +586,20 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             // the next step boundary instead of running a begin-only cohort
             // to its token ceiling or to `shutdownTimeout`.
             loop.requestCancelAllLive()
+            if mtpInactiveReason == nil {
+                // A verify step can still be constructing custom kernels.
+                // Retire it before the worker can destroy Metal's caches
+                // at process exit or read the final acceptance audit.
+                await loop.drain()
+                if CBv2StepProfiler.enabled {
+                    FileHandle.standardError.write(
+                        Data(
+                            ("[mtpRun] step profile\n"
+                                + CBv2StepProfiler.summaryTable() + "\n").utf8))
+                    CBv2StepProfiler.reset()
+                }
+                return
+            }
             // .userInitiated: a starved lower-priority drain would leave the
             // engine loop thread alive (and any joiner waiting) through the
             // caller's next work — measured locally as a real regression.
@@ -596,6 +610,13 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             return
         }
         await loop.drain()
+        if CBv2StepProfiler.enabled {
+            FileHandle.standardError.write(
+                Data(
+                    ("[serialRun] step profile\n"
+                        + CBv2StepProfiler.summaryTable() + "\n").utf8))
+            CBv2StepProfiler.reset()
+        }
     }
 
     /// Always-synchronous variant for unscored callers (e.g. the constructor

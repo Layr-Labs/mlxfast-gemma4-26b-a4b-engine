@@ -495,12 +495,69 @@ public enum Gemma4PrefillGlueV1 {
         ensureRowContiguous: true
     )
 
+    /// SCATVEC kill switch: `DARKBLOOM_GEMMA4_PREFILL_SCATTER_VEC4` set to
+    /// `0`/`false`/`no`/`off` restores the incumbent scatter body and the
+    /// incumbent registration name byte for byte. Default ON.
+    public static let scatterVec4Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_SCATTER_VEC4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// The incumbent scatter epilogue: K dependent index loads, each followed
+    /// by GLUE_NREADS scalar stores into the lane's own four-element window.
+    private static let scatterEpilogueScalar = """
+        // Assignment t * K + k of this row owns sorted position
+        // inverse[t * K + k]. The inverse order is a permutation of the
+        // plane rows, so every plane row is written exactly once.
+        const size_t assignment_base = size_t(row) * K;
+        for (int k = 0; k < K; k++) {
+            const size_t pos = size_t(inverse[assignment_base + k]);
+            const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                out[obase + i] = normed[i];
+            }
+        }
+        """
+
+    /// The same epilogue with the K index loads hoisted ahead of every store
+    /// and each lane's four-element window written as one `vec<T, 4>`.
+    /// `GLUE_AXIS % GLUE_NREADS == 0` and `lid * GLUE_NREADS % GLUE_NREADS == 0`,
+    /// so `obase` is a multiple of four elements and the eight-byte vector
+    /// store is aligned for every lane and every sorted position.
+    private static let scatterEpilogueVec4 = """
+        // Assignment t * K + k of this row owns sorted position
+        // inverse[t * K + k]. The inverse order is a permutation of the
+        // plane rows, so every plane row is written exactly once.
+        const size_t assignment_base = size_t(row) * K;
+        uint positions[K];
+        #pragma clang loop unroll(full)
+        for (int k = 0; k < K; k++) {
+            positions[k] = inverse[assignment_base + k];
+        }
+        vec<T, GLUE_NREADS> normed_v;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < GLUE_NREADS; i++) {
+            normed_v[i] = normed[i];
+        }
+        #pragma clang loop unroll(full)
+        for (int k = 0; k < K; k++) {
+            const size_t obase =
+                size_t(positions[k]) * GLUE_AXIS + lid * GLUE_NREADS;
+            *((device vec<T, GLUE_NREADS>*)(out + obase)) = normed_v;
+        }
+        """
+
     /// `dualPreNorm`'s second output written straight into expert-sorted
     /// order. One threadgroup per token row, as before; the row's normed
     /// values are computed once into registers and stored to each of the
     /// row's K sorted positions.
     private static let preNormScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_prenorm_scatter_2816_unroll_v2",
+        name: scatterVec4Enabled
+            ? "gemma4_prefill_glue_prenorm_scatter_2816_scatvec_v3"
+            : "gemma4_prefill_glue_prenorm_scatter_2816_unroll_v2",
         inputNames: ["x", "w", "inverse"],
         outputNames: ["out"],
         source: """
@@ -534,18 +591,7 @@ public enum Gemma4PrefillGlueV1 {
                 normed[i] = w[j] * scaled;
             }
 
-            // Assignment t * K + k of this row owns sorted position
-            // inverse[t * K + k]. The inverse order is a permutation of the
-            // plane rows, so every plane row is written exactly once.
-            const size_t assignment_base = size_t(row) * K;
-            for (int k = 0; k < K; k++) {
-                const size_t pos = size_t(inverse[assignment_base + k]);
-                const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
-                #pragma clang loop unroll(full)
-                for (int i = 0; i < GLUE_NREADS; i++) {
-                    out[obase + i] = normed[i];
-                }
-            }
+            \(scatterVec4Enabled ? scatterEpilogueVec4 : scatterEpilogueScalar)
             """,
         header: kernelHeader,
         ensureRowContiguous: true

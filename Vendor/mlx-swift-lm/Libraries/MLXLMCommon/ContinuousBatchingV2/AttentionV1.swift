@@ -33,6 +33,16 @@ enum CBv2AttentionV1 {
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+    /// Defer the fallback row-buffer backing allocations until the full-ring
+    /// decode fast paths have refused. The default keeps the old eager
+    /// reservation available through the kill switch.
+    private static let lazyDecodeRowStagingEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_DECODE_ROW_STAGING_LAZY"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
 
     /// Query-block width for multi-token prompt attention (see
     /// `attendQueryBlocks`). Smaller blocks execute strictly less attention
@@ -507,10 +517,15 @@ enum CBv2AttentionV1 {
             {
                 var cachedKeyRows: [MLXArray] = []
                 var cachedValueRows: [MLXArray] = []
-                cachedKeyRows.reserveCapacity(B)
-                cachedValueRows.reserveCapacity(B)
+                if !lazyDecodeRowStagingEnabled {
+                    cachedKeyRows.reserveCapacity(B)
+                    cachedValueRows.reserveCapacity(B)
+                }
                 let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
                 if ringRows.count == B && ringRows.allSatisfy({ $0.decodeRingView != nil }) {
+                    if lazyDecodeRowStagingEnabled {
+                        CBv2EngageMark.once("decode-row-staging-lazy")
+                    }
                     // Q4-LIVE-WRITE: admit all rows before any host state
                     // mutation. Pass A writes only the live q4 mirror slot;
                     // the established BF16 SliceUpdates and counters remain
@@ -632,12 +647,20 @@ enum CBv2AttentionV1 {
                     {
                         return output
                     }
+                    if lazyDecodeRowStagingEnabled {
+                        cachedKeyRows.reserveCapacity(B)
+                        cachedValueRows.reserveCapacity(B)
+                    }
                     for row in ringRows {
                         let view = row.snapshot()
                         cachedKeyRows.append(view.keys)
                         cachedValueRows.append(view.values)
                     }
                 } else {
+                    if lazyDecodeRowStagingEnabled {
+                        cachedKeyRows.reserveCapacity(B)
+                        cachedValueRows.reserveCapacity(B)
+                    }
                     for (index, row) in rows.enumerated() {
                         let (cachedKeys, cachedValues) = row.update(
                             keys: keys[index ..< (index + 1)],

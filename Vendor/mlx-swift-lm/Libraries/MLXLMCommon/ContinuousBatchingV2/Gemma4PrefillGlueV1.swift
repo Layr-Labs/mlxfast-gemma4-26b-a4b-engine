@@ -81,6 +81,64 @@ public enum Gemma4PrefillGlueV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// UNSORTIDX kill switch: `DARKBLOOM_GEMMA4_PREFILL_UNSORT_IDX_HOIST` set
+    /// to `0`/`false`/`no`/`off` restores the incumbent gather body and the
+    /// incumbent registration name byte for byte. Default ON.
+    public static let unsortIdxHoistEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_UNSORT_IDX_HOIST"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// The unsort gather's slot metadata, read once per lane instead of once
+    /// per (feature, slot) pair. `sorted_row` gates the address of the
+    /// `sorted` load, so the incumbent's 32 dependent index loads serialise 32
+    /// round trips; hoisting makes all eight independent and puts them in
+    /// flight before the first plane load issues.
+    private static let unsortGatherHoisted = """
+                uint gsr_[8];
+                float gsw_[8];
+                #pragma clang loop unroll(full)
+                for (uint slot = 0; slot < 8; ++slot) {
+                    const uint assignment = assignment_base + slot;
+                    gsr_[slot] = (uint)inverse_order[assignment];
+                    gsw_[slot] = (float)route_weights[assignment];
+                }
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    const uint feature = lid * GLUE_NREADS + i;
+                    av[i] = static_cast<float>(h1[base + i]);
+                    T accumulator = (T)0;
+                    #pragma clang loop unroll(full)
+                    for (uint slot = 0; slot < 8; ++slot) {
+                        const T weighted = (T)(
+                            (float)sorted[size_t(gsr_[slot]) * GLUE_AXIS + feature]
+                            * gsw_[slot]);
+                        accumulator = accumulator + weighted;
+                    }
+                    bv[i] = static_cast<float>(accumulator);
+                }
+        """
+
+    private static let unsortGatherIncumbent = """
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    const uint feature = lid * GLUE_NREADS + i;
+                    av[i] = static_cast<float>(h1[base + i]);
+                    T accumulator = (T)0;
+                    for (uint slot = 0; slot < 8; ++slot) {
+                        const uint assignment = assignment_base + slot;
+                        const uint sorted_row = (uint)inverse_order[assignment];
+                        const T weighted = (T)(
+                            (float)sorted[size_t(sorted_row) * GLUE_AXIS + feature]
+                            * (float)route_weights[assignment]);
+                        accumulator = accumulator + weighted;
+                    }
+                    bv[i] = static_cast<float>(accumulator);
+                }
+        """
+
     /// This checkpoint's hidden size, and the `rms_single_row` launch geometry
     /// the stock host derives from it (`RMS_N_READS` 4, so 2816 / 4 = 704
     /// threads, 22 simdgroups, one threadgroup per row).
@@ -495,12 +553,69 @@ public enum Gemma4PrefillGlueV1 {
         ensureRowContiguous: true
     )
 
+    /// SCATVEC kill switch: `DARKBLOOM_GEMMA4_PREFILL_SCATTER_VEC4` set to
+    /// `0`/`false`/`no`/`off` restores the incumbent scatter body and the
+    /// incumbent registration name byte for byte. Default ON.
+    public static let scatterVec4Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_SCATTER_VEC4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// The incumbent scatter epilogue: K dependent index loads, each followed
+    /// by GLUE_NREADS scalar stores into the lane's own four-element window.
+    private static let scatterEpilogueScalar = """
+        // Assignment t * K + k of this row owns sorted position
+        // inverse[t * K + k]. The inverse order is a permutation of the
+        // plane rows, so every plane row is written exactly once.
+        const size_t assignment_base = size_t(row) * K;
+        for (int k = 0; k < K; k++) {
+            const size_t pos = size_t(inverse[assignment_base + k]);
+            const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                out[obase + i] = normed[i];
+            }
+        }
+        """
+
+    /// The same epilogue with the K index loads hoisted ahead of every store
+    /// and each lane's four-element window written as one `vec<T, 4>`.
+    /// `GLUE_AXIS % GLUE_NREADS == 0` and `lid * GLUE_NREADS % GLUE_NREADS == 0`,
+    /// so `obase` is a multiple of four elements and the eight-byte vector
+    /// store is aligned for every lane and every sorted position.
+    private static let scatterEpilogueVec4 = """
+        // Assignment t * K + k of this row owns sorted position
+        // inverse[t * K + k]. The inverse order is a permutation of the
+        // plane rows, so every plane row is written exactly once.
+        const size_t assignment_base = size_t(row) * K;
+        uint positions[K];
+        #pragma clang loop unroll(full)
+        for (int k = 0; k < K; k++) {
+            positions[k] = inverse[assignment_base + k];
+        }
+        vec<T, GLUE_NREADS> normed_v;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < GLUE_NREADS; i++) {
+            normed_v[i] = normed[i];
+        }
+        #pragma clang loop unroll(full)
+        for (int k = 0; k < K; k++) {
+            const size_t obase =
+                size_t(positions[k]) * GLUE_AXIS + lid * GLUE_NREADS;
+            *((device vec<T, GLUE_NREADS>*)(out + obase)) = normed_v;
+        }
+        """
+
     /// `dualPreNorm`'s second output written straight into expert-sorted
     /// order. One threadgroup per token row, as before; the row's normed
     /// values are computed once into registers and stored to each of the
     /// row's K sorted positions.
     private static let preNormScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_prenorm_scatter_2816_unroll_v2",
+        name: scatterVec4Enabled
+            ? "gemma4_prefill_glue_prenorm_scatter_2816_scatvec_v3"
+            : "gemma4_prefill_glue_prenorm_scatter_2816_unroll_v2",
         inputNames: ["x", "w", "inverse"],
         outputNames: ["out"],
         source: """
@@ -534,18 +649,7 @@ public enum Gemma4PrefillGlueV1 {
                 normed[i] = w[j] * scaled;
             }
 
-            // Assignment t * K + k of this row owns sorted position
-            // inverse[t * K + k]. The inverse order is a permutation of the
-            // plane rows, so every plane row is written exactly once.
-            const size_t assignment_base = size_t(row) * K;
-            for (int k = 0; k < K; k++) {
-                const size_t pos = size_t(inverse[assignment_base + k]);
-                const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
-                #pragma clang loop unroll(full)
-                for (int i = 0; i < GLUE_NREADS; i++) {
-                    out[obase + i] = normed[i];
-                }
-            }
+            \(scatterVec4Enabled ? scatterEpilogueVec4 : scatterEpilogueScalar)
             """,
         header: kernelHeader,
         ensureRowContiguous: true
@@ -796,7 +900,8 @@ public enum Gemma4PrefillGlueV1 {
     /// same `[tokens, hidden]` expert result. Produce each reduced expert value
     /// in the tail thread that consumes it, removing the intermediate tensor.
     private static let expertTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_expert_unsort_tail_chain_2816_unroll_v2",
+        name: "gemma4_prefill_expert_unsort_tail_chain_2816"
+            + (unsortIdxHoistEnabled ? "_idxh_v3" : "_unroll_v2"),
         inputNames: [
             "sorted", "inverse_order", "route_weights", "h1",
             "w1", "w2", "w3", "res2", "s", "wn",
@@ -816,21 +921,7 @@ public enum Gemma4PrefillGlueV1 {
 
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint feature = lid * GLUE_NREADS + i;
-                av[i] = static_cast<float>(h1[base + i]);
-                T accumulator = (T)0;
-                for (uint slot = 0; slot < 8; ++slot) {
-                    const uint assignment = assignment_base + slot;
-                    const uint sorted_row = (uint)inverse_order[assignment];
-                    const T weighted = (T)(
-                        (float)sorted[size_t(sorted_row) * GLUE_AXIS + feature]
-                        * (float)route_weights[assignment]);
-                    accumulator = accumulator + weighted;
-                }
-                bv[i] = static_cast<float>(accumulator);
-            }
+            \(unsortIdxHoistEnabled ? unsortGatherHoisted : unsortGatherIncumbent)
 
             float inv_a = 0;
             float inv_b = 0;

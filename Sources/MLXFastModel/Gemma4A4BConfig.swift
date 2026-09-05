@@ -2,6 +2,8 @@ import CoreFoundation
 import Foundation
 import MLXFastCore
 
+/// The layer-type names below are taken from the model's configuration
+/// document exactly as written; nothing here recomputes them.
 /// Attention kind of one decoder layer, as spelled in `layer_types`.
 public enum Gemma4A4BLayerType: String, Equatable, Sendable {
     case sliding = "sliding_attention"

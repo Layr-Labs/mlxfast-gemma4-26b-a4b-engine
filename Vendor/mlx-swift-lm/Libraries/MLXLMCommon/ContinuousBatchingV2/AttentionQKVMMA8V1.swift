@@ -648,6 +648,86 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     /// where the amortisation stops paying for the extra live registers.
     private static let tilesPerGroup = 2
 
+    /// QKV-STATIC-N-001. The output stride `N` of the multi-tile rsp body is
+    /// fixed the moment the kernel is chosen. This supplies it as a
+    /// compile-time template value at that point instead of reading it from a
+    /// runtime shape buffer inside the body.
+    public static let staticNEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_MMA8_STATIC_N"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
+    /// `mma8KernelHeader` with the rsp multi-tile body renamed and its runtime
+    /// `N` parameter replaced by a template int. The body is the last function
+    /// in that header, so the transform is isolated from all other bodies.
+    private static let mma8StaticNHeader: String = {
+        let marker = """
+            template <typename T, int KS, int TILES, int KFIX, int SPLIT = 0>
+            METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
+            """
+        guard let split = mma8KernelHeader.range(of: marker) else {
+            preconditionFailure("QKV-STATIC-N-001: rsp multi-tile body not found")
+        }
+        let prefix = String(mma8KernelHeader[..<split.lowerBound])
+        var body = String(mma8KernelHeader[split.lowerBound...])
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(body.components(separatedBy: old).count == 2)
+            body = body.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(marker, with: """
+            template <typename T, int KS, int TILES, int KFIX, int SPLIT, int NFIX>
+            METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp_nfix(
+            """)
+        replaceOnce("""
+                const int N,
+
+            """, with: "")
+        replaceOnce(
+            "  constexpr int K = KFIX;",
+            with: """
+              constexpr int N = NFIX;
+              constexpr int K = KFIX;
+            """)
+        return prefix + body
+    }()
+
+    private static let fusedSlidingRspStaticNKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_staticn_v1",
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y", "y2"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt_rsp_nfix<T, 2, 2, 2816, 4096, N>(
+                w, scales, biases, x, rs_table, y,
+                int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup, y2);
+            return;
+            """,
+        header: mma8StaticNHeader,
+        ensureRowContiguous: true)
+
+    private static let fusedFullRspStaticNKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_staticn_v1",
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y", "y2"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt_rsp_nfix<T, 2, 2, 2816, 8192, N>(
+                w, scales, biases, x, rs_table, y,
+                int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup, y2);
+            return;
+            """,
+        header: mma8StaticNHeader,
+        ensureRowContiguous: true)
+
     private static let multiTileKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_v4",
         inputNames: ["x", "w", "scales", "biases"],
@@ -967,10 +1047,16 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             && rsTable!.dtype == .float32
             && rsTable!.shape == [batch, inputWidth / Self.groupSize]
 
-        let kernel =
-            qWidth == 4096
-            ? (tableReady ? fusedSlidingRspKernel : fusedSlidingKernel)
-            : (tableReady ? fusedFullRspKernel : fusedFullKernel)
+        let useStaticN = staticNEnabled && tableReady
+        let kernel: MLXFast.MLXFastKernel
+        if useStaticN {
+            kernel = qWidth == 4096
+                ? fusedSlidingRspStaticNKernel : fusedFullRspStaticNKernel
+        } else {
+            kernel = qWidth == 4096
+                ? (tableReady ? fusedSlidingRspKernel : fusedSlidingKernel)
+                : (tableReady ? fusedFullRspKernel : fusedFullKernel)
+        }
         let total = qWidth + kWidth
         let yTiles = total / outputsPerGroup
         guard yTiles % tilesPerGroup == 0 else { return nil }
@@ -988,9 +1074,11 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         fusedLock.unlock()
         guard let (fw, fs, fb) = plane else { return nil }
 
+        if useStaticN { CBv2EngageMark.once("qkv-static-n") }
         let outputs = kernel(
             tableReady ? [x, fw, fs, fb, rsTable!] : [x, fw, fs, fb],
-            template: [("T", x.dtype)],
+            template: useStaticN
+                ? [("T", x.dtype), ("N", total)] : [("T", x.dtype)],
             grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),
             threadGroup: (simdWidth, simdGroups, 1),
             outputShapes: [[batch, sequence, qWidth], [batch, sequence, kWidth]],

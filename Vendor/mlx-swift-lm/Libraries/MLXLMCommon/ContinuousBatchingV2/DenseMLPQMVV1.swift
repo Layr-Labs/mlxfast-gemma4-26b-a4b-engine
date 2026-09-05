@@ -137,6 +137,18 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// DMLP-GATEUP-CARRY2-022: two-deep weight carry on the gate/up plane's
+    /// static-K body. The down plane's promoted carry keeps one group (scale,
+    /// bias) and two groups (codes) resident across iterations; this arm gives
+    /// the gate/up plane the same treatment. Off restores the promoted
+    /// gate/up static-K kernel byte for byte in the same executable.
+    private static let gateUpCarry2Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_GATEUP_CARRY2"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// W4-LOAD (engage mark `mlp-w4-load`). The four packed affine-8 codes a
     /// lane owns for one output row are four CONTIGUOUS bytes at a 4-byte
     /// aligned address, so they can be fetched as ONE aligned 32-bit load
@@ -905,6 +917,79 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         header: mma8GateUpStaticKHeader,
         ensureRowContiguous: true)
 
+    /// DMLP-GATEUP-CARRY2-022 header. Derives from the promoted gate/up
+    /// static-K header, so the compile-time K walk, the 22-group split and
+    /// the two-fold unroll are unchanged; only the weight-operand handling
+    /// moves. Every address is a function of the group index alone, so one
+    /// iteration's codes, scale and bias stay resident in registers while the
+    /// next two groups' codes (and the next group's scale and bias) are read
+    /// a whole iteration ahead of their use. `g_next` clamps to the last
+    /// valid group, so the final look-ahead re-reads groups already read and
+    /// their values are discarded.
+    ///
+    /// The read stays at the statement it already occupied. The scale and the
+    /// bias stay one group ahead: they are two bytes each against the codes'
+    /// sixteen, they sit in the same cache lines as their neighbours, and a
+    /// second copy of them would cost registers for no stream. `g` is
+    /// monotone here and the loop count is a constant, so the hand-off is
+    /// register renaming in a fully unrolled body, not a copy.
+    private static let mma8GateUpCarry2Header: String = {
+        var result = mma8GateUpStaticKHeader
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(
+            "gemma4_qmv_mma8_affine8_g64_gateup_k2816_impl(",
+            with: "gemma4_qmv_mma8_affine8_g64_gateup_k2816_carry2_impl(")
+        replaceOnce(
+            """
+              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+            """,
+            with: """
+              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+              uint4 wv_next = *((const device uint4*)(wrow + 64 * g0));
+              uint4 wv_next2 =
+                  *((const device uint4*)(wrow + 64 * min(g0 + 1, G - 1)));
+              T s_next = srow[g0];
+              T b_next = brow[g0];
+            """)
+        replaceOnce(
+            """
+                const uint4 wv = *((const device uint4*)(wrow + 64 * g));
+                const float s = float(srow[g]);
+                const float b = float(brow[g]);
+            """,
+            with: """
+                const uint4 wv = wv_next;
+                const float s = float(s_next);
+                const float b = float(b_next);
+                const int g_next = min(g + 1, G - 1);
+                wv_next = wv_next2;
+                wv_next2 = *((const device uint4*)(wrow + 64 * min(g + 2, G - 1)));
+                s_next = srow[g_next];
+                b_next = brow[g_next];
+            """)
+        return result
+    }()
+
+    private static let mma8GateUpCarry2Kernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_k2816_u2_carry2_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            gemma4_qmv_mma8_affine8_g64_gateup_k2816_carry2_impl<T, 2>(
+                w, scales, biases, x, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            """,
+        header: mma8GateUpCarry2Header,
+        ensureRowContiguous: true)
+
     /// One complete SIMD group per g64 group. Keep all lane results rather
     /// than canonicalizing row sums: the consumer reads its own lane's tree.
     private static let mma8DownLaneSumKernel = MLXFast.metalKernel(
@@ -1357,11 +1442,16 @@ inline U qdot_affine8_registered_v4(
             }
             let selectedMMA: MLXFast.MLXFastKernel
             if isGateUp {
-                if mma8GateUpStaticKEnabled {
+                if mma8GateUpStaticKEnabled, gateUpCarry2Enabled {
                     CBv2EngageMark.once("mlp-gateup-k2816-u2")
+                    CBv2EngageMark.once("mlp-gateup-carry2")
+                    selectedMMA = mma8GateUpCarry2Kernel
+                } else if mma8GateUpStaticKEnabled {
+                    CBv2EngageMark.once("mlp-gateup-k2816-u2")
+                    selectedMMA = mma8GateUpStaticKKernel
+                } else {
+                    selectedMMA = mma8Kernel
                 }
-                selectedMMA = mma8GateUpStaticKEnabled
-                    ? mma8GateUpStaticKKernel : mma8Kernel
             } else {
                 selectedMMA = mma8DownStaticKEnabled
                     ? mma8DownStaticKKernel : mma8Kernel

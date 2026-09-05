@@ -762,6 +762,15 @@ private let routeCsortPrefillBitsetEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// The target's 128-expert table needs half the generic bitset storage.
+/// Other expert bounds, or a disabled gate, retain all 256 bins.
+private let routeCsortPrefillBitset128Enabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTE_CSORT_PREFILL_BITSET128"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Keys per histogram/scatter block.
 private let routeCsortPrefillBlock = 256
 /// Counter-table width; must equal ``routeCountingSortKeyBound`` and the 256
@@ -986,20 +995,21 @@ private let routeCsortPrefillScatterKernel: MLXFast.MLXFastKernel = MLXFast.meta
 /// disjoint position bits; the barrier makes the final words visible before
 /// any rank is read. Tail positions never set a bit or write an output.
 private let routeCsortPrefillBitsetScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "mlx_lm_route_csort128_scatter_bitset_v1",
+    name: "mlx_lm_route_csort128_scatter_bitset_bins_v2",
     inputNames: ["keys", "block_offset"],
     outputNames: ["row_order", "sorted_keys", "inverse_order"],
     source: """
         constexpr uint BLOCK = \(routeCsortPrefillBlock);
         constexpr uint WIDTH = \(routeCsortPrefillWidth);
         constexpr uint WORDS = BLOCK / 32;
+        constexpr uint BITWIDTH = BINS;
         const uint b = threadgroup_position_in_grid.x;
         const uint k = thread_position_in_threadgroup.x;
         const uint n = keys_shape[0];
         const uint idx = b * BLOCK + k;
         // Each bit names one input position; equal keys occupy distinct bits.
-        threadgroup atomic_uint bitsets[WIDTH * WORDS];
-        for (uint i = k; i < WIDTH * WORDS; i += BLOCK) {
+        threadgroup atomic_uint bitsets[BITWIDTH * WORDS];
+        for (uint i = k; i < BITWIDTH * WORDS; i += BLOCK) {
             atomic_store_explicit(&bitsets[i], 0u, memory_order_relaxed);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1007,7 +1017,7 @@ private let routeCsortPrefillBitsetScatterKernel: MLXFast.MLXFastKernel = MLXFas
         const uint word = k / 32u;
         const uint bit = k & 31u;
         if (idx < n) {
-            atomic_fetch_or_explicit(&bitsets[word * WIDTH + key], 1u << bit, memory_order_relaxed);
+            atomic_fetch_or_explicit(&bitsets[word * BITWIDTH + key], 1u << bit, memory_order_relaxed);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (idx < n) {
@@ -1015,9 +1025,9 @@ private let routeCsortPrefillBitsetScatterKernel: MLXFast.MLXFastKernel = MLXFas
             // The current-word mask is valid even when bit is zero or 31.
             uint rank = 0u;
             for (uint w = 0; w < word; ++w) {
-                rank += popcount(atomic_load_explicit(&bitsets[w * WIDTH + key], memory_order_relaxed));
+                rank += popcount(atomic_load_explicit(&bitsets[w * BITWIDTH + key], memory_order_relaxed));
             }
-            rank += popcount(atomic_load_explicit(&bitsets[word * WIDTH + key], memory_order_relaxed)
+            rank += popcount(atomic_load_explicit(&bitsets[word * BITWIDTH + key], memory_order_relaxed)
                 & ((1u << bit) - 1u));
             const uint pos = block_offset[b * WIDTH + key] + rank;
             row_order[pos] = idx / uint(M);
@@ -1099,9 +1109,13 @@ private func routeCountingSortPrefill(
     let scatter = useBitset
         ? routeCsortPrefillBitsetScatterKernel : routeCsortPrefillScatterKernel
     if useBitset { CBv2EngageMark.once("route-csort-prefill-bitset") }
+    let bitsetBins = routeCsortPrefillBitset128Enabled && numExperts == 128
+        ? 128 : width
+    let scatterTemplate: [(String, any KernelTemplateArg)] = useBitset
+        ? [("M", m), ("BINS", bitsetBins)] : [("M", m)]
     let outputs = scatter(
         [indices, offsets],
-        template: [("M", m)],
+        template: scatterTemplate,
         grid: (blocks * width, 1, 1),
         threadGroup: (width, 1, 1),
         outputShapes: [[n], [n], [n]],

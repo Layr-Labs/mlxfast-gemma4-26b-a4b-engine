@@ -3642,6 +3642,87 @@ private enum Gemma4RouterFinalistsWeightsV1 {
 /// `DARKBLOOM_GEMMA4_ROUTE_ORDER_KEYS=0` retains its original sorting network.
 /// Engage marks: `glue-fold` and, when enabled, `router-native-max8-sg1-decode`.
 private enum Gemma4RouteGlueFoldV1 {
+    /// Exact stable rank of 64 seven-bit expert IDs. Both complete SIMD
+    /// groups build identical bit planes, then count smaller keys and equal
+    /// keys at earlier assignment positions. Selection and weights are untouched.
+    private static let rankBitplanesEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTE_RANK64_BITPLANES"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
+    private static let incumbentRank64Source = """
+            // Phase 2 -- the incumbent simd-rank scatter, verbatim, over the
+            // staged 64 keys. Threads 0..63 are exactly the two complete
+            // SIMD groups the standalone kernel launched; `assignment` and
+            // `lane` reproduce its coordinates.
+            if (tid < 64u) {
+                const uint assignment = tid;
+                const uint key = sel[assignment];
+                const uint key_low = sel[lane];
+                const uint key_high = sel[32u + lane];
+                uint rank = 0;
+                #pragma clang loop unroll(full)
+                for (uint source = 0; source < 32; ++source) {
+                    const uint other_low = simd_broadcast(key_low, ushort(source));
+                    rank += (other_low < key)
+                        || (other_low == key && source < assignment);
+                    const uint other_high = simd_broadcast(key_high, ushort(source));
+                    const uint high_assignment = 32u + source;
+                    rank += (other_high < key)
+                        || (other_high == key && high_assignment < assignment);
+                }
+                row_order[rank] = assignment / 8;
+                sorted_keys[rank] = key;
+                inverse_order[assignment] = rank;
+            }
+        """
+
+    private static let bitplaneRank64Source = """
+            // All 64 assignments rank themselves against seven key bit planes.
+            // Both complete SIMD groups construct the same planes independently.
+            if (tid < 64u) {
+                const uint assignment = tid;
+                const uint key = sel[assignment];
+                const uint key_low = sel[lane];
+                const uint key_high = sel[32u + lane];
+                uint equal_low = 0xffffffffu;
+                uint equal_high = 0xffffffffu;
+                uint less_low = 0u;
+                uint less_high = 0u;
+                #pragma clang loop unroll(full)
+                for (int bit = 6; bit >= 0; --bit) {
+                    const uint plane_low = uint(simd_vote::vote_t(
+                        simd_ballot(((key_low >> bit) & 1u) != 0u)));
+                    const uint plane_high = uint(simd_vote::vote_t(
+                        simd_ballot(((key_high >> bit) & 1u) != 0u)));
+                    const uint ones = 0u - ((key >> bit) & 1u);
+                    less_low |= equal_low & ~plane_low & ones;
+                    less_high |= equal_high & ~plane_high & ones;
+                    equal_low &= ~(plane_low ^ ones);
+                    equal_high &= ~(plane_high ^ ones);
+                }
+                const uint prefix = (1u << lane) - 1u;
+                const uint earlier_low = assignment < 32u ? prefix : 0xffffffffu;
+                const uint earlier_high = assignment < 32u ? 0u : prefix;
+                const uint rank = popcount(less_low | (equal_low & earlier_low))
+                    + popcount(less_high | (equal_high & earlier_high));
+                row_order[rank] = assignment / 8u;
+                sorted_keys[rank] = key;
+                inverse_order[assignment] = rank;
+            }
+        """
+
+    private static func rank64Source(_ source: String) -> String {
+        guard rankBitplanesEnabled else { return source }
+        precondition(source.components(separatedBy: incumbentRank64Source).count == 2,
+                     "route rank64 bitplane source anchor drift")
+        return source.replacingOccurrences(
+            of: incumbentRank64Source, with: bitplaneRank64Source)
+    }
+
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_GLUE_FOLD"]
@@ -3664,12 +3745,13 @@ private enum Gemma4RouteGlueFoldV1 {
     }
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: orderKeysEnabled
+        name: (orderKeysEnabled
             ? "gemma4_route_monolithic_top8_e128_k8_bf16_max8_sg1_v1"
-            : "gemma4_route_monolithic_top8_e128_k8_bf16_v2",
+            : "gemma4_route_monolithic_top8_e128_k8_bf16_v2")
+            + (rankBitplanesEnabled ? "_bp1" : ""),
         inputNames: ["scores", "pes"],
         outputNames: ["indices", "weights", "row_order", "sorted_keys", "inverse_order"],
-        source: orderKeysEnabled ? """
+        source: rank64Source(orderKeysEnabled ? """
             const uint tid = thread_position_in_threadgroup.x;
             const uint row = tid / 32u;
             const uint lane = thread_index_in_simdgroup;
@@ -3838,7 +3920,7 @@ private enum Gemma4RouteGlueFoldV1 {
                 sorted_keys[rank] = key;
                 inverse_order[assignment] = rank;
             }
-        """,
+        """),
         header: """
             constant constexpr bool gemma4_route_order_keys = \(orderKeysEnabled ? "true" : "false");
 

@@ -1080,6 +1080,7 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
     source: """
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
+        constexpr uint row_simds = row_threads / 32;
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
         const uint lid = tid - slot * row_threads;
@@ -1088,7 +1089,6 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
         const uint row_simd = lid / 32;
 
         threadgroup float partials[RPT][32];
-        threadgroup float inv_rms[RPT];
         threadgroup T rounded[RPT][D];
         threadgroup uint row_position[RPT];
 
@@ -1139,22 +1139,22 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        // Slots 2..31 stay exactly zero, so the 32-lane combine returns the
-        // two simdgroup partials' sum whatever order the tree adds them in.
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Lanes at or above row_simds contribute exactly zero, so the 32-lane
+        // combine returns the simdgroup partials' sum whatever order the tree
+        // adds them in.
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
-            if (lane == 0) {
-                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // pg2's combine. Every simdgroup of the row reduces the same
+        // thirty-two operands the incumbent's first simdgroup reduced: the
+        // partials below row_simds, and the zero-fill's 0.0f from a register
+        // above it. Each therefore holds the bit-identical inverse rms with
+        // no zero-fill pass and no publish-back barrier.
+        sum = simd_sum(lane < row_simds ? partials[slot][lane] : 0.0f);
+        const float row_inverse_rms =
+            metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
 
         if (row >= TOTAL_ROWS) return;
-        const float inverse_rms = inv_rms[slot];
+        const float inverse_rms = row_inverse_rms;
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
             if (APPLY_ROPE) {
@@ -1280,6 +1280,7 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
     source: """
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
+        constexpr uint row_simds = row_threads / 32;
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
         const uint lid = tid - slot * row_threads;
@@ -1288,7 +1289,6 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
         const uint row_simd = lid / 32;
 
         threadgroup float partials[RPT][32];
-        threadgroup float inv_rms[RPT];
         threadgroup T rounded[RPT][D];
         threadgroup uint row_position[RPT];
 
@@ -1343,20 +1343,19 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
-            if (lane == 0) {
-                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // pg2's combine. Every simdgroup of the row reduces the same
+        // thirty-two operands the incumbent's first simdgroup reduced: the
+        // partials below row_simds, and the zero-fill's 0.0f from a register
+        // above it. Each therefore holds the bit-identical inverse rms with
+        // no zero-fill pass and no publish-back barrier.
+        sum = simd_sum(lane < row_simds ? partials[slot][lane] : 0.0f);
+        const float row_inverse_rms =
+            metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
 
         if (row >= TOTAL_ROWS) return;
-        const float inverse_rms = inv_rms[slot];
+        const float inverse_rms = row_inverse_rms;
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
             if (APPLY_ROPE && weighted) {
@@ -1420,6 +1419,7 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
     source: """
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
+        constexpr uint row_simds = row_threads / 32;
         constexpr uint mirror_row_words = D / 8 + D / 64;
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
@@ -1429,7 +1429,6 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
         const uint row_simd = lid / 32;
 
         threadgroup float partials[RPT][32];
-        threadgroup float inv_rms[RPT];
         threadgroup T rounded[RPT][D];
         threadgroup uint row_position[RPT];
         threadgroup T final_vals[RPT][D];
@@ -1492,20 +1491,19 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
-            if (lane == 0) {
-                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // pg2's combine. Every simdgroup of the row reduces the same
+        // thirty-two operands the incumbent's first simdgroup reduced: the
+        // partials below row_simds, and the zero-fill's 0.0f from a register
+        // above it. Each therefore holds the bit-identical inverse rms with
+        // no zero-fill pass and no publish-back barrier.
+        sum = simd_sum(lane < row_simds ? partials[slot][lane] : 0.0f);
+        const float row_inverse_rms =
+            metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
 
         if (valid) {
-            const float inverse_rms = inv_rms[slot];
+            const float inverse_rms = row_inverse_rms;
             for (uint i = 0; i < reads; ++i) {
                 const T normalized = T(float(input[i]) * inverse_rms);
                 if (APPLY_ROPE && weighted) {
@@ -5354,7 +5352,8 @@ private class Gemma4MLP: Module {
     /// Swift admission mirrors the kernel-side uniform predicate exactly;
     /// a nil keeps the incumbent split road untouched.
     fileprivate func zipPrefillGateUpGeGLU(_ x: MLXArray) -> MLXArray? {
-        guard gemma4DenseGeGLUEpilogueEnabled,
+        guard x.ndim >= 2, x.dim(-2) >= 512, x.dim(-1) == 2816,
+            gemma4DenseGeGLUEpilogueEnabled,
             Gemma4PrefillDeqGEMMV1.enabled,
             let gate = gateProj as? QuantizedLinear,
             let up = upProj as? QuantizedLinear,
@@ -5370,8 +5369,7 @@ private class Gemma4MLP: Module {
             gateBiases.shape == [2112, 44],
             let upBiases = up.biases, upBiases.dtype == .bfloat16,
             upBiases.shape == [2112, 44],
-            x.dtype == .bfloat16, x.ndim >= 2,
-            x.dim(-1) == 2816, x.dim(-2) >= 512,
+            x.dtype == .bfloat16,
             x.size / 2816 >= Gemma4PrefillDeqGEMMV1.minRows,
             let plane = Self.pairedGateUpPlane(
                 gate: gate, gateBiases: gateBiases, up: up, upBiases: upBiases)
@@ -5418,7 +5416,7 @@ private class Gemma4MLP: Module {
     ) -> MLXArray {
         // DENSE-GEGLU-EPILOGUE: the exact prefill geometry closes GeGLU inside
         // the single paired GEMM; every other rectangle falls through.
-        if let activated = zipPrefillGateUpGeGLU(x) {
+        if x.ndim >= 2 && x.dim(-2) >= 512, let activated = zipPrefillGateUpGeGLU(x) {
             return denseProjection(downProj, activated)
         }
         // DMLP-002: one exact activation-sum prepass feeds both fallback

@@ -3130,7 +3130,9 @@ public enum Gemma4MMAQuantizedGEMV {
         guard relayoutEnabled else { return nil }
         guard let logits = relayoutRewrite(sourceV27, relayoutLanePairs),
             let carry = relayoutRewrite(sourceV27Carry, relayoutCarryLanePairs),
-            let argmax = relayoutRewrite(sourceV27Argmax, relayoutLanePairs)
+            let argmax = relayoutRewrite(
+                sourceV27Argmax,
+                logitslessCarryEnabled ? relayoutCarryLanePairs : relayoutLanePairs)
         else {
             FileHandle.standardError.write(
                 Data("[head-relayout] derivation mismatch; incumbent kept\n".utf8))
@@ -3153,7 +3155,8 @@ public enum Gemma4MMAQuantizedGEMV {
                 header: "#include <metal_simdgroup_matrix>\n",
                 ensureRowContiguous: true),
             argmax: MLXFast.metalKernel(
-                name: "gemma4_mma_affine4_qmv_m8_v27_argmax_rl1",
+                name: "gemma4_mma_affine4_qmv_m8_v27_argmax_rl1"
+                    + logitslessCarryKeySuffix,
                 inputNames: ["x", "w", "scales", "biases", "xSums"],
                 outputNames: ["pv", "pi"],
                 source: argmax,
@@ -3356,6 +3359,20 @@ public enum Gemma4MMAQuantizedGEMV {
         }
     }()
 
+    /// The logitsless path has its own source derivation. Reuse the existing
+    /// v27 operand carry there as well as on the materialized-logits path;
+    /// the BF16 top-1 conversion and first-index-wins reduction stay intact.
+    private static let logitslessCarryEnabled: Bool = {
+        guard carryEnabled else { return false }
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_LOGITSLESS_HEAD_CARRY"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
+    private static let logitslessCarryKeySuffix = logitslessCarryEnabled ? "_carry" : ""
+
     /// The promoted version 27 with the vocabulary store replaced by an in-register top-1
     /// selection. The GEMV above is untouched, so what the reduction compares
     /// is the SAME bf16 the store would have written --- `T(acc)`, rounded
@@ -3374,7 +3391,7 @@ public enum Gemma4MMAQuantizedGEMV {
     /// into `pv`/`pi`: `[8, N / 128]`, 128 KB at the tied head's geometry
     /// against the 4 MB the logits store cost.
     private static let sourceV27Argmax: String = {
-        var result = sourceV27
+        var result = logitslessCarryEnabled ? sourceV27Carry : sourceV27
 
         func replaceOnce(_ old: String, with new: String) {
             let count = result.components(separatedBy: old).count
@@ -3464,7 +3481,7 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27Argmax: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_argmax",
+        name: "gemma4_mma_affine4_qmv_m8_v27_argmax" + logitslessCarryKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["pv", "pi"],
         source: sourceV27Argmax,

@@ -42,6 +42,41 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    private static let ropeInverseFrequencyTableEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROPE_INV_FREQ_TABLE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let ropeInverseFrequencyKernel = MLXFast.metalKernel(
+        name: "cbv2_sliding_rope_inverse_frequencies_v1",
+        inputNames: ["rope_log2_base"],
+        outputNames: ["inverse_frequencies"],
+        source: """
+            const uint pair = thread_position_in_grid.x;
+            const float d = static_cast<float>(pair) / static_cast<float>(D / 2);
+            inverse_frequencies[pair] = metal::exp2(-d * rope_log2_base[0]);
+            """,
+        ensureRowContiguous: true)
+
+    /// Per-layer, input-independent table using the resident kernel's exact
+    /// Metal expression. Retaining the array reuses its evaluated values on
+    /// subsequent decode steps; offsets and trigonometry remain per step.
+    public static func makeBaseRopeInverseFrequencies(
+        log2Base: MLXArray, dimensions: Int
+    ) -> MLXArray? {
+        guard ropeInverseFrequencyTableEnabled,
+            dimensions == headDim,
+            log2Base.dtype == .float32, log2Base.shape == [1]
+        else { return nil }
+        return ropeInverseFrequencyKernel(
+            [log2Base], template: [("D", dimensions)],
+            grid: (dimensions / 2, 1, 1),
+            threadGroup: (dimensions / 2, 1, 1),
+            outputShapes: [[dimensions / 2]], outputDTypes: [.float32])[0]
+    }
+
     private struct ResidentNormRopeInputs {
         let normalizedKeys: ObjectIdentifier
         let normalizedValues: ObjectIdentifier
@@ -52,6 +87,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         let kWeight: MLXArray
         let positionOffsets: MLXArray
         let ropeLog2Base: MLXArray
+        let ropeInverseFrequencies: MLXArray?
     }
 
     private static let residentNormRopeLock = NSLock()
@@ -74,6 +110,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         kWeight: MLXArray,
         positionOffsets: MLXArray,
         ropeLog2Base: MLXArray,
+        ropeInverseFrequencies: MLXArray? = nil,
         eps: Float,
         appliedRope: Bool
     ) -> Bool {
@@ -112,6 +149,13 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             ropeLog2Base.shape == [1]
         else { return false }
 
+        if let ropeInverseFrequencies,
+            (ropeInverseFrequencies.dtype != .float32
+                || ropeInverseFrequencies.shape != [headDim / 2])
+        {
+            return false
+        }
+
         residentNormRopeLock.lock()
         if residentNormRopeInputs.count >= 64 {
             residentNormRopeInputs.removeAll(keepingCapacity: true)
@@ -126,7 +170,8 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 qWeight: qWeight,
                 kWeight: kWeight,
                 positionOffsets: positionOffsets,
-                ropeLog2Base: ropeLog2Base)
+                ropeLog2Base: ropeLog2Base,
+                ropeInverseFrequencies: ropeInverseFrequencies)
         residentNormRopeLock.unlock()
         return true
     }
@@ -3155,8 +3200,9 @@ for (int element = 0; element < values_per_lane; ++element) {
                         const int pair = lane * 4 + i;
                         const float d = static_cast<float>(pair)
                             / static_cast<float>(D / 2);
-                        const float inv_freq =
-                            metal::exp2(-d * rope_log2_base[0]);
+                        const float inv_freq = ROPE_INV_FREQS
+                            ? rope_parameters[pair]
+                            : metal::exp2(-d * rope_parameters[0]);
                         const float theta = L * inv_freq;
                         const float costheta = metal::fast::cos(theta);
                         const float sintheta = metal::fast::sin(theta);
@@ -3446,12 +3492,12 @@ for (int element = 0; element < values_per_lane; ++element) {
 
     private static let portQuantFusedWriteResidentNormRopeKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)\(slidingSoftRefKey)",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)\(slidingSoftRefKey)_ropefreq_v1",
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
                 "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
-                "position_offsets", "rope_log2_base", "write_fence",
+                "position_offsets", "rope_parameters", "write_fence",
             ],
             outputNames: ["out", "fence", "k_out", "v_out"],
             source: residentNormRopeSource(withORunsum: false),
@@ -3462,12 +3508,12 @@ for (int element = 0; element < values_per_lane; ++element) {
     /// fifth output, so the standalone prepass never runs on a sliding layer.
     private static let portQuantFusedWriteResidentNormRopeORunsumKernel:
         MLXFast.MLXFastKernel = MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)\(slidingSoftRefKey)",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)\(slidingSoftRefKey)_ropefreq_v1",
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
                 "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
-                "position_offsets", "rope_log2_base", "write_fence",
+                "position_offsets", "rope_parameters", "write_fence",
             ],
             outputNames: ["out", "fence", "k_out", "v_out", "o_rs"],
             source: residentNormRopeSource(withORunsum: true),
@@ -3626,7 +3672,7 @@ for (int element = 0; element < values_per_lane; ++element) {
                         normRope.qWeight,
                         normRope.kWeight,
                         normRope.positionOffsets,
-                        normRope.ropeLog2Base,
+                        normRope.ropeInverseFrequencies ?? normRope.ropeLog2Base,
                         previousWriteFence,
                     ]
                 let residentTemplate: [(String, any KernelTemplateArg)] = [
@@ -3636,6 +3682,7 @@ for (int element = 0; element < values_per_lane; ++element) {
                     ("GQA", gqa),
                     ("KV_HEADS", kvHeads),
                     ("BLOCKS", blocks),
+                    ("ROPE_INV_FREQS", normRope.ropeInverseFrequencies != nil),
                 ]
                 let residentShapes = [
                     [batch, queryHeads, 1, headDim], [1],

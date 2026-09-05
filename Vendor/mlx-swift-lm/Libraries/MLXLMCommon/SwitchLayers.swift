@@ -754,6 +754,14 @@ private let routeCsortPrefillEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// Disable only the bitset scatter to retain the original local-rank loop.
+private let routeCsortPrefillBitsetEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTE_CSORT_PREFILL_BITSET"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Keys per histogram/scatter block.
 private let routeCsortPrefillBlock = 256
 /// Counter-table width; must equal ``routeCountingSortKeyBound`` and the 256
@@ -973,6 +981,53 @@ private let routeCsortPrefillScatterKernel: MLXFast.MLXFastKernel = MLXFast.meta
     ensureRowContiguous: true
 )
 
+/// Stable local rank from a 256-bin position bitset. Word-major storage keeps
+/// adjacent expert keys adjacent in threadgroup memory. Atomic OR combines
+/// disjoint position bits; the barrier makes the final words visible before
+/// any rank is read. Tail positions never set a bit or write an output.
+private let routeCsortPrefillBitsetScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128_scatter_bitset_v1",
+    inputNames: ["keys", "block_offset"],
+    outputNames: ["row_order", "sorted_keys", "inverse_order"],
+    source: """
+        constexpr uint BLOCK = \(routeCsortPrefillBlock);
+        constexpr uint WIDTH = \(routeCsortPrefillWidth);
+        constexpr uint WORDS = BLOCK / 32;
+        const uint b = threadgroup_position_in_grid.x;
+        const uint k = thread_position_in_threadgroup.x;
+        const uint n = keys_shape[0];
+        const uint idx = b * BLOCK + k;
+        // Each bit names one input position; equal keys occupy distinct bits.
+        threadgroup atomic_uint bitsets[WIDTH * WORDS];
+        for (uint i = k; i < WIDTH * WORDS; i += BLOCK) {
+            atomic_store_explicit(&bitsets[i], 0u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint key = idx < n ? keys[idx] : 0u;
+        const uint word = k / 32u;
+        const uint bit = k & 31u;
+        if (idx < n) {
+            atomic_fetch_or_explicit(&bitsets[word * WIDTH + key], 1u << bit, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (idx < n) {
+            // Count strictly earlier positions, preserving stable tie order.
+            // The current-word mask is valid even when bit is zero or 31.
+            uint rank = 0u;
+            for (uint w = 0; w < word; ++w) {
+                rank += popcount(atomic_load_explicit(&bitsets[w * WIDTH + key], memory_order_relaxed));
+            }
+            rank += popcount(atomic_load_explicit(&bitsets[word * WIDTH + key], memory_order_relaxed)
+                & ((1u << bit) - 1u));
+            const uint pos = block_offset[b * WIDTH + key] + rank;
+            row_order[pos] = idx / uint(M);
+            sorted_keys[pos] = key;
+            inverse_order[idx] = pos;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 /// Exact stable counting sort of a flat uint32 route table. Returns nil (fail
 /// closed onto `argSort`) unless every precondition of the kernels holds.
 private func routeCountingSortPrefill(
@@ -1038,7 +1093,13 @@ private func routeCountingSortPrefill(
             outputDTypes: [.uint32]
         )[0]
     }
-    let outputs = routeCsortPrefillScatterKernel(
+    // Large route tables amortize the 8 KiB bitset initialization. Smaller
+    // tables retain the compact incumbent scratch and rank loop.
+    let useBitset = routeCsortPrefillBitsetEnabled && n >= 4096
+    let scatter = useBitset
+        ? routeCsortPrefillBitsetScatterKernel : routeCsortPrefillScatterKernel
+    if useBitset { CBv2EngageMark.once("route-csort-prefill-bitset") }
+    let outputs = scatter(
         [indices, offsets],
         template: [("M", m)],
         grid: (blocks * width, 1, 1),

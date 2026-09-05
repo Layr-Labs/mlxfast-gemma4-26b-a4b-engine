@@ -255,6 +255,30 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         absoluteOffset += 1
     }
 
+    /// Capacity-only preparation for an ordinary append that must grow.
+    /// No counters or storage change until every row's replacement is ready.
+    func privateGrowthCapacity(forNeededCount needed: Int) -> Int? {
+        guard cohortPool == nil, keys != nil, values != nil,
+            needed > capacity, needed <= maxLength
+        else { return nil }
+        return min(maxLength, max(capacity * 2, needed))
+    }
+
+    /// Install a private, bit-identical old-capacity prefix plus zero tail.
+    /// The caller orders the copy after the preceding write fence. This is
+    /// capacity growth only; the fused writer commits the new token later.
+    func installPrivateGrowth(keys newKeys: MLXArray, values newValues: MLXArray) {
+        precondition(cohortPool == nil && keys != nil && values != nil)
+        precondition(newKeys.ndim == 4 && newValues.shape == newKeys.shape)
+        precondition(newKeys.dim(0) == 1 && newKeys.dim(1) == kvHeads
+            && newKeys.dim(3) == headDim)
+        precondition(newKeys.dtype == keys!.dtype && newValues.dtype == values!.dtype)
+        precondition(newKeys.dim(2) == privateGrowthCapacity(forNeededCount: absoluteOffset + 1))
+        keys = newKeys
+        values = newValues
+        capacity = newKeys.dim(2)
+    }
+
     public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
         let n = newKeys.dim(2)
         precondition(newKeys.dim(0) == 1 && newValues.dim(0) == 1,

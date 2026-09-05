@@ -6057,6 +6057,63 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Ordinary cache doubling, paid only on the decode step that needs it.
+    /// Eight private outputs per dispatch preserve per-row and K/V lifetime accounting.
+    /// The old arrays are never mutated, so borrowed prefix views stay valid.
+    private static let privateGrowthKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_fullkv_decode_private_growth_plane_b8_h2_d512_v2",
+        inputNames: ["b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "growth_params", "growth_fence"],
+        outputNames: ["b0_grown", "b1_grown", "b2_grown", "b3_grown", "b4_grown", "b5_grown", "b6_grown", "b7_grown"],
+        source: """
+            const int lane = int(thread_position_in_threadgroup.x);
+            const int token = int(threadgroup_position_in_grid.x);
+            const int head = int(threadgroup_position_in_grid.y);
+            const int plane = int(threadgroup_position_in_grid.z);
+            const int old_capacity = int(growth_params[0]);
+            const int new_capacity = int(growth_params[1]);
+            const device T* src;
+            const constant int64_t* strides;
+            device T* dst;
+            switch (plane) {
+                case 0: src = b0; strides = b0_strides; dst = b0_grown; break;
+                case 1: src = b1; strides = b1_strides; dst = b1_grown; break;
+                case 2: src = b2; strides = b2_strides; dst = b2_grown; break;
+                case 3: src = b3; strides = b3_strides; dst = b3_grown; break;
+                case 4: src = b4; strides = b4_strides; dst = b4_grown; break;
+                case 5: src = b5; strides = b5_strides; dst = b5_grown; break;
+                case 6: src = b6; strides = b6_strides; dst = b6_grown; break;
+                case 7: src = b7; strides = b7_strides; dst = b7_grown; break;
+                default: return;
+            }
+            device uint4* out = (device uint4*)(dst + (size_t(head) * new_capacity + token) * 512);
+            if (token < old_capacity) {
+                const int64_t offset = int64_t(head) * strides[1] + int64_t(token) * strides[2];
+                ushort4 lo, hi;
+                if (strides[3] == 1) {
+                    const device packed_ushort4* in = (const device packed_ushort4*)(src + offset);
+                    lo = ushort4(in[2 * lane]);
+                    hi = ushort4(in[2 * lane + 1]);
+                } else {
+                    const device ushort* in = (const device ushort*)src;
+                    for (int i = 0; i < 4; ++i) {
+                        lo[i] = in[offset + int64_t(8 * lane + i) * strides[3]];
+                        hi[i] = in[offset + int64_t(8 * lane + i + 4) * strides[3]];
+                    }
+                }
+                out[lane] = uint4(as_type<uint2>(lo), as_type<uint2>(hi));
+            } else {
+                out[lane] = uint4(0u);
+            }
+            """,
+        header: "#include <metal_stdlib>\nusing namespace metal;\n",
+        ensureRowContiguous: false)
+
+    private static let privateGrowthEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_D512_PRIVATE_GROWTH"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// WRITE-022: the fused append as its own 32 KiB dispatch placed before
     /// the STOCK three-kernel chain (byte-for-byte dispatch 1-3), fence-
     /// ordered. Removes the same 80 copy-on-write appends as the v2 fold
@@ -6107,6 +6164,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         valueBuffers.reserveCapacity(batch)
         var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
         params.reserveCapacity(batch + 2)
+        var needsPrivateGrowth = false
         for row in fullRows {
             let state = row.cbv2InnerState()
             guard state.count == 2,
@@ -6117,12 +6175,43 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 state[0].dim(1) == kvHeads,
                 state[0].dim(3) == headDim,
                 state[1].shape == state[0].shape,
-                state[1].dtype == state[0].dtype,
-                state[0].dim(2) >= keyLength
+                state[1].dtype == state[0].dtype
             else { return nil }
+            if state[0].dim(2) < keyLength {
+                guard privateGrowthEnabled, state[0].dim(2) == offset else { return nil }
+                needsPrivateGrowth = true
+            }
             keyBuffers.append(state[0])
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
+        }
+        if needsPrivateGrowth {
+            // Uniform growth only. Finish every refusal before replacing any
+            // row. Mixed reservations retain the ordinary append fallback.
+            guard keyBuffers.allSatisfy({ $0.dim(2) == offset }),
+                let capacity = fullRows[0].privateGrowthCapacity(forNeededCount: keyLength),
+                capacity <= Int(Int32.max) / (batch * 2 * kvHeads * 64),
+                fullRows.allSatisfy({ $0.privateGrowthCapacity(forNeededCount: keyLength) == capacity })
+            else { return nil }
+            let growthParams = MLXArray([UInt32(offset), UInt32(capacity)])
+            // Two planes keep buffer bindings below Metal's per-dispatch
+            // limit while retaining private allocations on both sides.
+            func growPlane(_ buffers: [MLXArray]) -> [MLXArray] {
+                privateGrowthKernel(
+                    buffers + [growthParams, previousWriteFence],
+                    template: [("T", queries.dtype)],
+                    grid: (capacity * 64, kvHeads, batch),
+                    threadGroup: (64, 1, 1),
+                    outputShapes: Array(repeating: [1, kvHeads, capacity, headDim], count: batch),
+                    outputDTypes: Array(repeating: .bfloat16, count: batch))
+            }
+            keyBuffers = growPlane(keyBuffers)
+            valueBuffers = growPlane(valueBuffers)
+            for (index, row) in fullRows.enumerated() {
+                row.installPrivateGrowth(keys: keyBuffers[index], values: valueBuffers[index])
+                params[index + 2] = UInt32(capacity)
+            }
+            CBv2EngageMark.once("d512-private-growth")
         }
         let paramsArray = getD512ParamsArray(params: params)
 

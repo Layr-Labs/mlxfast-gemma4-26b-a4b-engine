@@ -59,6 +59,22 @@ public protocol CBv2MTPForwardable: AnyObject {
     /// plain forward on the logits side.
     func cbv2ForwardWithHidden(_ tokens: MLXArray, caches: [KVCache])
         -> (logits: MLXArray, lastHidden: MLXArray)
+
+    /// Optional scheduling of serial-target columns without widening their
+    /// arithmetic. A nil result must leave caches unchanged.
+    func cbv2ForwardColumnsWithHidden(_ columns: [MLXArray], caches: [KVCache])
+        -> (logits: MLXArray, lastHidden: MLXArray)?
+    /// Greedy verification without materializing vocabulary-sized logits.
+    /// A nil result must leave caches unchanged.
+    func cbv2ForwardColumnsArgmaxWithHidden(_ columns: [MLXArray], caches: [KVCache])
+        -> (argmax: MLXArray, lastHidden: MLXArray)?
+}
+
+extension CBv2MTPForwardable {
+    public func cbv2ForwardColumnsArgmaxWithHidden(_ columns: [MLXArray], caches: [KVCache])
+        -> (argmax: MLXArray, lastHidden: MLXArray)? { nil }
+    public func cbv2ForwardColumnsWithHidden(_ columns: [MLXArray], caches: [KVCache])
+        -> (logits: MLXArray, lastHidden: MLXArray)? { nil }
 }
 
 /// Steppable models that can drive MTP rounds. Additive refinement of
@@ -76,10 +92,20 @@ public protocol CBv2MTPSteppableModel: CBv2SteppableModel {
     /// [B, L, hidden]. Same cache/attention semantics as `forward`.
     func forwardWithHidden(tokens: MLXArray, caches: [CBv2AttendingLayerCache])
         -> (logits: MLXArray, lastHidden: MLXArray)
+    func forwardColumnsWithHidden(columns: [MLXArray], caches: [CBv2AttendingLayerCache])
+        -> (logits: MLXArray, lastHidden: MLXArray)?
+    func forwardColumnsArgmaxWithHidden(columns: [MLXArray], caches: [CBv2AttendingLayerCache])
+        -> (argmax: MLXArray, lastHidden: MLXArray)?
 }
 
 extension CBv2MTPSteppableModel {
+    public func forwardColumnsArgmaxWithHidden(
+        columns: [MLXArray], caches: [CBv2AttendingLayerCache]
+    ) -> (argmax: MLXArray, lastHidden: MLXArray)? { nil }
     public var mtpTargetIdentity: ObjectIdentifier? { nil }
+    public func forwardColumnsWithHidden(
+        columns: [MLXArray], caches: [CBv2AttendingLayerCache]
+    ) -> (logits: MLXArray, lastHidden: MLXArray)? { nil }
 }
 
 // MARK: - Drafter seam
@@ -370,8 +396,8 @@ public struct CBv2MTPRoundAuditRecord: Sendable, Equatable {
     /// `drafts[i] == targets[i]`.
     public var accepted: Int
     /// Tokens actually committed this round (`kept.count`): the accepted
-    /// prefix plus the correction/bonus, clamped by the cross-row common
-    /// width, stop tokens, and max_tokens.
+    /// prefix plus the correction/bonus, clamped by this row's stop tokens
+    /// and max_tokens.
     public var confirmed: Int
     /// Staged KV entries rolled back (`(1 + k) - confirmed`).
     public var rejected: Int

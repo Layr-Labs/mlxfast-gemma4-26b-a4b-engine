@@ -2500,6 +2500,33 @@ private class Gemma4Attention: Module {
             rsTable: rsTable)
     }
 
+    fileprivate struct MTPQKProjection {
+        let q: MLXArray
+        let k: MLXArray
+    }
+
+    fileprivate func mtpC2QKProjections(
+        inputs: [MLXArray], runsumTables: [MLXArray?]
+    ) -> [MTPQKProjection]? {
+        guard inputs.count == 2, runsumTables.count == 2,
+            !usesSharedKV,
+            let rsa = runsumTables[0], let rsb = runsumTables[1],
+            let q = qProj as? QuantizedLinear, q.bias == nil,
+            let kProj, let k = kProj as? QuantizedLinear, k.bias == nil,
+            q.groupSize == k.groupSize, q.bits == k.bits, q.mode == k.mode,
+            let qk = CBv2AttentionQKVMMA8V1.fusedQKMatmulTGC2(
+                xa: inputs[0], rsa: rsa, xb: inputs[1], rsb: rsb,
+                qWeight: q.weight, qScales: q.scales, qBiases: q.biases,
+                kWeight: k.weight, kScales: k.scales, kBiases: k.biases,
+                groupSize: q.groupSize, bits: q.bits, mode: q.mode,
+                cacheKey: ObjectIdentifier(q))
+        else { return nil }
+        return [
+            MTPQKProjection(q: qk.0.0, k: qk.0.1),
+            MTPQKProjection(q: qk.1.0, k: qk.1.1),
+        ]
+    }
+
     /// Exact B8/L1 attention output projection. Sliding/full K widths select
     /// the tight affine4 fast-QMV replica; every other path keeps the layer.
     /// MMA-RS-001: the projection input's run-sum table is computed here (the
@@ -2545,7 +2572,8 @@ private class Gemma4Attention: Module {
         v2SharedSource: (any CBv2AttendingLayerCache)? = nil,
         outputStart: Int = 0,
         useLastQueryPrefill: Bool = false,
-        carriedRunsum: MLXArray? = nil
+        carriedRunsum: MLXArray? = nil,
+        mtpQK: MTPQKProjection? = nil
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // ContinuousBatchingV2: the layer cache owns both the KV update and
         // the attention computation (no masks, no padding — see
@@ -2556,7 +2584,7 @@ private class Gemma4Attention: Module {
                 x, layerCache: layerCacheV2, source: v2SharedSource,
                 sharedKV: sharedKV, positionOffset: positionOffset,
                 outputStart: outputStart, useLastQueryPrefill: useLastQueryPrefill,
-                carriedRunsum: carriedRunsum)
+                carriedRunsum: carriedRunsum, mtpQK: mtpQK)
         }
         precondition(
             outputStart == 0 && !useLastQueryPrefill,
@@ -2696,7 +2724,8 @@ private class Gemma4Attention: Module {
         positionOffset: Gemma4.PositionOffset?,
         outputStart: Int = 0,
         useLastQueryPrefill: Bool = false,
-        carriedRunsum: MLXArray? = nil
+        carriedRunsum: MLXArray? = nil,
+        mtpQK: MTPQKProjection? = nil
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         let (B, L) = (x.dim(0), x.dim(1))
         precondition(
@@ -2750,10 +2779,10 @@ private class Gemma4Attention: Module {
         // table — the table is per activation row and per 64-group of K,
         // independent of N, so the concatenated-N dispatch reads the same
         // entries the separate Q and K dispatches would.
-        let fusedQK: (MLXArray, MLXArray)? =
-            (lastQueryCache == nil && !usesSharedKV
-                && (vProj == nil || gemma4QKFuseSlidingEnabled))
-            ? fusedQKProjection(x, rsTable: qkvRunsumTable) : nil
+        let fusedQK: (MLXArray, MLXArray)? = mtpQK.map { ($0.q, $0.k) }
+            ?? ((lastQueryCache == nil && !usesSharedKV
+                    && (vProj == nil || gemma4QKFuseSlidingEnabled))
+                ? fusedQKProjection(x, rsTable: qkvRunsumTable) : nil)
         let queryRaw = (
             fusedQK?.0 ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
         ).reshaped(B, queryLength, nHeads, effectiveHeadDim)
@@ -2947,6 +2976,83 @@ private class Gemma4Attention: Module {
 public enum Gemma4RouterProbe {
     nonisolated(unsafe) public static var recorder:
         ((_ expertScores: MLXArray, _ topKIndices: MLXArray) -> Void)?
+}
+
+private let gemma4MTPCompiledFFNVerifyEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_MTP_COMPILED_FFN_VERIFY"] == "1"
+
+/// Diagnostic-only counters for the bounded compiled MTP FFN spike.
+public struct Gemma4MTPCompiledFFNProbeStats: Sendable, Equatable {
+    public let callerHits: Int
+    public let compileClosureHits: Int
+    public let checkedOutputs: Int
+    public let nextGlueIdentityHits: Int
+}
+
+public enum Gemma4MTPCompiledFFNProbe {
+    private struct Counts {
+        var callerHits = 0
+        var compileClosureHits = 0
+        var checkedOutputs = 0
+        var nextGlueIdentityHits = 0
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var counts = Counts()
+    private static func stats(_ c: Counts) -> Gemma4MTPCompiledFFNProbeStats {
+        Gemma4MTPCompiledFFNProbeStats(
+            callerHits: c.callerHits,
+            compileClosureHits: c.compileClosureHits,
+            checkedOutputs: c.checkedOutputs,
+            nextGlueIdentityHits: c.nextGlueIdentityHits)
+    }
+
+    private static func bump(_ keyPath: WritableKeyPath<Counts, Int>) {
+        guard gemma4MTPCompiledFFNVerifyEnabled else { return }
+        lock.lock()
+        counts[keyPath: keyPath] += 1
+        lock.unlock()
+    }
+
+    public static func reset() {
+        lock.lock()
+        counts = Counts()
+        lock.unlock()
+    }
+
+    public static func snapshot() -> Gemma4MTPCompiledFFNProbeStats {
+        lock.lock()
+        let result = stats(counts)
+        lock.unlock()
+        return result
+    }
+
+    fileprivate static func recordCallerHit() {
+        bump(\Counts.callerHits)
+    }
+
+    fileprivate static func recordCompileClosureHit() {
+        bump(\Counts.compileClosureHits)
+    }
+
+    fileprivate static func recordNextGlueIdentityHit() {
+        bump(\Counts.nextGlueIdentityHits)
+    }
+
+    fileprivate static func recordCheckedOutputs() {
+        guard gemma4MTPCompiledFFNVerifyEnabled else { return }
+        lock.lock()
+        counts.checkedOutputs += 1
+        let result = stats(counts)
+        lock.unlock()
+        let line =
+            "[mtp-compiled-ffn] caller_hits=\(result.callerHits) "
+            + "compile_closure_hits=\(result.compileClosureHits) "
+            + "checked_outputs=\(result.checkedOutputs) "
+            + "next_glue_identity_hits=\(result.nextGlueIdentityHits)\n"
+        FileHandle.standardError.write(Data(line.utf8))
+    }
 }
 
 /// ROUTE-001: one-dispatch, byte-identical replacement of the decode router's
@@ -3919,6 +4025,7 @@ private enum Gemma4RouteGlueFoldV1 {
 /// to the stock `inputLayernorm(x)`.
 public final class Gemma4GlueChainBox {
     var pending: (source: MLXArray, normed: MLXArray, rs: MLXArray?)?
+    var pendingIsMTPCompiledFFN = false
     public init() {}
 }
 
@@ -5730,6 +5837,89 @@ private enum Gemma4ZipRouterV1 {
     }
 }
 
+private enum Gemma4MTPCompiledFFN {
+    typealias Result = (out: MLXArray, normedNext: MLXArray, rs: MLXArray)
+    typealias Function = @Sendable (
+        MLXArray, MLXArray, MLXArray
+    ) -> Result
+
+    static let enabled =
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MTP_COMPILED_FFN"] == "1"
+    static let verify = gemma4MTPCompiledFFNVerifyEnabled
+
+    struct Plan {
+        let router: Gemma4Router
+        let mlp: Gemma4MLP
+        let experts: Gemma4Experts
+        let postAttentionWeight: MLXArray
+        let denseWeight: MLXArray
+        let expertWeight: MLXArray
+        let postFeedforwardWeight1: MLXArray
+        let postFeedforwardWeight2: MLXArray
+        let postFeedforwardWeight: MLXArray
+        let layerScalar: MLXArray
+        let eps: Float
+
+        func run(
+            attnOut: MLXArray, residual: MLXArray,
+            nextInputNormWeight: MLXArray
+        ) -> Result? {
+            guard let prefix = Gemma4ZipRouterV1.makeAttentionBranchPrefix(
+                router: router,
+                attn: attnOut,
+                residual: residual,
+                postAttentionWeight: postAttentionWeight,
+                denseWeight: denseWeight,
+                expertWeight: expertWeight,
+                eps: eps
+            ),
+            let zipped = Gemma4ZipRouterV1.run(
+                router: router,
+                mlp: mlp,
+                out: prefix.out,
+                w1: denseWeight,
+                w2: expertWeight,
+                eps: eps,
+                prefix: prefix
+            ),
+            let deferred = experts.deferredWeightedRows(
+                zipped.expertNorm,
+                topKIndices: zipped.topKIndices,
+                topKWeights: zipped.topKWeights,
+                isExpertPrefill: false,
+                routeTable: zipped.routeTable
+            ),
+            let result = Gemma4FusedLayerGlue.tailChainedDeferred(
+                mlpOut: zipped.denseOut,
+                expertRows: deferred,
+                residual: prefix.out,
+                w1: postFeedforwardWeight1,
+                w2: postFeedforwardWeight2,
+                w3: postFeedforwardWeight,
+                layerScalar: layerScalar,
+                nextInputNormWeight: nextInputNormWeight,
+                eps: eps
+            )
+            else { return nil }
+            return result
+        }
+    }
+
+    struct Instance {
+        let plan: Plan
+        let function: Function
+    }
+
+    static func byteExact(_ lhs: MLXArray, _ rhs: MLXArray) -> Bool {
+        let left = lhs.asData(access: .copy)
+        let right = rhs.asData(access: .copy)
+        return left.shape == right.shape
+            && left.dType == right.dType
+            && left.data == right.data
+    }
+}
+
 // MARK: - Decoder Layer
 
 /// Gemma 4 decoder layer. Combines `Gemma4Attention` with an MLP (or MoE)
@@ -5766,6 +5956,15 @@ public class Gemma4DecoderLayer: Module {
     @ModuleInfo(key: "layer_scalar") var layerScalar: MLXArray
 
     let isMoE: Bool
+
+    private struct MTPPreparedQKColumn {
+        let h: MLXArray
+        let carriedRunsum: MLXArray?
+        let qk: Gemma4Attention.MTPQKProjection?
+    }
+
+    private var mtpPreparedQKColumns: [ObjectIdentifier: MTPPreparedQKColumn] = [:]
+    private var mtpCompiledFFN: Gemma4MTPCompiledFFN.Instance?
 
     public init(
         _ config: Gemma4TextConfiguration, layerIdx: Int, forceSharedKV: Bool = false,
@@ -5817,6 +6016,168 @@ public class Gemma4DecoderLayer: Module {
         super.init()
     }
 
+    @inline(__always)
+    private func prepareAttentionInput(
+        _ x: MLXArray, cache: KVCache?, glueChain: Gemma4GlueChainBox?
+    ) -> (h: MLXArray, carriedRunsum: MLXArray?) {
+        if let chain = glueChain, let pending = chain.pending,
+            pending.source === x
+        {
+            let compiled = chain.pendingIsMTPCompiledFFN
+            chain.pendingIsMTPCompiledFFN = false
+            chain.pending = nil
+            if compiled {
+                Gemma4MTPCompiledFFNProbe.recordNextGlueIdentityHit()
+            }
+            return (pending.normed, pending.rs)
+        }
+        if cache is any CBv2AttendingLayerCache,
+            let produced = Gemma4FusedLayerGlue.inputNormWithQKVRunsum(
+                x: x, weight: inputLayernorm.weight, eps: config.rmsNormEps)
+        {
+            glueChain?.pendingIsMTPCompiledFFN = false
+            glueChain?.pending = nil
+            return (produced.normed, produced.qkvRunsumTable)
+        }
+        glueChain?.pendingIsMTPCompiledFFN = false
+        glueChain?.pending = nil
+        return (inputLayernorm(x), nil)
+    }
+
+    fileprivate func prepareMTPC2QK(
+        _ inputs: [MLXArray], cache: KVCache?, glueChains: [Gemma4GlueChainBox]
+    ) {
+        guard CBv2AttentionQKVMMA8V1.mtpC2Enabled,
+            inputs.count == 2, glueChains.count == inputs.count
+        else { return }
+        mtpPreparedQKColumns.removeAll(keepingCapacity: true)
+        let prepared = inputs.indices.map {
+            prepareAttentionInput(inputs[$0], cache: cache, glueChain: glueChains[$0])
+        }
+        let projections = selfAttn.mtpC2QKProjections(
+            inputs: prepared.map(\.h),
+            runsumTables: prepared.map(\.carriedRunsum))
+        if projections != nil {
+            CBv2EngageMark.once("mtp-qk-tg-c2")
+        }
+        for column in inputs.indices {
+            mtpPreparedQKColumns[ObjectIdentifier(inputs[column])] = MTPPreparedQKColumn(
+                h: prepared[column].h,
+                carriedRunsum: prepared[column].carriedRunsum,
+                qk: projections?[column])
+        }
+    }
+
+    private func makeMTPCompiledFFN() -> Gemma4MTPCompiledFFN.Instance? {
+        guard isMoE,
+            layerType == "sliding_attention",
+            hiddenSizePerLayerInput == 0,
+            Gemma4ZipRouterV1.enabled,
+            Gemma4RouterProbe.recorder == nil,
+            let router, router.zipAdmits,
+            let experts,
+            let postFeedforwardLayernorm1,
+            let preFeedforwardLayernorm2,
+            let postFeedforwardLayernorm2
+        else { return nil }
+
+        _ = router.zipEffectiveScale()
+        let plan = Gemma4MTPCompiledFFN.Plan(
+            router: router,
+            mlp: mlp,
+            experts: experts,
+            postAttentionWeight: postAttentionLayernorm.weight,
+            denseWeight: preFeedforwardLayernorm.weight,
+            expertWeight: preFeedforwardLayernorm2.weight,
+            postFeedforwardWeight1: postFeedforwardLayernorm1.weight,
+            postFeedforwardWeight2: postFeedforwardLayernorm2.weight,
+            postFeedforwardWeight: postFeedforwardLayernorm.weight,
+            layerScalar: layerScalar,
+            eps: config.rmsNormEps)
+        let body: (MLXArray, MLXArray, MLXArray) -> Gemma4MTPCompiledFFN.Result = {
+            attnOut, residual, nextInputNormWeight in
+            Gemma4MTPCompiledFFNProbe.recordCompileClosureHit()
+            guard let result = plan.run(
+                attnOut: attnOut,
+                residual: residual,
+                nextInputNormWeight: nextInputNormWeight
+            ) else {
+                preconditionFailure("Gemma4 MTP compiled FFN lost its admitted geometry")
+            }
+            return result
+        }
+        return Gemma4MTPCompiledFFN.Instance(
+            plan: plan, function: compile(shapeless: false, body))
+    }
+
+    private func callMTPCompiledFFN(
+        attnOut: MLXArray,
+        residual: MLXArray,
+        cache: KVCache?,
+        outputStart: Int,
+        useLastQueryPrefill: Bool,
+        isExpertPrefill: Bool,
+        nextInputLayernormWeight: MLXArray?
+    ) -> Gemma4MTPCompiledFFN.Result? {
+        guard Gemma4MTPCompiledFFN.enabled,
+            gemma4CompiledDecodeSupported,
+            !isExpertPrefill,
+            layerType == "sliding_attention",
+            isMoE,
+            hiddenSizePerLayerInput == 0,
+            outputStart == 0,
+            !useLastQueryPrefill,
+            cache is any CBv2AttendingLayerCache,
+            Gemma4RouterProbe.recorder == nil,
+            attnOut.shape == [8, 1, 2816],
+            residual.shape == [8, 1, 2816],
+            attnOut.dtype == .bfloat16,
+            residual.dtype == .bfloat16,
+            let nextWeight = nextInputLayernormWeight,
+            nextWeight.shape == [2816],
+            nextWeight.dtype == .bfloat16
+        else { return nil }
+
+        let instance: Gemma4MTPCompiledFFN.Instance
+        let firstEager: Gemma4MTPCompiledFFN.Result?
+        if let cached = mtpCompiledFFN {
+            instance = cached
+            firstEager = nil
+        } else {
+            guard let created = makeMTPCompiledFFN(),
+                let admitted = created.plan.run(
+                    attnOut: attnOut,
+                    residual: residual,
+                    nextInputNormWeight: nextWeight)
+            else { return nil }
+            mtpCompiledFFN = created
+            instance = created
+            firstEager = admitted
+        }
+
+        Gemma4MTPCompiledFFNProbe.recordCallerHit()
+        let compiled = instance.function(attnOut, residual, nextWeight)
+        if Gemma4MTPCompiledFFN.verify {
+            guard let eager = firstEager ?? instance.plan.run(
+                attnOut: attnOut,
+                residual: residual,
+                nextInputNormWeight: nextWeight
+            ) else {
+                preconditionFailure("Gemma4 MTP eager FFN lost its admitted geometry")
+            }
+            let outExact = Gemma4MTPCompiledFFN.byteExact(compiled.out, eager.out)
+            let normedExact = Gemma4MTPCompiledFFN.byteExact(
+                compiled.normedNext, eager.normedNext)
+            let rsExact = Gemma4MTPCompiledFFN.byteExact(compiled.rs, eager.rs)
+            Gemma4MTPCompiledFFNProbe.recordCheckedOutputs()
+            precondition(
+                outExact && normedExact && rsExact,
+                "Gemma4 MTP compiled FFN bytes differ "
+                    + "out=\(outExact) normedNext=\(normedExact) rs=\(rsExact)")
+        }
+        return compiled
+    }
+
     public func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
@@ -5830,7 +6191,8 @@ public class Gemma4DecoderLayer: Module {
         isExpertPrefill: Bool = false,
         glueChain: Gemma4GlueChainBox? = nil,
         nextInputLayernormWeight: MLXArray? = nil,
-        enableAttentionBranchPrefix: Bool = false
+        enableAttentionBranchPrefix: Bool = false,
+        enableCompiledMTPFFN: Bool = false
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // Prompt-path narrowing (CBv2 only): attention and every K/V write
         // still cover the full chunk; only the token-local work AFTER
@@ -5862,29 +6224,34 @@ public class Gemma4DecoderLayer: Module {
         // GLUE-003 consumption: the previous layer's fused tail already
         // produced this layer's input norm. Pointer identity on the source
         // guarantees the normed tensor was computed from exactly this input.
-        let h: MLXArray
-        var carriedRunsum: MLXArray? = nil
-        if let chain = glueChain, let pending = chain.pending,
-            pending.source === x
-        {
-            chain.pending = nil
-            h = pending.normed
-            carriedRunsum = pending.rs
-        } else if cache is any CBv2AttendingLayerCache,
-            let produced = Gemma4FusedLayerGlue.inputNormWithQKVRunsum(
-                x: x, weight: inputLayernorm.weight, eps: config.rmsNormEps)
-        {
-            glueChain?.pending = nil
-            h = produced.normed
-            carriedRunsum = produced.qkvRunsumTable
-        } else {
-            glueChain?.pending = nil
-            h = inputLayernorm(x)
-        }
+        let mtpPrepared = mtpPreparedQKColumns.removeValue(
+            forKey: ObjectIdentifier(x))
+        let attentionInput = mtpPrepared.map { ($0.h, $0.carriedRunsum) }
+            ?? prepareAttentionInput(x, cache: cache, glueChain: glueChain)
+        let h = attentionInput.0
+        let carriedRunsum = attentionInput.1
         let (attnOut, kvPair, attnPositionOffset) = selfAttn(
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
-            useLastQueryPrefill: useLastQueryPrefill, carriedRunsum: carriedRunsum)
+            useLastQueryPrefill: useLastQueryPrefill, carriedRunsum: carriedRunsum,
+            mtpQK: mtpPrepared?.qk)
+        if enableCompiledMTPFFN, enableAttentionBranchPrefix,
+            let chain = glueChain,
+            let compiled = callMTPCompiledFFN(
+                attnOut: attnOut,
+                residual: residual,
+                cache: cache,
+                outputStart: outputStart,
+                useLastQueryPrefill: useLastQueryPrefill,
+                isExpertPrefill: isExpertPrefill,
+                nextInputLayernormWeight: nextInputLayernormWeight)
+        {
+            chain.pending = (
+                source: compiled.out, normed: compiled.normedNext, rs: compiled.rs)
+            chain.pendingIsMTPCompiledFFN = true
+            CBv2EngageMark.once("mtp-compiled-ffn")
+            return (compiled.out, kvPair, attnPositionOffset)
+        }
         // PREFIX-001: only build the joined producer when the ZIP consumer is
         // guaranteed to accept it. A nil leaves the established attention
         // residual and branch pre-norm paths untouched.
@@ -6724,6 +7091,64 @@ public class Gemma4TextModelInner: Module {
         let r = forwardTrunk(
             inputs, cache: cache, captureHook: captureHook, capturePreNorm: true)
         return (r.postNorm, r.preNorm!)
+    }
+
+    /// Schedule serial-target columns layer-major. Every projection, norm,
+    /// expert route, and attention call keeps its original B8x1 geometry.
+    fileprivate func callColumnsCapturingPreNorm(
+        _ columns: [MLXArray], caches: [KVCache]
+    ) -> (
+        postNorm: [MLXArray], preNorm: [MLXArray],
+        activationSums: [Gemma4MMAQuantizedGEMV.ActivationSums?]
+    )? {
+        guard (2...4).contains(columns.count),
+            columns.allSatisfy({ $0.shape == [8, 1] }),
+            hiddenSizePerLayerInput == 0, config.numKvSharedLayers == 0,
+            config.useBidirectionalAttention != "all",
+            caches.count == layers.count,
+            let offsets = (caches.first as? CBv2LayerCache)?.unifiedPositionOffsets,
+            caches.allSatisfy({
+                ($0 as? CBv2LayerCache)?.unifiedPositionOffsets === offsets
+            })
+        else { return nil }
+
+        // Only the last owning layer advances the bank's shared position
+        // chain. Earlier layers therefore need explicit per-column offsets.
+        let start = offsets + 0
+        let positions = columns.indices.map { Gemma4.PositionOffset.batch(start + Int32($0)) }
+        var hidden = columns.map { tokens in
+            Gemma4FusedScaledEmbedding.apply(
+                tokens: tokens, embedding: embedTokens, embedScale: embedScale,
+                hiddenSize: config.hiddenSize) ?? embedTokens(tokens) * embedScale
+        }
+        let chains = columns.map { _ in Gemma4GlueChainBox() }
+        for (index, layer) in layers.enumerated() {
+            _ = (caches[index] as? CBv2LayerCache)?
+                .prepareSpeculativeRingWriteBlock(columnCount: columns.count)
+            if columns.count == 2 {
+                layer.prepareMTPC2QK(
+                    hidden, cache: caches[index], glueChains: chains)
+            }
+            for column in columns.indices {
+                hidden[column] = layer(
+                    hidden[column], cache: caches[index],
+                    positionOffset: positions[column], glueChain: chains[column],
+                    nextInputLayernormWeight: index + 1 < layers.count
+                        ? layers[index + 1].inputLayernorm.weight : nil,
+                    enableAttentionBranchPrefix: true,
+                    enableCompiledMTPFFN: true
+                ).0
+            }
+            // Submit the completed layer across columns before constructing
+            // the next layer; no CPU wait and no widening of tensor math.
+            asyncEval(hidden)
+        }
+        let normalized = hidden.map {
+            Gemma4FinalNormMMAHeadSumsV1.apply($0, weight: norm.weight, eps: norm.eps)
+        }
+        return (
+            zip(hidden, normalized).map { input, produced in produced?.postNorm ?? norm(input) },
+            hidden, normalized.map { $0?.sums })
     }
 
     /// DFlash target-hidden capture (2026-08-25, gemma4-dflash-real-loader
@@ -7670,6 +8095,72 @@ extension Gemma4TextModel: CBv2MTPForwardable {
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
         return (applyLMHead(postNorm), preNorm)
+    }
+
+    public func cbv2ForwardColumnsWithHidden(
+        _ columns: [MLXArray], caches: [KVCache]
+    ) -> (logits: MLXArray, lastHidden: MLXArray)? {
+        guard let output = model.callColumnsCapturingPreNorm(columns, caches: caches)
+        else { return nil }
+        return (
+            concatenated(zip(output.postNorm, output.activationSums).map {
+                applyLMHead($0.0, activationSums: $0.1)
+            }, axis: 1),
+            concatenated(output.preNorm, axis: 1))
+    }
+
+    public func cbv2ForwardColumnsArgmaxWithHidden(
+        _ columns: [MLXArray], caches: [KVCache]
+    ) -> (argmax: MLXArray, lastHidden: MLXArray)? {
+        guard ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_MTP_ARGMAX"] != "0",
+            columns.allSatisfy({ cbv2AdmitsArgmaxDecode($0) }),
+            lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            let output = model.callColumnsCapturingPreNorm(columns, caches: caches)
+        else { return nil }
+        if let shared = Gemma4MMAQuantizedGEMV.applyArgmaxColumns(
+            x: output.postNorm,
+            w: quantized.weight,
+            scales: quantized.scales,
+            biases: quantized.biases,
+            groupSize: quantized.groupSize,
+            bits: quantized.bits,
+            activationSums: output.activationSums)
+        {
+            CBv2EngageMark.once("mtp-logitsless-head")
+            if gemma4LogitslessHeadVerify {
+                let stock = concatenated(
+                    zip(output.postNorm, output.activationSums).map { hidden, sums in
+                        self.applyLMHead(hidden, activationSums: sums)
+                            .argMax(axis: -1).asType(.int32).reshaped([8, 1])
+                    }, axis: 1)
+                precondition(
+                    sum(notEqual(shared, stock)).item(Int.self) == 0,
+                    "MTP shared head differs from full-logit argmax")
+            }
+            return (shared, concatenated(output.preNorm, axis: 1))
+        }
+        let ids = zip(output.postNorm, output.activationSums).map { hidden, sums in
+            let stock = {
+                self.applyLMHead(hidden, activationSums: sums)
+                    .argMax(axis: -1).asType(.int32).reshaped([8, 1])
+            }
+            guard let fused = Gemma4MMAQuantizedGEMV.applyArgmax(
+                x: hidden, w: quantized.weight,
+                scales: quantized.scales, biases: quantized.biases,
+                groupSize: quantized.groupSize, bits: quantized.bits,
+                activationSums: sums)
+            else { return stock() }
+            CBv2EngageMark.once("mtp-logitsless-head")
+            let selected = fused.reshaped([8, 1])
+            if gemma4LogitslessHeadVerify {
+                precondition(
+                    sum(notEqual(selected, stock())).item(Int.self) == 0,
+                    "MTP fused head differs from full-logit argmax")
+            }
+            return selected
+        }
+        return (concatenated(ids, axis: 1), concatenated(output.preNorm, axis: 1))
     }
 }
 

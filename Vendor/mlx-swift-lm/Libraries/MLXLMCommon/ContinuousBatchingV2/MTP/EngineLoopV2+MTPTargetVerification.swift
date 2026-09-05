@@ -62,7 +62,26 @@ extension EngineLoopV2 {
         }
         mtp.recordVerificationStrategy(rectangular: useRectangular)
 
+        if !useRectangular,
+            let output = mtp.model.forwardColumnsArgmaxWithHidden(columns: columns, caches: caches)
+        {
+            return (output.argmax, output.lastHidden, eagerCacheInnerState(caches))
+        }
+
+        if !useRectangular,
+            let output = mtp.model.forwardColumnsWithHidden(columns: columns, caches: caches)
+        {
+            return (
+                argMax(output.logits, axis: -1).asType(.int32),
+                output.lastHidden, eagerCacheInnerState(caches))
+        }
+
         if !useRectangular {
+            // The contiguous B8 bank orders its ring reads and writes with
+            // graph fences. Keep those canonical columns in one lazy graph.
+            // Other cache geometries retain the synchronous authority path.
+            let deferColumnEval = columns[0].dim(0) == 8
+                && caches.allSatisfy { $0 is CBv2LayerCache }
             var argmaxColumns: [MLXArray] = []
             var hiddenColumns: [MLXArray] = []
             argmaxColumns.reserveCapacity(columns.count)
@@ -71,10 +90,9 @@ extension EngineLoopV2 {
                 precondition(column.dim(1) == 1, "CBv2 MTP: serial target column must have L=1")
                 let output = mtp.model.forwardWithHidden(tokens: column, caches: caches)
                 let columnArgmax = argMax(output.logits, axis: -1).asType(.int32)
-                // Building several eager decode calls in one lazy graph can
-                // let mutable KV buffers observe a later version. Complete
-                // each canonical target step before constructing the next.
-                eval([columnArgmax, output.lastHidden] + eagerCacheInnerState(caches))
+                if !deferColumnEval {
+                    eval([columnArgmax, output.lastHidden] + eagerCacheInnerState(caches))
+                }
                 argmaxColumns.append(columnArgmax)
                 hiddenColumns.append(output.lastHidden)
             }

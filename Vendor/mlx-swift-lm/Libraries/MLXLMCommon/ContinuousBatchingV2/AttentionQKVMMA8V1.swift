@@ -632,6 +632,218 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
 }
 """
 
+    /// QKV-MTRSP-CARRY2. The two-tile run-sum body reads each group's packed
+    /// codes, scale and bias at the point of use, so it stands at zero
+    /// outstanding weight loads while the eight matrix-unit steps of the
+    /// previous group retire. Its own non-run-sum twin
+    /// `qkv_mma8_affine4_g64_mt` carries them two groups deep
+    /// (AttentionQKVMMA8V1.swift 296-341); the o_proj run-sum bodies took that
+    /// same rotation and were promoted. This transplants the twin's rotation,
+    /// textually verbatim, onto the run-sum body the ranked decode geometry
+    /// actually dispatches: preload wv_next/wv_next2/s_next/b_next per tile
+    /// before the group walk, rotate at loop top with min-clamped
+    /// g_next/g_next2, and read the carried registers where the in-place loads
+    /// stood. Pure load scheduling — addresses, operand order into `C`, the
+    /// `acc[t] += s * C + rs * b` step, the run-sum table reads and the KS = 2
+    /// close are unchanged, so every output word is the same float sum in the
+    /// same order.
+    ///
+    /// DISCLOSED PORT (donor-port hygiene): the donor pattern is verbatim, but
+    /// its application site never carried, and the promoted registration names
+    /// for two of the three affected kernels already SAY `carry2` while their
+    /// body has none — the suffix below makes the name honest and, more
+    /// importantly, gives MLX a distinct pipeline key for the changed source.
+    /// `DARKBLOOM_GEMMA4_QKV_MTRSP_CARRY2=0` restores the promoted bodies and
+    /// names byte for byte in the same executable.
+    public static let mtRspCarry2Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_MTRSP_CARRY2"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let mtRspCarry2KeySuffix = mtRspCarry2Enabled ? "_mtcarry2" : ""
+
+    private static let mma8MtRspCarry2Header: String = {
+        var result = mma8KernelHeader
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(
+                result.components(separatedBy: old).count == 2,
+                "mt_rsp carry2 anchor drift")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(
+            """
+              simdgroup_float8x8 A;
+              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+            #pragma unroll
+              for (int gi = 0; gi < nGroups; ++gi) {
+                const int g = g0 + gi;
+                const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+                const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+                const float2 rs = float2(
+                    rs_table[c.fn * G + g], rs_table[(c.fn + 1) * G + g]);
+
+                MMA8_SETB(B0, x, lo)
+                MMA8_SETB(B1, x, hi)
+                MMA8_SETB(B2, y, lo)
+                MMA8_SETB(B3, y, hi)
+                MMA8_SETB(B4, z, lo)
+                MMA8_SETB(B5, z, hi)
+                MMA8_SETB(B6, w, lo)
+                MMA8_SETB(B7, w, hi)
+
+            #pragma clang loop unroll(full)
+                for (int t = 0; t < TILES; ++t) {
+                  const uint2 wv = *((const device uint2*)(wrow[t] + 32 * g));
+                  const float s = float(srow[t][g]);
+                  const float b = float(brow[t][g]);
+            """,
+            with: """
+              simdgroup_float8x8 A;
+              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+              // The per-group weight operands are carried in registers: group
+              // g0's packed word, scale and bias are read before the walk, and
+              // each trip reads the next group's while the current group's stay
+              // resident. The addresses are functions of the group index alone,
+              // so the value each trip consumes is the value the in-place read
+              // produced. The clamp on `g_next` keeps the last trip inside the
+              // simdgroup's group range; the value it re-reads is discarded at
+              // loop exit and touches no byte the walk had not already read.
+              uint2 wv_next[TILES];
+              uint2 wv_next2[TILES];
+              T s_next[TILES];
+              T b_next[TILES];
+            #pragma clang loop unroll(full)
+              for (int t = 0; t < TILES; ++t) {
+                wv_next[t] = *((const device uint2*)(wrow[t] + 32 * g0));
+                wv_next2[t] =
+                    *((const device uint2*)(wrow[t] + 32 * (g0 + min(1, nGroups - 1))));
+                s_next[t] = srow[t][g0];
+                b_next[t] = brow[t][g0];
+              }
+
+            #pragma unroll
+              for (int gi = 0; gi < nGroups; ++gi) {
+                const int g = g0 + gi;
+
+                uint2 wv_cur[TILES];
+                float s_cur[TILES];
+                float b_cur[TILES];
+            #pragma clang loop unroll(full)
+                for (int t = 0; t < TILES; ++t) {
+                  wv_cur[t] = wv_next[t];
+                  s_cur[t] = float(s_next[t]);
+                  b_cur[t] = float(b_next[t]);
+                }
+                const int g_next = g0 + min(gi + 1, nGroups - 1);
+                const int g_next2 = g0 + min(gi + 2, nGroups - 1);
+            #pragma clang loop unroll(full)
+                for (int t = 0; t < TILES; ++t) {
+                  wv_next[t] = wv_next2[t];
+                  wv_next2[t] = *((const device uint2*)(wrow[t] + 32 * g_next2));
+                  s_next[t] = srow[t][g_next];
+                  b_next[t] = brow[t][g_next];
+                }
+
+                const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+                const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+                const float2 rs = float2(
+                    rs_table[c.fn * G + g], rs_table[(c.fn + 1) * G + g]);
+
+                MMA8_SETB(B0, x, lo)
+                MMA8_SETB(B1, x, hi)
+                MMA8_SETB(B2, y, lo)
+                MMA8_SETB(B3, y, hi)
+                MMA8_SETB(B4, z, lo)
+                MMA8_SETB(B5, z, hi)
+                MMA8_SETB(B6, w, lo)
+                MMA8_SETB(B7, w, hi)
+
+            #pragma clang loop unroll(full)
+                for (int t = 0; t < TILES; ++t) {
+                  const uint2 wv = wv_cur[t];
+                  const float s = s_cur[t];
+                  const float b = b_cur[t];
+            """)
+        return result
+    }()
+
+    /// QKV-MT-UR4. Selects the loop unroll directive on the multi-tile
+    /// run-sum group loop: `#pragma clang loop unroll_count(4)` when on, the
+    /// incumbent `#pragma unroll` when off. The directive line is the only
+    /// text that differs: the loop bounds, the group index, the operand
+    /// carry, the addresses and the arithmetic are carried over character for
+    /// character, so the setting changes how many group bodies the compiler
+    /// keeps live, not what any one of them computes.
+    ///
+    /// Scope is the multi-tile run-sum body. The single-tile bodies and the
+    /// buffer-fill bodies take the shared base header directly and keep their
+    /// incumbent text and their incumbent keys.
+    ///
+    /// `DARKBLOOM_GEMMA4_QKV_UNROLL4=0` restores the incumbent bodies and
+    /// names byte for byte.
+    public static let mtUnroll4Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_UNROLL4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let mtUnroll4KeySuffix = mtUnroll4Enabled ? "_ur4" : ""
+
+    /// The group loop's opening statement, in the two shapes the multi-tile
+    /// run-sum body has: with the operand carry ahead of the activation
+    /// reads, and without it.
+    private static let mtUnroll4CarryAnchor =
+        "#pragma unroll\n  for (int gi = 0; gi < nGroups; ++gi) {\n"
+        + "    const int g = g0 + gi;\n\n    uint2 wv_cur[TILES];"
+
+    private static let mtUnroll4PlainAnchor =
+        "#pragma unroll\n  for (int gi = 0; gi < nGroups; ++gi) {\n"
+        + "    const int g = g0 + gi;\n"
+        + "    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));"
+
+    /// Neither opening is unique in the header as a whole: the single-tile
+    /// bodies and the buffer-fill multi-tile body walk their groups with the
+    /// same statement. The rewrite is therefore scoped to the text from the
+    /// run-sum body's definition onward -- the last function in the header --
+    /// where the opening occurs exactly once. Every byte before that point is
+    /// left alone, so the bodies sharing this header keep their incumbent
+    /// directive and their incumbent keys.
+    private static let mtRspFunctionMarker =
+        "METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp("
+
+    private static func applyMtUnroll4(to header: String, anchor: String)
+        -> String
+    {
+        precondition(
+            header.components(separatedBy: mtRspFunctionMarker).count == 2,
+            "qkv mt_rsp ur4 marker drift")
+        let cut = header.range(of: mtRspFunctionMarker)!.lowerBound
+        let head = String(header[..<cut])
+        let body = String(header[cut...])
+        precondition(
+            body.components(separatedBy: anchor).count == 2,
+            "qkv mt_rsp ur4 anchor drift")
+        let rewritten = "#pragma clang loop unroll_count(4)"
+            + anchor.dropFirst("#pragma unroll".count)
+        return head + body.replacingOccurrences(of: anchor, with: rewritten)
+    }
+
+    private static let mtRspHeader: String = {
+        let base = mtRspCarry2Enabled ? mma8MtRspCarry2Header : mma8KernelHeader
+        guard mtUnroll4Enabled else { return base }
+        return applyMtUnroll4(
+            to: base,
+            anchor: mtRspCarry2Enabled
+                ? mtUnroll4CarryAnchor : mtUnroll4PlainAnchor)
+    }()
+
     /// MMA-MT-001 arm. Default ON.
     /// `DARKBLOOM_GEMMA4_QKV_MMA8_MULTITILE=0` restores the promoted
     /// single-tile dispatch byte for byte in the same executable.
@@ -714,7 +926,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     // entries the separate Q and K rsp dispatches would; the SPLIT store
     // keeps QKFUSE-001's two-buffer layout.
     private static let fusedSlidingRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_v1"
+            + mtRspCarry2KeySuffix + mtUnroll4KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y", "y2"],
         source: """
@@ -727,11 +940,12 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
                 thread_index_in_simdgroup, y2);
             return;
             """,
-        header: mma8KernelHeader,
+        header: mtRspHeader,
         ensureRowContiguous: true)
 
     private static let fusedFullRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_v1"
+            + mtRspCarry2KeySuffix + mtUnroll4KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y", "y2"],
         source: """
@@ -744,7 +958,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
                 thread_index_in_simdgroup, y2);
             return;
             """,
-        header: mma8KernelHeader,
+        header: mtRspHeader,
         ensureRowContiguous: true)
 
     private static let mma8Kernel = MLXFast.metalKernel(
@@ -805,7 +1019,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let multiTileRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_v1"
+            + mtRspCarry2KeySuffix + mtUnroll4KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -818,7 +1033,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: mma8KernelHeader,
+        header: mtRspHeader,
         ensureRowContiguous: true)
 
     private static let mma8RspKernel = MLXFast.metalKernel(
@@ -974,6 +1189,10 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         let total = qWidth + kWidth
         let yTiles = total / outputsPerGroup
         guard yTiles % tilesPerGroup == 0 else { return nil }
+        if tableReady && mtRspCarry2Enabled {
+            CBv2EngageMark.once("qkv-mtrsp-carry2")
+            if mtUnroll4Enabled { CBv2EngageMark.once("qkv-mtrsp-ur4") }
+        }
 
         fusedLock.lock()
         var plane = fusedPlanes[cacheKey]
@@ -1049,6 +1268,10 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         let yTiles = outputWidth / outputsPerGroup
         if multiTileEnabled, yTiles % tilesPerGroup == 0 {
             if tableReady {
+                if mtRspCarry2Enabled {
+                    CBv2EngageMark.once("qkv-mtrsp-carry2")
+                    if mtUnroll4Enabled { CBv2EngageMark.once("qkv-mtrsp-ur4") }
+                }
                 return multiTileRspKernel(
                     [x, weight, scales, biases, rsTable!],
                     template: [("T", x.dtype)],

@@ -908,6 +908,7 @@ private struct Gemma4QKVRopeParameters {
     let frequencies: MLXArray
     let usesFrequencies: Bool
     let inverseFrequencies: MLXArray?
+    let sinCos: MLXArray?
 }
 
 private let gemma4QKVNormRopeEnabled: Bool = {
@@ -2429,7 +2430,9 @@ private class Gemma4Attention: Module {
                 frequencies: MLXArray([Float.infinity]), usesFrequencies: false,
                 inverseFrequencies: CBv2RaggedTwoPassDecodeAttentionV1
                     .makeBaseRopeInverseFrequencies(
-                        log2Base: log2Base, dimensions: effectiveHeadDim))
+                        log2Base: log2Base, dimensions: effectiveHeadDim),
+                sinCos: CBv2RaggedTwoPassDecodeAttentionV1.makeBaseRopeSinCos(
+                    log2Base: log2f(config.slidingRopeTheta), dimensions: effectiveHeadDim))
         } else {
             let fullRope = initializeRope(
                 dims: effectiveHeadDim, base: config.fullRopeTheta, traditional: false,
@@ -2446,7 +2449,7 @@ private class Gemma4Attention: Module {
             self.rope = proportional
             self.qkvRopeParameters = Gemma4QKVRopeParameters(
                 log2Base: MLXArray([Float.zero]), frequencies: frequencies,
-                usesFrequencies: true, inverseFrequencies: nil)
+                usesFrequencies: true, inverseFrequencies: nil, sinCos: nil)
         }
 
         super.init()
@@ -2888,6 +2891,7 @@ private class Gemma4Attention: Module {
                 positionOffsets: capturedOffsets,
                 ropeLog2Base: qkvRopeParameters.log2Base,
                 ropeInverseFrequencies: qkvRopeParameters.inverseFrequencies,
+                ropeSinCos: qkvRopeParameters.sinCos,
                 eps: config.rmsNormEps, appliedRope: appliedRope)
         } else if vProj == nil, qkvRopeParameters.usesFrequencies {
             // NORMROPE-D512: the full layers' store dispatch takes the raw

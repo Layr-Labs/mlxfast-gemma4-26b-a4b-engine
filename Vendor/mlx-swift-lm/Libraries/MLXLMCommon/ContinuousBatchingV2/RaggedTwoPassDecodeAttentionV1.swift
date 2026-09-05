@@ -77,6 +77,61 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             outputShapes: [[dimensions / 2]], outputDTypes: [.float32])[0]
     }
 
+    /// Input-independent sine/cosine values for the common context range.
+    /// The same float32 Metal expressions run once per RoPE configuration;
+    /// positions outside the table keep the existing per-step calculation.
+    private static let ropeSinCosTableEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROPE_SINCOS_TABLE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let ropeSinCosPositions = 16_384
+    private static let ropeSinCosLock = NSLock()
+    nonisolated(unsafe) private static var ropeSinCosTables: [UInt32: MLXArray] = [:]
+
+    private static let ropeSinCosKernel = MLXFast.metalKernel(
+        name: "cbv2_sliding_rope_sincos_table_v1",
+        inputNames: ["rope_log2_base"],
+        outputNames: ["cos_sin"],
+        source: """
+            const uint pair = thread_position_in_grid.x;
+            const uint position = thread_position_in_grid.y;
+            const float d = static_cast<float>(pair) / static_cast<float>(D / 2);
+            const float inv_freq = metal::exp2(-d * rope_log2_base[0]);
+            const float theta = static_cast<float>(position) * inv_freq;
+            const uint cell = (position * (D / 2) + pair) * 2;
+            cos_sin[cell] = metal::fast::cos(theta);
+            cos_sin[cell + 1] = metal::fast::sin(theta);
+            """,
+        ensureRowContiguous: true)
+
+    /// Shared by layers with the same scalar base, without retaining weights,
+    /// tokens, activations, or request-dependent state. One D=256 table is 16 MiB.
+    public static func makeBaseRopeSinCos(
+        log2Base: Float, dimensions: Int
+    ) -> MLXArray? {
+        guard ropeSinCosTableEnabled, ropeInverseFrequencyTableEnabled,
+            dimensions == headDim, log2Base.isFinite
+        else { return nil }
+        ropeSinCosLock.lock()
+        defer { ropeSinCosLock.unlock() }
+        let key = log2Base.bitPattern
+        if let table = ropeSinCosTables[key] { return table }
+        let table = ropeSinCosKernel(
+            [MLXArray([log2Base])], template: [("D", dimensions)],
+            grid: (dimensions / 2, ropeSinCosPositions, 1),
+            threadGroup: (dimensions / 2, 1, 1),
+            outputShapes: [[ropeSinCosPositions, dimensions / 2, 2]],
+            outputDTypes: [.float32])[0]
+        // Model instances retain their own arrays if the small global cache
+        // rotates after serving many distinct configurations.
+        if ropeSinCosTables.count >= 8 { ropeSinCosTables.removeAll() }
+        ropeSinCosTables[key] = table
+        return table
+    }
+
     private struct ResidentNormRopeInputs {
         let normalizedKeys: ObjectIdentifier
         let normalizedValues: ObjectIdentifier
@@ -88,6 +143,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         let positionOffsets: MLXArray
         let ropeLog2Base: MLXArray
         let ropeInverseFrequencies: MLXArray?
+        let ropeSinCos: MLXArray?
     }
 
     private static let residentNormRopeLock = NSLock()
@@ -111,6 +167,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         positionOffsets: MLXArray,
         ropeLog2Base: MLXArray,
         ropeInverseFrequencies: MLXArray? = nil,
+        ropeSinCos: MLXArray? = nil,
         eps: Float,
         appliedRope: Bool
     ) -> Bool {
@@ -156,6 +213,13 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             return false
         }
 
+        if let ropeSinCos,
+            (ropeSinCos.dtype != .float32
+                || ropeSinCos.shape != [ropeSinCosPositions, headDim / 2, 2])
+        {
+            return false
+        }
+
         residentNormRopeLock.lock()
         if residentNormRopeInputs.count >= 64 {
             residentNormRopeInputs.removeAll(keepingCapacity: true)
@@ -171,7 +235,8 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 kWeight: kWeight,
                 positionOffsets: positionOffsets,
                 ropeLog2Base: ropeLog2Base,
-                ropeInverseFrequencies: ropeInverseFrequencies)
+                ropeInverseFrequencies: ropeInverseFrequencies,
+                ropeSinCos: ropeSinCos)
         residentNormRopeLock.unlock()
         return true
     }
@@ -3203,9 +3268,19 @@ for (int element = 0; element < values_per_lane; ++element) {
                         const float inv_freq = ROPE_INV_FREQS
                             ? rope_parameters[pair]
                             : metal::exp2(-d * rope_parameters[0]);
-                        const float theta = L * inv_freq;
-                        const float costheta = metal::fast::cos(theta);
-                        const float sintheta = metal::fast::sin(theta);
+                        float costheta;
+                        float sintheta;
+                        const int position = position_offsets[batch_index];
+                        if (ROPE_TRIG_POSITIONS > 0 && position >= 0
+                            && position < ROPE_TRIG_POSITIONS) {
+                            const uint cell = (uint(position) * (D / 2) + uint(pair)) * 2;
+                            costheta = rope_trig_table[cell];
+                            sintheta = rope_trig_table[cell + 1];
+                        } else {
+                            const float theta = L * inv_freq;
+                            costheta = metal::fast::cos(theta);
+                            sintheta = metal::fast::sin(theta);
+                        }
                         const float x1 =
                             static_cast<float>(normalized_row[pair]);
                         const float x2 =
@@ -3497,7 +3572,7 @@ for (int element = 0; element < values_per_lane; ++element) {
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
                 "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
-                "position_offsets", "rope_parameters", "write_fence",
+                "position_offsets", "rope_parameters", "rope_trig_table", "write_fence",
             ],
             outputNames: ["out", "fence", "k_out", "v_out"],
             source: residentNormRopeSource(withORunsum: false),
@@ -3513,7 +3588,7 @@ for (int element = 0; element < values_per_lane; ++element) {
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
                 "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
-                "position_offsets", "rope_parameters", "write_fence",
+                "position_offsets", "rope_parameters", "rope_trig_table", "write_fence",
             ],
             outputNames: ["out", "fence", "k_out", "v_out", "o_rs"],
             source: residentNormRopeSource(withORunsum: true),
@@ -3673,6 +3748,7 @@ for (int element = 0; element < values_per_lane; ++element) {
                         normRope.kWeight,
                         normRope.positionOffsets,
                         normRope.ropeInverseFrequencies ?? normRope.ropeLog2Base,
+                        normRope.ropeSinCos ?? normRope.ropeLog2Base,
                         previousWriteFence,
                     ]
                 let residentTemplate: [(String, any KernelTemplateArg)] = [
@@ -3683,7 +3759,11 @@ for (int element = 0; element < values_per_lane; ++element) {
                     ("KV_HEADS", kvHeads),
                     ("BLOCKS", blocks),
                     ("ROPE_INV_FREQS", normRope.ropeInverseFrequencies != nil),
+                    ("ROPE_TRIG_POSITIONS", normRope.ropeSinCos == nil ? 0 : ropeSinCosPositions),
                 ]
+                if normRope.ropeSinCos != nil {
+                    CBv2EngageMark.once("sliding-rope-sincos-table")
+                }
                 let residentShapes = [
                     [batch, queryHeads, 1, headDim], [1],
                     [batch, kvHeads, 1, headDim],

@@ -99,7 +99,7 @@ extension EngineLoopV2 {
         if !decodeRows.isEmpty {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
-            let caches = eagerCaches(rowStates: decodeRows.map { kvStates[$0.rec.id]! })
+            let caches = MTPDecodeCacheMemoizer.getCaches(for: decodeRows, loop: self)
             let (logits, hidden) = mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             decodeSampled = sampler.sample(
@@ -164,21 +164,29 @@ extension EngineLoopV2 {
 
         // Plain sampled tokens stay in plan order. Verify rows are finalized
         // from the target-authoritative acceptance packet instead.
-        var pieces: [MLXArray] = []
-        var sampledRows: [CBv2RequestID] = []
-        var decodeIndex = 0
-        for row in work {
-            if row.isDecode {
-                pieces.append(decodeSampled![decodeIndex ..< decodeIndex + 1])
-                decodeIndex += 1
-                sampledRows.append(row.rec.id)
-            } else if let sampled = prefillSampled[row.rec.id] {
-                pieces.append(sampled)
-                sampledRows.append(row.rec.id)
+        let sampledTokens: MLXArray?
+        let sampledRows: [CBv2RequestID]
+        if decodeRows.count == work.count, let decodeSampled {
+            sampledRows = decodeRows.map(\.rec.id)
+            sampledTokens = decodeSampled
+        } else {
+            var pieces: [MLXArray] = []
+            var sRows: [CBv2RequestID] = []
+            var decodeIndex = 0
+            for row in work {
+                if row.isDecode {
+                    pieces.append(decodeSampled![decodeIndex ..< decodeIndex + 1])
+                    decodeIndex += 1
+                    sRows.append(row.rec.id)
+                } else if let sampled = prefillSampled[row.rec.id] {
+                    pieces.append(sampled)
+                    sRows.append(row.rec.id)
+                }
             }
+            sampledTokens =
+                pieces.isEmpty ? nil : (pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0))
+            sampledRows = sRows
         }
-        let sampledTokens: MLXArray? =
-            pieces.isEmpty ? nil : (pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0))
 
         var asyncEvalTargets = prefillEvalTargets
         if let sampledTokens { asyncEvalTargets.append(sampledTokens) }
@@ -318,4 +326,24 @@ extension EngineLoopV2 {
         if !unfenceable.isEmpty { eval(unfenceable) }
     }
 
+}
+
+private final class MTPDecodeCacheMemoizer: @unchecked Sendable {
+    nonisolated(unsafe) static var cachedRowIDs: [CBv2RequestID] = []
+    nonisolated(unsafe) static var cachedCaches: [CBv2AttendingLayerCache] = []
+
+    @inline(__always)
+    static func getCaches(
+        for decodeRows: [CBv2MTPRowWork],
+        loop: EngineLoopV2
+    ) -> [CBv2AttendingLayerCache] {
+        let rowIDs = decodeRows.map(\.rec.id)
+        if rowIDs == cachedRowIDs, !cachedCaches.isEmpty {
+            return cachedCaches
+        }
+        let freshCaches = loop.eagerCaches(rowStates: decodeRows.map { loop.kvStates[$0.rec.id]! })
+        cachedRowIDs = rowIDs
+        cachedCaches = freshCaches
+        return freshCaches
+    }
 }

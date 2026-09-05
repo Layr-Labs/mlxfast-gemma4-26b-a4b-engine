@@ -1157,7 +1157,7 @@ public func gatherSort(
         )
     }
     let m = indices.dim(-1)
-    let indices = indices.flattened()
+    let indices = indices.ndim == 1 ? indices : indices.flattened()
     routeCsortShapeLog.note {
         "gatherSort n=\(indices.size) m=\(m) E=\(numExperts) "
             + "dtype=\(indices.dtype)"
@@ -1190,7 +1190,7 @@ public func gatherSortOrder(
     indices: MLXArray, numExperts: Int = Int.max
 ) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray) {
     let m = indices.dim(-1)
-    let indices = indices.flattened()
+    let indices = indices.ndim == 1 ? indices : indices.flattened()
     routeCsortShapeLog.note {
         "gatherSortOrder n=\(indices.size) m=\(m) E=\(numExperts) "
             + "dtype=\(indices.dtype)"
@@ -1238,7 +1238,7 @@ public func gatherSortIndices(
         return (outputs[0], outputs[1], outputs[2])
     }
     let m = indices.dim(-1)
-    let indices = indices.flattened()
+    let indices = indices.ndim == 1 ? indices : indices.flattened()
     routeCsortShapeLog.note {
         "gatherSortIndices n=\(indices.size) m=\(m) E=\(numExperts) "
             + "dtype=\(indices.dtype)"

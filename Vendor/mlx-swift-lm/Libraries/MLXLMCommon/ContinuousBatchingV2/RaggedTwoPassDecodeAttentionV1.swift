@@ -2685,6 +2685,177 @@ for (int element = 0; element < values_per_lane; ++element) {
         return (lines.joined(separator: "\n"), min(applied, scoreApplied))
     }
 
+    /// SLIDE-NIBH-001 (engage mark `sliding-nibble-half`). Default ON, active
+    /// only inside SLIDE-SOFTREF mode 2 with SLIDE-AFFFOLD. Bit-identical.
+    static let slidingNibbleHalfMode: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_SLIDE_NIBH"]?
+            .trimmingCharacters(in: .whitespaces).lowercased()
+        else { return 5 }
+        if ["0", "false", "no", "off"].contains(raw) { return 0 }
+        if let value = Int(raw), value >= 0, value <= 5 { return value }
+        return 5
+    }()
+
+    private static var slidingNibbleHalfActive: Bool {
+        slidingAffineFoldActive && slidingNibbleHalfMode != 0
+    }
+
+    /// Whether the mode carries the 2^24 scale on `q` and the accumulators.
+    private static var slidingNibbleHalfScaled: Bool {
+        slidingNibbleHalfActive
+            && (slidingNibbleHalfMode <= 2 || slidingNibbleHalfMode == 5)
+    }
+
+    /// Mode 5 keeps odd elements four bits up, at `2^-20`.
+    private static var slidingNibbleHalfMixedScale: Bool {
+        slidingNibbleHalfActive && slidingNibbleHalfMode == 5
+    }
+
+    private static let slidingNibbleHalfKeyLine =
+        "const float key_code = float((kw >> (4 * element)) & 0xfu);"
+    private static let slidingNibbleHalfValueLine =
+        "const float value_code = float((vw >> (4 * element)) & 0xfu);"
+
+    private static func slidingNibbleHalfLines(
+        word: String, name: String
+    ) -> [String] {
+        switch slidingNibbleHalfMode {
+        case 5:
+            return [
+                "const int nib = element & 3;",
+                "const uint32_t \(word)s = (nib < 2) ? \(word) : (\(word) >> 8);",
+                "const uint32_t \(word)n =",
+                "    \(word)s & ((nib & 1) ? 0x00f000f0u : 0x000f000fu);",
+                "const half2 \(word)h = as_type<half2>(\(word)n);",
+                "const float \(name) = float((element < 4) ? \(word)h.x : \(word)h.y);",
+            ]
+        case 1:
+            return [
+                "const int nib = element & 3;",
+                "const uint32_t \(word)n = (nib == 0) ? (\(word) & 0x000f000fu)",
+                "    : ((\(word) >> (4 * nib)) & 0x000f000fu);",
+                "const half2 \(word)h = as_type<half2>(\(word)n);",
+                "const float \(name) = float((element < 4) ? \(word)h.x : \(word)h.y);",
+            ]
+        case 2:
+            return [
+                "const half \(word)h =",
+                "    as_type<half>(ushort((\(word) >> (4 * element)) & 0xfu));",
+                "const float \(name) = float(\(word)h);",
+            ]
+        case 3:
+            return [
+                "const float \(name) = float(as_type<half>(",
+                "    ushort(0x6400u | ((\(word) >> (4 * element)) & 0xfu))) - 1024.0h);",
+            ]
+        default:
+            return [
+                "const float \(name) = float(as_type<half>(",
+                "    ushort(0x6400u | ((\(word) >> (4 * element)) & 0xfu))));",
+            ]
+        }
+    }
+
+    /// Line-exact surgery on the SLIDE-AFFFOLD walk: each unpack line is
+    /// replaced at its own indent; the count of replaced lines is returned
+    /// so a body that drifts fails closed onto the SLIDE-AFFFOLD walk.
+    private static func slidingNibbleHalfRewrite(_ walk: String) -> (String, Int) {
+        var lines: [String] = []
+        var applied = 0
+        for line in walk.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            let indent = String(line.prefix(while: { $0 == " " }))
+            if trimmed == slidingNibbleHalfKeyLine {
+                lines += slidingNibbleHalfLines(word: "kw", name: "key_code")
+                    .map { indent + $0 }
+                applied += 1
+            } else if trimmed == slidingNibbleHalfValueLine {
+                lines += slidingNibbleHalfLines(word: "vw", name: "value_code")
+                    .map { indent + $0 }
+                applied += 1
+            } else if slidingNibbleHalfMode == 4,
+                trimmed == "score_lo = fma(ks, score_lo, kb * qsum_lo);"
+            {
+                lines.append(indent
+                    + "score_lo = fma(ks, score_lo, (kb - 1024.0f * ks) * qsum_lo);")
+            } else if slidingNibbleHalfMode == 4,
+                trimmed == "score_hi = fma(ks, score_hi, kb * qsum_hi);"
+            {
+                lines.append(indent
+                    + "score_hi = fma(ks, score_hi, (kb - 1024.0f * ks) * qsum_hi);")
+            } else if slidingNibbleHalfMode == 4,
+                trimmed == "vbias_lo = fma(weight_lo, vb, vbias_lo);"
+            {
+                lines.append(indent
+                    + "vbias_lo = fma(weight_lo, vb - 1024.0f * vs, vbias_lo);")
+            } else if slidingNibbleHalfMode == 4,
+                trimmed == "vbias_hi = fma(weight_hi, vb, vbias_hi);"
+            {
+                lines.append(indent
+                    + "vbias_hi = fma(weight_hi, vb - 1024.0f * vs, vbias_hi);")
+            } else {
+                lines.append(line)
+            }
+        }
+        return (lines.joined(separator: "\n"), applied)
+    }
+
+    /// The prologue fold: scale the query registers once the reference and
+    /// `qsum` have been formed from the unscaled values. Interpolated on the
+    /// SLIDE-AFFFOLD prologue's line, so the kill switch leaves no trace.
+    private static var slidingNibbleHalfPrologue: String {
+        guard slidingNibbleHalfScaled else { return "" }
+        let scale = slidingNibbleHalfMixedScale
+            ? "((element & 1) ? 1048576.0f : 16777216.0f)" : "16777216.0f"
+        return """
+
+                #pragma clang loop unroll(full)
+                for (int element = 0; element < values_per_lane; ++element) {
+                    q_lo[element] *= \(scale);
+                    q_hi[element] *= \(scale);
+                }
+        """
+    }
+
+    private static var slidingNibbleHalfAccScale: String {
+        slidingNibbleHalfMixedScale
+            ? " * ((j & 1) ? 1048576.0f : 16777216.0f)" : " * 16777216.0f"
+    }
+
+    private static var slidingWalkAccLo: String {
+        slidingNibbleHalfScaled
+            ? slidingNibbleHalfAccScale + " + vbias_lo" : slidingAffineFoldAccLo
+    }
+
+    private static var slidingWalkAccHi: String {
+        slidingNibbleHalfScaled
+            ? slidingNibbleHalfAccScale + " + vbias_hi" : slidingAffineFoldAccHi
+    }
+
+    /// The walk bodies after SLIDE-NIBH. `applied` is true only when every
+    /// SLIDE-AFFFOLD unpack line (two per walk body, four in the peeled walk)
+    /// was substituted.
+    private static let slidingNibbleHalfWalks:
+        (depth1: String, depth2: String, peeled: String, applied: Bool) = {
+        let base = slidingSoftRefWalks
+        guard base.applied, slidingNibbleHalfActive else {
+            return (base.depth1, base.depth2, base.peeled, false)
+        }
+        let one = slidingNibbleHalfRewrite(base.depth1)
+        let two = slidingNibbleHalfRewrite(base.depth2)
+        let peeled = slidingNibbleHalfRewrite(base.peeled)
+        guard one.1 == 2, two.1 == 2, peeled.1 == 4 else {
+            return (base.depth1, base.depth2, base.peeled, false)
+        }
+        return (one.0, two.0, peeled.0, true)
+    }()
+
+    private static let slidingNibbleHalfKey: String = {
+        guard slidingNibbleHalfWalks.applied else { return "" }
+        return "_nh\(slidingNibbleHalfMode)"
+    }()
+
     /// The three resident walk bodies after SLIDE-SOFTREF. `applied` is true
     /// only when all four promoted blocks (one in each of the depth-one and
     /// depth-two walks, two in the peeled walk) were substituted; otherwise
@@ -3061,9 +3232,9 @@ for (int element = 0; element < values_per_lane; ++element) {
 
 
     private static var residentSlidingWalk: String {
-        if !slidingPrefetchDepth2 { return slidingSoftRefWalks.depth1 }
+        if !slidingPrefetchDepth2 { return slidingNibbleHalfWalks.depth1 }
         return slidingPrefetchPeelEnabled
-            ? slidingSoftRefWalks.peeled : slidingSoftRefWalks.depth2
+            ? slidingNibbleHalfWalks.peeled : slidingNibbleHalfWalks.depth2
     }
 
     /// F4: exact decode Q/K/V normalization and sliding RoPE in the resident
@@ -3357,7 +3528,7 @@ for (int element = 0; element < values_per_lane; ++element) {
                 float sum_lo = 0.0f;
                 float sum_hi = 0.0f;
                 \(slidingSoftRefReferenceInit)
-                \(slidingAffineFoldPrologue)
+                \(slidingAffineFoldPrologue)\(slidingNibbleHalfPrologue)
                 \(residentSlidingWalk)
 
                 if (lane == 0) {
@@ -3375,8 +3546,8 @@ for (int element = 0; element < values_per_lane; ++element) {
                     T4 p4_lo, p4_hi;
                     #pragma clang loop unroll(full)
                     for (int j = 0; j < 4; ++j) {
-                        p4_lo[j] = T(acc_lo[q * 4 + j]\(slidingAffineFoldAccLo));
-                        p4_hi[j] = T(acc_hi[q * 4 + j]\(slidingAffineFoldAccHi));
+                        p4_lo[j] = T(acc_lo[q * 4 + j]\(slidingWalkAccLo));
+                        p4_hi[j] = T(acc_hi[q * 4 + j]\(slidingWalkAccHi));
                     }
                     partial_vec_lo[q] = p4_lo;
                     partial_vec_hi[q] = p4_hi;
@@ -3492,7 +3663,7 @@ for (int element = 0; element < values_per_lane; ++element) {
 
     private static let portQuantFusedWriteResidentNormRopeKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)\(slidingSoftRefKey)_ropefreq_v1",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)\(slidingSoftRefKey)\(slidingNibbleHalfKey)_ropefreq_v1",
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -3508,7 +3679,7 @@ for (int element = 0; element < values_per_lane; ++element) {
     /// fifth output, so the standalone prepass never runs on a sliding layer.
     private static let portQuantFusedWriteResidentNormRopeORunsumKernel:
         MLXFast.MLXFastKernel = MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)\(slidingSoftRefKey)_ropefreq_v1",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)\(slidingSoftRefKey)\(slidingNibbleHalfKey)_ropefreq_v1",
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -3733,6 +3904,9 @@ for (int element = 0; element < values_per_lane; ++element) {
                     CBv2EngageMark.once("sliding-softmax-ref")
                     if slidingAffineFoldActive {
                         CBv2EngageMark.once("sliding-affine-fold")
+                    }
+                    if slidingNibbleHalfWalks.applied {
+                        CBv2EngageMark.once("sliding-nibble-half")
                     }
                 }
                 return (resident[0], resident[1])

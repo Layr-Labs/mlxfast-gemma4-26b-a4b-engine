@@ -1309,6 +1309,17 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
 /// `0`/`false`/`no`/`off` leaves the split arrays as loaded and restores the
 /// two split gathers. Engage marks: `prefill-gateup-fuse` and
 /// `prefill-gateup-gelu-epilogue`.
+/// DECODE-GATEUP-MERGE. Selects the concatenated right-hand side on the small
+/// decode geometry. Default on; set to `0`/`false`/`no`/`off` it restores the
+/// incumbent path exactly, in the same executable, with the split planes and
+/// their existing behaviour unchanged. Engage mark: `decode-gateup-merge`.
+public let switchGateUpMergeDecodeEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DECODE_GATEUP_MERGE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 public let switchGateUpFusePrefillEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_PREFILL_GATEUP_FUSE"]
@@ -1326,6 +1337,15 @@ public final class SwitchGateUpFusedStorage {
     public let weight: MLXArray
     public let scales: MLXArray
     public let biases: MLXArray
+    /// DECODE-GATEUP-MERGE. The same frozen quantized bytes of the gate and up
+    /// planes, concatenated along the output axis in gate-then-up order with no
+    /// interleaving: the leading rows are the gate plane's rows in their loaded
+    /// order and the remainder are the up plane's, each row's codes, scale and
+    /// bias untouched. Distinct from the paired arrays above, whose block order
+    /// the prompt-side store epilogue requires and which a view cannot split.
+    public let concatWeight: MLXArray
+    public let concatScales: MLXArray
+    public let concatBiases: MLXArray
     public let gateWeight: MLXArray
     public let gateScales: MLXArray
     public let gateBiases: MLXArray
@@ -1365,6 +1385,9 @@ public final class SwitchGateUpFusedStorage {
         self.weight = paired16(gateWeight, upWeight, tail: 352)
         self.scales = paired16(gateScales, upScales, tail: 44)
         self.biases = paired16(gateBiases, upBiases, tail: 44)
+        self.concatWeight = MLX.concatenated([gateWeight, upWeight], axis: 1)
+        self.concatScales = MLX.concatenated([gateScales, upScales], axis: 1)
+        self.concatBiases = MLX.concatenated([gateBiases, upBiases], axis: 1)
         self.gateWeight = gateWeight
         self.gateScales = gateScales
         self.gateBiases = gateBiases
@@ -1677,6 +1700,33 @@ public class SwitchGLU: Module {
                 x = downProj(
                     activated, idx, lhsIndices: downLhs, sortedIndices: true)
                 return (x, inverseOrder, true)
+            } else if switchGateUpMergeDecodeEnabled,
+                doSort, useLhsIndices, let lhs = lhsIndices,
+                x.ndim == 3, x.dim(-2) == 1, x.dim(-1) == inputDims,
+                x.dtype == .bfloat16,
+                idx.ndim == 1, idx.size == 64,
+                let merged = fusedGateUpDispatch()
+            {
+                // DECODE-GATEUP-MERGE: the concatenated right-hand side in
+                // place of the split planes. The output columns are disjoint
+                // and each owns an independent K-chain, so the halves are
+                // plain views.
+                CBv2EngageMark.once("decode-gateup-merge")
+                let xGateUp = MLX.gatherQuantizedMM(
+                    x,
+                    merged.storage.concatWeight,
+                    scales: merged.storage.concatScales,
+                    biases: merged.storage.concatBiases,
+                    lhsIndices: lhs,
+                    rhsIndices: idx,
+                    transpose: true,
+                    groupSize: merged.groupSize,
+                    bits: merged.bits,
+                    mode: merged.mode,
+                    sortedIndices: doSort
+                )
+                xGate = xGateUp[.ellipsis, ..<hiddenDims]
+                xUp = xGateUp[.ellipsis, hiddenDims...]
             } else {
                 xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
                 xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)

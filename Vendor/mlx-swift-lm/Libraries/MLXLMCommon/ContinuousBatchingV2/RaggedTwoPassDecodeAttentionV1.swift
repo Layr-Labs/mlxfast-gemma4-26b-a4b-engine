@@ -42,6 +42,16 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Run sliding Q/K RoPE directly from each producer SIMD group's
+    /// BF16-rounded normalization registers. Off selects the staged incumbent
+    /// kernel with its first threadgroup barrier for same-binary A/B checks.
+    private static let q4ResidentDirectRopeEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_Q4_RESIDENT_DIRECT_ROPE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let ropeInverseFrequencyTableEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_ROPE_INV_FREQ_TABLE"]
@@ -3066,41 +3076,9 @@ for (int element = 0; element < values_per_lane; ++element) {
             ? slidingSoftRefWalks.peeled : slidingSoftRefWalks.depth2
     }
 
-    /// F4: exact decode Q/K/V normalization and sliding RoPE in the resident
-    /// attention prologue. SIMD groups 0...3 own Q0, Q1, K, V respectively, so
-    /// every raw element is normalized once; all eight resident attention groups
-    /// reuse the BF16-rounded threadgroup rows.
-    private static func residentNormRopeSource(withORunsum: Bool) -> String {
-        """
-                typedef vec<T, 4> T4;
-                constexpr int simd_width = 32;
-                constexpr int values_per_lane = D / simd_width;
-                constexpr int vectors_per_lane = values_per_lane / 4;
-                constexpr int payload_words = D / 8;
-                constexpr int row_words = payload_words + D / 64;
-                constexpr int current_block = (N - 1) % BLOCKS;
-                constexpr int COLS = BLOCKS;
-                constexpr int sets = simd_width / COLS;
-                constexpr int rounds = (BLOCKS + COLS - 1) / COLS;
-                static_assert(BLOCKS == 8, "resident kernel requires eight blocks");
-                static_assert(GQA == 2, "resident kernel requires GQA two");
-                static_assert(values_per_lane % 4 == 0, "lane run is four-wide");
-
-                const int kv_head = int(threadgroup_position_in_grid.x);
-                const int batch_index = int(threadgroup_position_in_grid.y);
-                const int block = int(simdgroup_index_in_threadgroup);
-                const int query_head = GQA * kv_head;
-                const int batch_head = batch_index * 16 + query_head;
-                const int lane = int(thread_index_in_simdgroup);
-
-                threadgroup T local_partials[GQA * BLOCKS * D];
-                threadgroup float local_sums[GQA * BLOCKS];
-                threadgroup float local_maxs[GQA * BLOCKS];
-                threadgroup T local_queries[GQA * D];
-                threadgroup T local_key[D];
-                threadgroup T local_value[D];
-                \(withORunsum ? "threadgroup float local_o_rs[GQA * BLOCKS];" : "")
-
+    /// The incumbent F4 normalization-to-RoPE handoff. Keep this source intact
+    /// behind the direct-RoPE switch so its JIT key remains a useful control.
+    private static let residentNormRopeStagedPrologue = """
                 // Transcribe gemma4_b8_qkv_rms_norm_rope_v2_vec1 one row per
                 // designated SIMD group. Each lane owns the same two four-value
                 // runs as the standalone kernel's two 32-lane SIMD groups.
@@ -3223,6 +3201,177 @@ for (int element = 0; element < values_per_lane; ++element) {
                     }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
+        """
+
+    /// Direct handoff: each of the Q0, Q1, and K producer SIMD groups applies
+    /// RoPE to its own BF16-rounded register values. No other SIMD group reads
+    /// those values until the retained barrier at the end of this prologue.
+    private static let residentNormRopeDirectPrologue = """
+                static_assert(D == 256, "direct RoPE requires D256 paired vectors");
+
+                // Transcribe gemma4_b8_qkv_rms_norm_rope_v2_vec1 one row per
+                // designated SIMD group. Each lane owns the same two four-value
+                // runs as the standalone kernel's two 32-lane SIMD groups.
+                if (block < GQA + 2) {
+                    const device T* raw_row = raw_queries;
+                    const device T* weight_row = q_weight;
+                    bool weighted = true;
+                    if (block < GQA) {
+                        raw_row += (batch_head + block) * D;
+                    } else if (block == GQA) {
+                        raw_row = raw_keys
+                            + (batch_index * KV_HEADS + kv_head) * D;
+                        weight_row = k_weight;
+                    } else {
+                        raw_row = raw_values
+                            + (batch_index * KV_HEADS + kv_head) * D;
+                        weighted = false;
+                    }
+
+                    const device T4* raw_vectors =
+                        reinterpret_cast<const device T4*>(raw_row);
+                    const device T4* weight_vectors =
+                        reinterpret_cast<const device T4*>(weight_row);
+                    const T4 vin_first = raw_vectors[lane];
+                    const T4 vin_second = raw_vectors[lane + simd_width];
+                    float sum_first = 0.0f;
+                    float sum_second = 0.0f;
+                    #pragma clang loop unroll(full)
+                    for (int i = 0; i < 4; ++i) {
+                        const float first = float(vin_first[i]);
+                        const float second = float(vin_second[i]);
+                        sum_first += first * first;
+                        sum_second += second * second;
+                    }
+                    sum_first = simd_sum(sum_first);
+                    sum_second = simd_sum(sum_second);
+
+                    // Same second 32-lane tree as partials[0], partials[1],
+                    // partials[2...31] = 0 in the standalone kernel.
+                    float sum = lane == 0 ? sum_first
+                        : (lane == 1 ? sum_second : 0.0f);
+                    sum = simd_sum(sum);
+                    float inverse_rms = 0.0f;
+                    if (lane == 0) {
+                        inverse_rms = metal::precise::rsqrt(
+                            sum / float(D) + 1.0e-6f);
+                    }
+                    inverse_rms = simd_shuffle(inverse_rms, ushort(0));
+
+                    const T4 weight_first = weight_vectors[lane];
+                    const T4 weight_second = weight_vectors[lane + simd_width];
+                    T4 rounded_first;
+                    T4 rounded_second;
+                    #pragma clang loop unroll(full)
+                    for (int i = 0; i < 4; ++i) {
+                        const T normalized_first =
+                            T(float(vin_first[i]) * inverse_rms);
+                        const T normalized_second =
+                            T(float(vin_second[i]) * inverse_rms);
+                        rounded_first[i] = weighted
+                            ? T(weight_first[i] * normalized_first)
+                            : T(1) * normalized_first;
+                        rounded_second[i] = weighted
+                            ? T(weight_second[i] * normalized_second)
+                            : T(1) * normalized_second;
+                    }
+
+                    if (block < GQA + 1) {
+                        const float L = static_cast<float>(
+                            position_offsets[batch_index]);
+                        #pragma clang loop unroll(full)
+                        for (int i = 0; i < 4; ++i) {
+                            const int pair = lane * 4 + i;
+                            const float d = static_cast<float>(pair)
+                                / static_cast<float>(D / 2);
+                            const float inv_freq = ROPE_INV_FREQS
+                                ? rope_parameters[pair]
+                                : metal::exp2(-d * rope_parameters[0]);
+                            const float theta = L * inv_freq;
+                            const float costheta = metal::fast::cos(theta);
+                            const float sintheta = metal::fast::sin(theta);
+                            const float x1 = static_cast<float>(rounded_first[i]);
+                            const float x2 = static_cast<float>(rounded_second[i]);
+                            const T rx1 = static_cast<T>(
+                                x1 * costheta - x2 * sintheta);
+                            const T rx2 = static_cast<T>(
+                                x1 * sintheta + x2 * costheta);
+                            rounded_first[i] = rx1;
+                            rounded_second[i] = rx2;
+                        }
+                    }
+
+                    threadgroup T* normalized_row = local_value;
+                    if (block < GQA) {
+                        normalized_row = local_queries + block * D;
+                    } else if (block == GQA) {
+                        normalized_row = local_key;
+                    }
+                    threadgroup T4* normalized_vectors =
+                        reinterpret_cast<threadgroup T4*>(normalized_row);
+                    normalized_vectors[lane] = rounded_first;
+                    normalized_vectors[lane + simd_width] = rounded_second;
+
+                    if (block == GQA) {
+                        device T4* key_output_vectors =
+                            reinterpret_cast<device T4*>(
+                                k_out + (batch_index * KV_HEADS + kv_head) * D);
+                        key_output_vectors[lane] = rounded_first;
+                        key_output_vectors[lane + simd_width] = rounded_second;
+                    } else if (block == GQA + 1) {
+                        device T4* value_output_vectors =
+                            reinterpret_cast<device T4*>(
+                                v_out + (batch_index * KV_HEADS + kv_head) * D);
+                        value_output_vectors[lane] = rounded_first;
+                        value_output_vectors[lane + simd_width] = rounded_second;
+                    }
+                }
+
+                // All eight attention SIMD groups consume the three Q/K/V
+                // threadgroup rows below, so this producer/consumer barrier stays.
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+        """
+
+    /// F4: exact decode Q/K/V normalization and sliding RoPE in the resident
+    /// attention prologue. SIMD groups 0...3 own Q0, Q1, K, V respectively, so
+    /// every raw element is normalized once; all eight resident attention groups
+    /// reuse the BF16-rounded threadgroup rows.
+    private static func residentNormRopeSource(
+        withORunsum: Bool, directRope: Bool
+    ) -> String {
+        let normRopePrologue = directRope
+            ? residentNormRopeDirectPrologue : residentNormRopeStagedPrologue
+        return """
+                typedef vec<T, 4> T4;
+                constexpr int simd_width = 32;
+                constexpr int values_per_lane = D / simd_width;
+                constexpr int vectors_per_lane = values_per_lane / 4;
+                constexpr int payload_words = D / 8;
+                constexpr int row_words = payload_words + D / 64;
+                constexpr int current_block = (N - 1) % BLOCKS;
+                constexpr int COLS = BLOCKS;
+                constexpr int sets = simd_width / COLS;
+                constexpr int rounds = (BLOCKS + COLS - 1) / COLS;
+                static_assert(BLOCKS == 8, "resident kernel requires eight blocks");
+                static_assert(GQA == 2, "resident kernel requires GQA two");
+                static_assert(values_per_lane % 4 == 0, "lane run is four-wide");
+
+                const int kv_head = int(threadgroup_position_in_grid.x);
+                const int batch_index = int(threadgroup_position_in_grid.y);
+                const int block = int(simdgroup_index_in_threadgroup);
+                const int query_head = GQA * kv_head;
+                const int batch_head = batch_index * 16 + query_head;
+                const int lane = int(thread_index_in_simdgroup);
+
+                threadgroup T local_partials[GQA * BLOCKS * D];
+                threadgroup float local_sums[GQA * BLOCKS];
+                threadgroup float local_maxs[GQA * BLOCKS];
+                threadgroup T local_queries[GQA * D];
+                threadgroup T local_key[D];
+                threadgroup T local_value[D];
+                \(withORunsum ? "threadgroup float local_o_rs[GQA * BLOCKS];" : "")
+
+                \(normRopePrologue)
 
                 const device uint32_t* mirror_w = m0;
                 switch (batch_index) {
@@ -3500,7 +3649,7 @@ for (int element = 0; element < values_per_lane; ++element) {
                 "position_offsets", "rope_parameters", "write_fence",
             ],
             outputNames: ["out", "fence", "k_out", "v_out"],
-            source: residentNormRopeSource(withORunsum: false),
+            source: residentNormRopeSource(withORunsum: false, directRope: false),
             ensureRowContiguous: true
         )
 
@@ -3516,7 +3665,38 @@ for (int element = 0; element < values_per_lane; ++element) {
                 "position_offsets", "rope_parameters", "write_fence",
             ],
             outputNames: ["out", "fence", "k_out", "v_out", "o_rs"],
-            source: residentNormRopeSource(withORunsum: true),
+            source: residentNormRopeSource(withORunsum: true, directRope: false),
+            ensureRowContiguous: true
+        )
+
+    /// Direct norm-to-RoPE candidates have distinct JIT names from both staged
+    /// incumbents. This prevents an A/B environment toggle from reusing the
+    /// other source through MLX's process-wide Metal kernel cache.
+    private static let portQuantFusedWriteResidentNormRopeDirectKernel:
+        MLXFast.MLXFastKernel = MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_directrope_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)\(slidingSoftRefKey)_ropefreq_v1",
+            inputNames: [
+                "raw_queries",
+                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+                "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
+                "position_offsets", "rope_parameters", "write_fence",
+            ],
+            outputNames: ["out", "fence", "k_out", "v_out"],
+            source: residentNormRopeSource(withORunsum: false, directRope: true),
+            ensureRowContiguous: true
+        )
+
+    private static let portQuantFusedWriteResidentNormRopeDirectORunsumKernel:
+        MLXFast.MLXFastKernel = MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_directrope_ors_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)\(slidingSoftRefKey)_ropefreq_v1",
+            inputNames: [
+                "raw_queries",
+                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+                "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
+                "position_offsets", "rope_parameters", "write_fence",
+            ],
+            outputNames: ["out", "fence", "k_out", "v_out", "o_rs"],
+            source: residentNormRopeSource(withORunsum: true, directRope: true),
             ensureRowContiguous: true
         )
 
@@ -3695,7 +3875,10 @@ for (int element = 0; element < values_per_lane; ++element) {
                 let resident: [MLXArray]
                 let oRunsum: MLXArray?
                 if oRunsumFoldEnabled {
-                    resident = portQuantFusedWriteResidentNormRopeORunsumKernel(
+                    let kernel = q4ResidentDirectRopeEnabled
+                        ? portQuantFusedWriteResidentNormRopeDirectORunsumKernel
+                        : portQuantFusedWriteResidentNormRopeORunsumKernel
+                    resident = kernel(
                         residentInputs,
                         template: residentTemplate,
                         grid: (kvHeads * blocks * 32, batch, 1),
@@ -3707,7 +3890,10 @@ for (int element = 0; element < values_per_lane; ++element) {
                     oRunsum = resident[4]
                     CBv2EngageMark.once("o-runsum-resident-fold")
                 } else {
-                    resident = portQuantFusedWriteResidentNormRopeKernel(
+                    let kernel = q4ResidentDirectRopeEnabled
+                        ? portQuantFusedWriteResidentNormRopeDirectKernel
+                        : portQuantFusedWriteResidentNormRopeKernel
+                    resident = kernel(
                         residentInputs,
                         template: residentTemplate,
                         grid: (kvHeads * blocks * 32, batch, 1),
@@ -3726,6 +3912,9 @@ for (int element = 0; element < values_per_lane; ++element) {
                 CBv2EngageMark.once("kvq4-fused-live-write")
                 CBv2EngageMark.once("kvq4-resident-merge")
                 CBv2EngageMark.once("kvq4-resident-norm-rope")
+                if q4ResidentDirectRopeEnabled {
+                    CBv2EngageMark.once("kvq4-resident-direct-rope")
+                }
                 if slidingPrefetchDepth2 && slidingPrefetchPeelEnabled {
                     CBv2EngageMark.once("sliding-prefetch-pf2-tail-peel")
                 }

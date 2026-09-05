@@ -197,7 +197,7 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
 
     public func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
         let identity = rowStates.map { row -> ObjectIdentifier in
-            guard let anchor = row.compactMap({ $0 }).first else {
+            guard let anchor = row.lazy.compactMap({ $0 }).first else {
                 preconditionFailure("CBv2LayerCacheBank: row owns no storage at any layer")
             }
             return ObjectIdentifier(anchor)

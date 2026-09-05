@@ -447,6 +447,86 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
     private static let mma8Rsp2Carry2Header = applyOprojCarry2(
         to: mma8Rsp2KernelHeader, occurrences: 2)
 
+    /// Default-on scheduling-only transformation for the run-sum kernels.
+    /// UR4 changes only the loop unroll directive. PEEL4 removes clamping
+    /// from the steady prefix while retaining the identical last four groups.
+    public static let unroll4Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_OPROJ_UNROLL4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let unroll4KeySuffix = unroll4Enabled ? "_ur4_58ef" : ""
+
+    public static let tailPeel4Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_OPROJ_PEEL4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let tailPeel4Active =
+        tailPeel4Enabled && unroll4Enabled && oprojCarry2Enabled
+    private static let tailPeel4KeySuffix = tailPeel4Active ? "_peel4_v1" : ""
+
+    private static func applyOprojUr4(to header: String, occurrences: Int) -> String {
+        let old = "#pragma unroll\n  for (int gi = 0; gi < nGroups; ++gi) {\n    const int g = g0 + gi;\n    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));"
+        let new = "#pragma clang loop unroll_count(4)" + old.dropFirst("#pragma unroll".count)
+        precondition(
+            header.components(separatedBy: old).count == occurrences + 1,
+            "ur4 anchor drift")
+        return header.replacingOccurrences(of: old, with: new)
+    }
+
+    private static func applyOprojCarryPeel4(to header: String, occurrences: Int) -> String {
+        let opening = "#pragma clang loop unroll_count(4)\n  for (int gi = 0; gi < nGroups; ++gi) {"
+        let closing = "    acc1 += s * C.thread_elements()[1] + rs.y * b;\n  }"
+        let next = "g0 + min(gi + 1, nGroups - 1)"
+        let next2 = "g0 + min(gi + 2, nGroups - 1)"
+        var remaining = header[...]
+        var result = ""
+        var count = 0
+        while let start = remaining.range(of: opening) {
+            result += remaining[..<start.lowerBound]
+            let suffix = remaining[start.upperBound...]
+            guard let end = suffix.range(of: closing) else {
+                preconditionFailure("peel closing anchor missing")
+            }
+            let body = String(suffix[..<end.upperBound])
+            precondition(body.components(separatedBy: next).count == 2)
+            precondition(body.components(separatedBy: next2).count == 2)
+            let steadyBody = body
+                .replacingOccurrences(of: next, with: "g0 + gi + 1")
+                .replacingOccurrences(of: next2, with: "g0 + gi + 2")
+            result += "#pragma clang loop unroll_count(4)\n  for (int gi = 0; gi < nGroups - 4; ++gi) {"
+            result += steadyBody
+            result += "\n#pragma unroll\n  for (int gi = nGroups - 4; gi < nGroups; ++gi) {"
+            result += body
+            remaining = suffix[end.upperBound...]
+            count += 1
+        }
+        result += remaining
+        precondition(count == occurrences, "peel function count mismatch")
+        return result
+    }
+
+    private static let mma8RspHeader: String = {
+        let base = oprojCarry2Enabled ? mma8Carry2Header : mma8KernelHeader
+        let scheduled = unroll4Enabled ? applyOprojUr4(to: base, occurrences: 1) : base
+        return tailPeel4Active
+            ? applyOprojCarryPeel4(to: scheduled, occurrences: 1)
+            : scheduled
+    }()
+
+    private static let mma8Rsp2Header: String = {
+        let base = oprojCarry2Enabled ? mma8Rsp2Carry2Header : mma8Rsp2KernelHeader
+        let scheduled = unroll4Enabled ? applyOprojUr4(to: base, occurrences: 2) : base
+        return tailPeel4Active
+            ? applyOprojCarryPeel4(to: scheduled, occurrences: 2)
+            : scheduled
+    }()
+
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_bfill_v4",
@@ -602,7 +682,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
 
     private static let mma8RspKernelK4096 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_rsp_v1"
-            + carry2KeySuffix,
+            + carry2KeySuffix + unroll4KeySuffix + tailPeel4KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -615,12 +695,12 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: oprojCarry2Enabled ? mma8Carry2Header : mma8KernelHeader,
+        header: mma8RspHeader,
         ensureRowContiguous: true)
 
     private static let mma8RspKernelK8192 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp_v1"
-            + carry2KeySuffix,
+            + carry2KeySuffix + unroll4KeySuffix + tailPeel4KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -633,7 +713,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: oprojCarry2Enabled ? mma8Carry2Header : mma8KernelHeader,
+        header: mma8RspHeader,
         ensureRowContiguous: true)
 
     /// ORS-D512: the `_rsp` body with the run sums read as PAIRS of
@@ -735,7 +815,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
 
     private static let mma8Rsp2KernelK8192 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp2_v1"
-            + carry2KeySuffix,
+            + carry2KeySuffix + unroll4KeySuffix + tailPeel4KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_pairs"],
         outputNames: ["y"],
         source: """
@@ -748,7 +828,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: oprojCarry2Enabled ? mma8Rsp2Carry2Header : mma8Rsp2KernelHeader,
+        header: mma8Rsp2Header,
         ensureRowContiguous: true)
 
     @inline(__always)
@@ -811,6 +891,9 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
                 if oprojCarry2Enabled {
                     CBv2EngageMark.once("oproj-carry2")
                 }
+                if unroll4Enabled {
+                    CBv2EngageMark.once("oproj-ur4")
+                }
                 CBv2EngageMark.once("d512-ors-oproj-pairs")
                 return mma8Rsp2KernelK8192(
                     [x, weight, scales, biases, rsPairTable!],
@@ -824,6 +907,9 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
             if tableReady {
                 if oprojCarry2Enabled {
                     CBv2EngageMark.once("oproj-carry2")
+                }
+                if unroll4Enabled {
+                    CBv2EngageMark.once("oproj-ur4")
                 }
                 let kernel = inDim == 8192 ? mma8RspKernelK8192 : mma8RspKernelK4096
                 return kernel(

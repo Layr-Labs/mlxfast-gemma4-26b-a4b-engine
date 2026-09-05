@@ -3218,7 +3218,28 @@ private enum Gemma4RouterFinalistsV1 {
             }
         """,
         header: """
+            constant constexpr bool gemma4_route_order_keys = \(orderKeysEnabled ? "true" : "false");
+
+            inline uint gemma4_finalists_pack(bfloat16_t value, uint expert) {
+                const uint bits = uint(bfloat16_to_uint16(value));
+                if (!gemma4_route_order_keys) return (bits << 7) | expert;
+                // Use the native equality operation here: under Metal's flush-
+                // to-zero mode, BF16 subnormals must tie with signed zero too.
+                const uint ordinal = metal::isnan(value) ? 0xffffu
+                    : (value == bfloat16_t(0.0f) ? 0x8000u
+                       : ((bits & 0x8000u) ? ((~bits) & 0xffffu) : (bits ^ 0x8000u)));
+                return (ordinal << 7) | expert;
+            }
+
+            inline bfloat16_t gemma4_finalists_value(
+                uint item, const device bfloat16_t* row_scores)
+            {
+                return gemma4_route_order_keys ? row_scores[item & 127u]
+                    : uint16_to_bfloat16(uint16_t(item >> 7));
+            }
+
             inline bool gemma4_finalists_before(uint a, uint b) {
+                if (gemma4_route_order_keys) return a < b;
                 const bfloat16_t av = uint16_to_bfloat16(uint16_t(a >> 7));
                 const bfloat16_t bv = uint16_to_bfloat16(uint16_t(b >> 7));
                 const bool an = metal::isnan(av);
@@ -3589,6 +3610,15 @@ private enum Gemma4RouteGlueFoldV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    // Encode the comparator's ordering once per score, rather than converting
+    // the same BF16 payload at every stage of the two sorting networks.
+    private static let orderKeysEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTE_ORDER_KEYS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     struct Fold {
         let indices: MLXArray
         let weights: MLXArray
@@ -3596,7 +3626,9 @@ private enum Gemma4RouteGlueFoldV1 {
     }
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_route_monolithic_top8_e128_k8_bf16_v2",
+        name: orderKeysEnabled
+            ? "gemma4_route_monolithic_top8_e128_k8_bf16_orderkey_v1"
+            : "gemma4_route_monolithic_top8_e128_k8_bf16_v2",
         inputNames: ["scores", "pes"],
         outputNames: ["indices", "weights", "row_order", "sorted_keys", "inverse_order"],
         source: """
@@ -3606,12 +3638,10 @@ private enum Gemma4RouteGlueFoldV1 {
             const uint sg = simdgroup_index_in_threadgroup;
             const uint group = sg % 4u;
             const uint expert = group * 32u + lane;
-            // Phase 1 -- the incumbent finalists32 selection, verbatim, with
-            // the per-row threadgroup slices offset by `row`. Pack the
-            // unchanged BF16 bits and the original expert index; comparisons
-            // retain native BF16 LessThan semantics.
-            uint item = (uint(bfloat16_to_uint16(scores[row * 128u + expert])) << 7)
-                | expert;
+            // Preserve the native comparator's ordering, including its zero
+            // comparison semantics, and retain expert ID as the stable tie key.
+            // Only the sorting payload changes; weights read the original score.
+            uint item = gemma4_finalists_pack(scores[row * 128u + expert], expert);
             threadgroup uint finalists[256];
             threadgroup uint sel[64];
 
@@ -3648,7 +3678,7 @@ private enum Gemma4RouteGlueFoldV1 {
                     }
                 }
 
-                float score = (lane >= 24u) ? float(uint16_to_bfloat16(uint16_t(item >> 7))) : -1e38f;
+                float score = (lane >= 24u) ? float(gemma4_finalists_value(item, scores + row * 128u)) : -1e38f;
                 float max_score = score;
                 max_score = metal::max(max_score, simd_shuffle_xor(max_score, 4));
                 max_score = metal::max(max_score, simd_shuffle_xor(max_score, 2));
@@ -3731,6 +3761,7 @@ private enum Gemma4RouteGlueFoldV1 {
             perExpertScale.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-fold")
+        if orderKeysEnabled { CBv2EngageMark.once("route-order-keys") }
         let outs = kernel(
             [scores, perExpertScale],
             grid: (1024, 1, 1),
@@ -6767,7 +6798,7 @@ public class Gemma4TextModelInner: Module {
             let outputTailRows: Int? =
                 isFinalPromptLayer && gemma4PrefillTailRows > 0
                 ? min(gemma4PrefillTailRows, h.dim(1)) : nil
-            let useLastQueryPrefill = gemma4UseLastQueryPrefill(
+            let useLastQueryPrefill = outputTailRows == 1 && gemma4UseLastQueryPrefill(
                 config,
                 layerIdx: idx,
                 batchSize: h.dim(0),

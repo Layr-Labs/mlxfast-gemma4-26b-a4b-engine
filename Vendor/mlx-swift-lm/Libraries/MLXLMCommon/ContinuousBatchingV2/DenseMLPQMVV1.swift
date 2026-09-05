@@ -137,6 +137,15 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Apply the down-plane's packed-weight read-ahead pattern to the
+    /// independent gate/up static-K body without moving its affine close.
+    private static let mma8GateUpCarry2Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_GATEUP_CARRY2"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// W4-LOAD (engage mark `mlp-w4-load`). The four packed affine-8 codes a
     /// lane owns for one output row are four CONTIGUOUS bytes at a 4-byte
     /// aligned address, so they can be fetched as ONE aligned 32-bit load
@@ -886,11 +895,44 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
               for (int gi = 0; gi < nGroups; ++gi) {
                 const int g = g0 + gi;
             """)
+        if mma8GateUpCarry2Enabled {
+            replaceOnce(
+                """
+                  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+                """,
+                with: """
+                  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+                  uint4 wv_next = *((const device uint4*)(wrow + 64 * g0));
+                  uint4 wv_next2 = *((const device uint4*)(
+                      wrow + 64 * (g0 + min(1, nGroups - 1))));
+                  T s_next = srow[g0];
+                  T b_next = brow[g0];
+                """)
+            replaceOnce(
+                """
+                    const uint4 wv = *((const device uint4*)(wrow + 64 * g));
+                    const float s = float(srow[g]);
+                    const float b = float(brow[g]);
+                """,
+                with: """
+                    const uint4 wv = wv_next;
+                    const float s = float(s_next);
+                    const float b = float(b_next);
+                    const int g_next = g0 + min(gi + 1, nGroups - 1);
+                    const int g_next2 = g0 + min(gi + 2, nGroups - 1);
+                    wv_next = wv_next2;
+                    wv_next2 = *((const device uint4*)(wrow + 64 * g_next2));
+                    s_next = srow[g_next];
+                    b_next = brow[g_next];
+                """)
+        }
         return result
     }()
 
     private static let mma8GateUpStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_k2816_u2_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_k2816_u2_v1"
+            + (mma8GateUpCarry2Enabled ? "_carry2" : ""),
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

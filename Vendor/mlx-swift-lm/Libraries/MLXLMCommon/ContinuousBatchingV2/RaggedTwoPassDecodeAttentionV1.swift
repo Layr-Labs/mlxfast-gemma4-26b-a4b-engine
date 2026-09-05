@@ -13,6 +13,10 @@ import Foundation
 import MLX
 import MLXFast
 
+/// Control redraw of crown 5816e36: never called, dead code only so the tree differs from the crown
+/// by a real source change and the benchmarker takes a fresh timing sample. No behaviour change.
+@inline(never) private func raggedTwoPassDecodeAttentionRedrawControlMarker() -> Int { 0 }
+
 public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[

@@ -4237,7 +4237,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// orders the standalone K/V store before this dispatch without touching
     /// the unrolled inner loop (the addressing perturbation WRITE-021/v2
     /// paid ~-1.34% decode for).
-    private static let qkSource: String = """
+    private static let qkSourcePromoted: String = """
             constexpr int D = 512;
             constexpr int GQA = 8;
 
@@ -4399,39 +4399,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             }
         """
 
-    private static let qkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_xfold_v3_vec1",
-        inputNames: [
-            "queries",
-            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
-            "params",
-        ],
-        outputNames: ["scores"],
-        source: qkSource,
-        ensureRowContiguous: true
-    )
-
-    private static let qkFencedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_xfold_v3_vec1",
-        inputNames: [
-            "queries",
-            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
-            "params", "store_fence",
-        ],
-        outputNames: ["scores"],
-        source: qkSource,
-        ensureRowContiguous: true
-    )
-
-    /// Dispatch 2 — softmax. A verbatim transcription of
-    /// `softmax_single_row` (block_softmax_precise, AccT=float, N_READS=4)
-    /// over the 128 score rows; the CALLER sizes the threadgroup exactly
-    /// like softmax.cpp:64-68 (32·ceil(ceil(kL/4)/32)). params[0] = kL.
-    private static let softmaxKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1",
-        inputNames: ["scores", "params"],
-        outputNames: ["probs"],
-        source: """
+    private static let softmaxSourcePromoted: String = """
             const int axis_size = int(params[0]);
             const int gid = int(threadgroup_position_in_grid.x);
             const int lid = int(thread_position_in_threadgroup.x);
@@ -4511,53 +4479,9 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     }
                 }
             }
-        """,
-        ensureRowContiguous: true
-    )
+        """
 
-    /// CUT-13: alignment-gated vec4 twins of dispatch 2 and dispatch 3.
-    ///
-    /// The probability-row stride is `key_length`, which is not always a
-    /// multiple of four, so the softmax load/store loops and the AV
-    /// `p_coeff` loops above issue four scalar transactions per row chunk.
-    /// Each `_sv1` twin computes one threadgroup-uniform branch
-    /// `(axis_size & 3) == 0` (softmax) / `(key_length & 3) == 0` (AV) at
-    /// the top of the kernel. When the row is 4-aligned:
-    ///
-    /// - softmax: `gid * axis_size` and `lid * 4` are multiples of four
-    ///   elements, so each guarded chunk (`lid * 4 + 4 <= axis_size`) starts
-    ///   on an 8-byte boundary for bf16 and covers exactly the four elements
-    ///   the scalar run touches. Threads outside that guard — the whole
-    ///   masked tail threadgroup included — keep the scalar path, so no
-    ///   transaction is issued past the row end.
-    /// - AV: `prob_rows` is offset by `(row * 16 + kv_head * GQA) *
-    ///   key_length`, each head row by `h * key_length`, and `bm = 32 * i +
-    ///   4 * thrM`; all three terms are multiples of four elements when
-    ///   `key_length % 4 == 0`, and `bm + 4 <= 32 * n_iter <= key_length`
-    ///   keeps every vec4 inside the row. The leftover tail stays scalar.
-    ///
-    /// Exactness: identical per-element `static_cast<float>` conversions and
-    /// `static_cast<T>(... * normalizer)` store expressions, identical
-    /// simd_max/simd_sum reduction order, identical addresses; only the
-    /// memory transaction width changes. The scalar arm of every branch is
-    /// the promoted source verbatim. The ranked decode key length runs
-    /// 1024..1152, so about half the steps take the vector arm.
-    ///
-    /// Kill switch: `DARKBLOOM_GEMMA4_D512_SOFTMAX_VEC` set to
-    /// `0`/`false`/`no`/`off` restores all three promoted kernels byte for
-    /// byte, including their cached pipeline names. Default ON.
-    private static let softmaxVecEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_D512_SOFTMAX_VEC"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    private static let softmaxVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1_sv1",
-        inputNames: ["scores", "params"],
-        outputNames: ["probs"],
-        source: """
+    private static let softmaxVecSourcePromoted: String = """
             const int axis_size = int(params[0]);
             const int gid = int(threadgroup_position_in_grid.x);
             const int lid = int(thread_position_in_threadgroup.x);
@@ -4647,66 +4571,9 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     }
                 }
             }
-        """,
-        ensureRowContiguous: true
-    )
+        """
 
-    private static var softmaxActive: MLXFast.MLXFastKernel {
-        softmaxVecEnabled ? softmaxVecKernel : softmaxKernel
-    }
-
-    /// AV-TILES-001: the column tiling of dispatch 3.
-    ///
-    /// probs·V is the heaviest byte stream of the D=512 decode chain — it
-    /// reads every row's whole value plane once per full-attention layer, and
-    /// nothing else in the chain touches that much memory. It shipped as 8
-    /// column tiles of 64 per row and kv head, so the launch is
-    /// `batch * kvHeads * 8` = 128 threadgroups of four simdgroups. Every
-    /// threadgroup walks the entire key length, so they all cost the same,
-    /// and 128 divides no shipped core count evenly: the cores that draw one
-    /// threadgroup more than their neighbours hold the whole dispatch open
-    /// for a full extra tile while the rest stand idle.
-    ///
-    /// Halving the tile to 32 columns doubles the launch to 256 threadgroups
-    /// of two simdgroups, which cuts that residue term roughly in half at the
-    /// same total thread count and the same per-lane register footprint.
-    ///
-    /// Exactness: a simdgroup keeps its lane→column stride, its 4×4 value
-    /// tile, its key-major walk over the same 32-key blocks and the same
-    /// cross-lane butterfly, because none of those read `sg`. Only the base
-    /// column a simdgroup starts from moves, so every output element is
-    /// accumulated from the same terms in the same order. The value plane
-    /// stays partitioned into disjoint column runs and a simdgroup still
-    /// issues one 32-byte contiguous run per key row, so the coalescing is
-    /// unchanged too; only the probability rows, which are small next to the
-    /// value plane and stay resident, are re-read by twice as many tiles.
-    ///
-    /// `DARKBLOOM_GEMMA4_D512_AV_TILES=8` restores the incumbent geometry.
-    private static let avColumnTiles: Int = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_D512_AV_TILES"], let value = Int(raw)
-        else { return 16 }
-        return value == 8 || value == 16 ? value : 16
-    }()
-
-    /// Columns one threadgroup of dispatch 3 owns, and the simdgroups it
-    /// needs to cover them at the frozen 16 columns per simdgroup.
-    private static let avTileColumns = headDim / avColumnTiles
-    private static let avSimdgroups = avTileColumns / 16
-
-    /// Dispatch 3 — probs·V. Grid: (row, kv head, column tile) × 32·SG
-    /// threads. Replays the stock GEMVTKernel<bf16,1,4,8,4,4,4> row-striding
-    /// and butterfly for all 8 heads of the GQA group at once (shared V tile
-    /// loads). params as dispatch 1.
-    private static let avKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1",
-        inputNames: [
-            "probs",
-            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-            "params",
-        ],
-        outputNames: ["out"],
-        source: """
+    private static let avSourcePromoted: String = """
             constexpr int D = 512;
             constexpr int GQA = 8;
 
@@ -4853,30 +4720,9 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     out_ptr[j] = static_cast<T>(result[j]);
                 }
             }
-        """,
-        ensureRowContiguous: true
-    )
+        """
 
-    /// CUT-13: alignment-gated vec4 twin of dispatch 3 above. Identical to
-    /// the promoted kernel except for the threadgroup-uniform
-    /// `(key_length & 3) == 0` gate and the `p_coeff` loop: the 4-aligned
-    /// arm loads each head's probability chunk as one `vec<T, 4>` from
-    /// `prob_rows + h * key_length + bm`, an address that is a multiple of
-    /// four elements (row base `(row * 16 + kv_head * GQA) * key_length`,
-    /// head stride `h * key_length`, `bm = 32 * i + 4 * thrM` all are, and
-    /// `bm + 4 <= 32 * n_iter <= key_length` stays in row). Per-element
-    /// `static_cast<float>`, the XFOLD butterfly and every store are
-    /// unchanged; the scalar arm and the leftover tail are the promoted
-    /// source verbatim.
-    private static let avVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_sv1",
-        inputNames: [
-            "probs",
-            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-            "params",
-        ],
-        outputNames: ["out"],
-        source: """
+    private static let avVecSourcePromoted: String = """
             constexpr int D = 512;
             constexpr int GQA = 8;
 
@@ -5033,57 +4879,9 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     out_ptr[j] = static_cast<T>(result[j]);
                 }
             }
-        """,
-        ensureRowContiguous: true
-    )
+        """
 
-    private static var avActive: MLXFast.MLXFastKernel {
-        softmaxVecEnabled ? avVecKernel : avKernel
-    }
-
-    /// ORS-D512: how many per-threadgroup partials one o_proj 64-group of the
-    /// activation is split into. At the AV-TILES-001 default of 32-column
-    /// tiles a 64-group spans two threadgroups, so dispatch 3 emits a
-    /// `[8, 256]` pair table and the o_proj kernel adds each pair (the
-    /// prepass's own final xor-4 stage); at `DARKBLOOM_GEMMA4_D512_AV_TILES=8`
-    /// the group sits inside one threadgroup and the `[8, 128]` table is
-    /// emitted whole.
-    private static let avORunsumPartials = avColumnTiles / 8
-
-    /// ORS-D512 twin of the CUT-13 dispatch-3 kernel: the same body verbatim,
-    /// plus an epilogue that emits the o_proj run-sum table (or its pair
-    /// partials) for the activation this dispatch just stored, so the
-    /// standalone `cbv2_b8_rs_table_dyn_v1` prepass never runs on a full
-    /// layer.
-    ///
-    /// Exactness. The prepass lane `fm` reads the eight consecutive BF16
-    /// values `64g + 8fm ... + 7` of the o_proj input, forms the two quads
-    /// `((x0+x1)+x2)+x3` and `((x4+x5)+x6)+x7` in T, adds them into a float
-    /// as `(0 + qA) + qB`, then butterflies xor 1, 2, 4 over `fm`. Here the
-    /// o_proj input is this kernel's own `out` plane read back head-major
-    /// (column `head * 512 + d`), and after the XFOLD every lane holds the
-    /// four consecutive stored columns `out_col ... + 3` of head `thrM`, so
-    /// the octet `fm` is the lane pair `(thrN, thrN ^ 1)` of one simdgroup:
-    /// the even lane holds `x0..x3`, the odd lane `x4..x7`. Each lane
-    /// gathers the partner's four stored bit patterns, writes the two quads
-    /// and the float sum as the prepass's own statements in the prepass's
-    /// order, and both lanes of the pair hold the identical octet value.
-    /// `fm` bit 0 is lane bit 1 (`simd_shuffle_xor 2`), bit 1 is the
-    /// simdgroup pair (threadgroup memory), bit 2 is the second simdgroup
-    /// pair at 64-column tiles or the neighbouring threadgroup at 32-column
-    /// tiles (the pair table). Every node adds the same two subtrees the
-    /// prepass's butterfly adds; float addition is commutative, so the
-    /// left/right order at a node is immaterial. The `out` store, the
-    /// accumulation and the fold above it are the promoted text.
-    private static let avVecORunsumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_sv1_ors1",
-        inputNames: [
-            "probs",
-            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-            "params",
-        ],
-        outputNames: ["out", "rs"],
-        source: """
+    private static let avORunsumSourcePromoted: String = """
             constexpr int D = 512;
             constexpr int GQA = 8;
 
@@ -5273,7 +5071,511 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                         + (kv_head * GQA + thrM) * \(avColumnTiles) + tile] = rsv;
                 }
             }
-        """,
+        """
+
+
+    // MARK: D512-MICROSCHED
+
+    /// D512-KVC2 — the sliding twin's K/V carry, transplanted.
+    ///
+    /// The resident sliding walk keeps ONE iteration's packed K/V words
+    /// outstanding in `kw_pre`/`vw_pre`: the depth-one body seeds them before
+    /// the token loop and re-issues them at the TOP of each step for the next
+    /// step (`residentSlidingWalkDepth1`), and the depth-two body does the
+    /// same per phase register. The D=512 full-attention triple had no carry
+    /// at all: dispatch 1 loaded its 4x4 K tile at the head of every `n_iter`
+    /// step and consumed it in the very next statement, and dispatch 3 did
+    /// the same with its 4x4 V tile — the load and its first use sit in the
+    /// same basic block with nothing between them to cover the latency.
+    ///
+    /// This adds the depth-one form to both. A `k_pre` / `v_pre` register set
+    /// is seeded before the tile loop, each step consumes the set the
+    /// PREVIOUS step loaded, and the next step's rows are re-issued at the
+    /// top of the body under the same guard that decides whether that step
+    /// runs at all. The same addresses are read, in the same order, exactly
+    /// once each, and each is consumed by the step that consumed it before;
+    /// only the issue point moves one step earlier. The K and V planes are
+    /// read-only inputs of these dispatches — the ring store is a separate
+    /// dispatch ordered by the WRITE-022 fence — so no write can be reordered
+    /// across the hoist. Not one arithmetic statement is touched, so the
+    /// per-lane sum order, the softmax reduction order and every rounding
+    /// point are the promoted ones.
+    ///
+    /// The QK `k_tile[tm] = k_pre[tm]` copy is a register rename, not a move:
+    /// both arrays are `thread` arrays indexed only by the fully unrolled
+    /// `tm`, and the carry rewrite puts `#pragma clang loop unroll(full)` on
+    /// the `n_iter` loop too (`n_iter` is `constexpr D / 128` = 4), so the
+    /// whole tile chain is straight-line SSA. In dispatch 3 `n_iter` is
+    /// `key_length / 32` and runtime, so the copy stays a loop-carried phi
+    /// there; the arrays are still fully scalarised because every index is a
+    /// constant after the inner `tm` unroll.
+    ///
+    /// `DARKBLOOM_GEMMA4_D512_KV_CARRY` set to `0`/`false`/`no`/`off`
+    /// restores the promoted sources and their promoted kernel names byte for
+    /// byte. Default ON. Registration suffix `_kvc2`.
+    private static let d512KVCarryEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_KV_CARRY"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// D512-UNR — the sliding twin's `#pragma clang loop unroll(full)` on the
+    /// constant-trip inner loops the D=512 triple left bare.
+    ///
+    /// The sliding walk marks every constant-trip inner loop it has (the two
+    /// `values_per_lane` loops in each walk body, the seed and phase loops of
+    /// the depth-two walk). The D=512 triple marks most of its own but not
+    /// all: dispatch 3's innermost accumulate `for (int tn = 0; tn < 4; ++tn)`
+    /// under `float vc = p_coeff[tm]` is bare, and all of dispatch 2's
+    /// `for (int i = 0; i < 4; i++)` load / max / exp / store loops are bare.
+    ///
+    /// This is `unroll(full)` on a trip count the compiler already knows, so
+    /// the term order of every sum is exactly the sequence the rolled loop
+    /// executed — full unrolling cannot reassociate. It is deliberately NOT
+    /// `unroll_count(4)` on a runtime-trip loop: this repo measured that form
+    /// negative on the gate|up plane, and none of these loops is runtime-trip
+    /// anyway.
+    ///
+    /// `DARKBLOOM_GEMMA4_D512_UNROLL` set to `0`/`false`/`no`/`off` restores
+    /// the promoted sources and their promoted kernel names byte for byte.
+    /// Default ON. Registration suffix `_unr`.
+    private static let d512UnrollEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_UNROLL"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Line-exact surgery in the house style of `slidingSoftRefRewrite`:
+    /// match a block by its trimmed text, keep the indent it was written at,
+    /// substitute. The caller checks the count against the number of sites it
+    /// expects, so a source that drifts fails CLOSED onto the promoted text
+    /// instead of being half-rewritten.
+    private static func d512BlockRewrite(
+        _ source: String, find: [String], replace: [String]
+    ) -> (String, Int) {
+        var lines = source.components(separatedBy: "\n")
+        var index = 0
+        var applied = 0
+        while index < lines.count {
+            guard lines[index].trimmingCharacters(in: .whitespaces) == find[0],
+                index + find.count <= lines.count
+            else {
+                index += 1
+                continue
+            }
+            let window = (0..<find.count).map {
+                lines[index + $0].trimmingCharacters(in: .whitespaces)
+            }
+            guard window == find else {
+                index += 1
+                continue
+            }
+            let indent = String(lines[index].prefix(while: { $0 == " " }))
+            let body = replace.map { $0.isEmpty ? "" : indent + $0 }
+            lines.replaceSubrange(index..<(index + find.count), with: body)
+            index += body.count
+            applied += 1
+        }
+        return (lines.joined(separator: "\n"), applied)
+    }
+
+    /// Dispatch 2's bare constant-trip loops, marked in place.
+    private static func d512Scalar4Rewrite(_ source: String) -> (String, Int) {
+        var out: [String] = []
+        var applied = 0
+        for line in source.components(separatedBy: "\n") {
+            if line.trimmingCharacters(in: .whitespaces)
+                == "for (int i = 0; i < 4; i++) {" {
+                out.append(
+                    String(line.prefix(while: { $0 == " " }))
+                        + "#pragma clang loop unroll(full)")
+                applied += 1
+            }
+            out.append(line)
+        }
+        return (out.joined(separator: "\n"), applied)
+    }
+
+    private static let d512QKCarryIncumbent = [
+        "for (int i = 0; i < n_iter; ++i) {",
+        "int mat_offset = 0;",
+        "#pragma clang loop unroll(full)",
+        "for (int tm = 0; tm < 4; ++tm) {",
+        "k_tile[tm] = *reinterpret_cast<const device T4*>(",
+        "mat + mat_offset + bn);",
+        "mat_offset += D;",
+        "}",
+    ]
+
+    private static let d512QKCarryBlock = [
+        "// D512-KVC2: the tile this step consumes was issued by the previous",
+        "// step; this step issues the next one. Same addresses, same order,",
+        "// once each; only the issue point moves.",
+        "T4 k_pre[4];",
+        "{",
+        "    int mat_offset = 0;",
+        "    #pragma clang loop unroll(full)",
+        "    for (int tm = 0; tm < 4; ++tm) {",
+        "        k_pre[tm] = *reinterpret_cast<const device T4*>(",
+        "            mat + mat_offset + bn);",
+        "        mat_offset += D;",
+        "    }",
+        "}",
+        "#pragma clang loop unroll(full)",
+        "for (int i = 0; i < n_iter; ++i) {",
+        "    #pragma clang loop unroll(full)",
+        "    for (int tm = 0; tm < 4; ++tm) {",
+        "        k_tile[tm] = k_pre[tm];",
+        "    }",
+        "    if (i + 1 < n_iter) {",
+        "        int mat_offset = 0;",
+        "        #pragma clang loop unroll(full)",
+        "        for (int tm = 0; tm < 4; ++tm) {",
+        "            k_pre[tm] = *reinterpret_cast<const device T4*>(",
+        "                mat + mat_offset + bn + 128);",
+        "            mat_offset += D;",
+        "        }",
+        "    }",
+    ]
+
+    private static let d512AVCarryIncumbent = [
+        "for (int i = 0; i < n_iter; ++i) {",
+        "#pragma clang loop unroll(full)",
+        "for (int tm = 0; tm < 4; ++tm) {",
+        "v_tile[tm] = *reinterpret_cast<const device T4*>(",
+        "value_plane + size_t(bm + tm) * D + out_col);",
+        "}",
+    ]
+
+    private static let d512AVCarryBlock = [
+        "// D512-KVC2: seed guarded by the loop's own trip count, so no",
+        "// address is formed that the promoted loop did not form.",
+        "T4 v_pre[4];",
+        "if (n_iter > 0) {",
+        "    #pragma clang loop unroll(full)",
+        "    for (int tm = 0; tm < 4; ++tm) {",
+        "        v_pre[tm] = *reinterpret_cast<const device T4*>(",
+        "            value_plane + size_t(bm + tm) * D + out_col);",
+        "    }",
+        "}",
+        "for (int i = 0; i < n_iter; ++i) {",
+        "    #pragma clang loop unroll(full)",
+        "    for (int tm = 0; tm < 4; ++tm) {",
+        "        v_tile[tm] = v_pre[tm];",
+        "    }",
+        "    if (i + 1 < n_iter) {",
+        "        #pragma clang loop unroll(full)",
+        "        for (int tm = 0; tm < 4; ++tm) {",
+        "            v_pre[tm] = *reinterpret_cast<const device T4*>(",
+        "                value_plane + size_t(bm + tm + 32) * D + out_col);",
+        "        }",
+        "    }",
+    ]
+
+    private static let d512AVUnrollIncumbent = [
+        "for (int tm = 0; tm < 4; ++tm) {",
+        "float vc = p_coeff[tm];",
+        "for (int tn = 0; tn < 4; ++tn) {",
+        "result[h * 4 + tn] += vc * v_tile[tm][tn];",
+        "}",
+        "}",
+    ]
+
+    private static let d512AVUnrollBlock = [
+        "for (int tm = 0; tm < 4; ++tm) {",
+        "    float vc = p_coeff[tm];",
+        "    #pragma clang loop unroll(full)",
+        "    for (int tn = 0; tn < 4; ++tn) {",
+        "        result[h * 4 + tn] += vc * v_tile[tm][tn];",
+        "    }",
+        "}",
+    ]
+
+    /// The six D=512 kernel sources after D512-MICROSCHED, plus the two
+    /// registration suffixes. Each mechanism is all-or-nothing across the
+    /// sources it owns: if any one site fails to match, that mechanism leaves
+    /// every source it touches at the promoted text and contributes an empty
+    /// suffix, so the kernel names stay the promoted ones and MLX reuses the
+    /// promoted pipeline. The expected counts are the sites this file has:
+    /// one QK tile load, three AV tile loads (plain / `_sv1` / `_sv1_ors1`),
+    /// three AV accumulate loops, six bare quad loops in the promoted softmax
+    /// and eight in its `_sv1` twin.
+    private static let d512Scheduled: (
+        qk: String, softmax: String, softmaxVec: String,
+        av: String, avVec: String, avORS: String,
+        carryKey: String, unrollKey: String) = {
+        var qk = qkSourcePromoted
+        var softmax = softmaxSourcePromoted
+        var softmaxVec = softmaxVecSourcePromoted
+        var av = avSourcePromoted
+        var avVec = avVecSourcePromoted
+        var avORS = avORunsumSourcePromoted
+        var carryKey = ""
+        var unrollKey = ""
+
+        if d512KVCarryEnabled {
+            let q = d512BlockRewrite(
+                qk, find: d512QKCarryIncumbent, replace: d512QKCarryBlock)
+            let a = d512BlockRewrite(
+                av, find: d512AVCarryIncumbent, replace: d512AVCarryBlock)
+            let b = d512BlockRewrite(
+                avVec, find: d512AVCarryIncumbent, replace: d512AVCarryBlock)
+            let c = d512BlockRewrite(
+                avORS, find: d512AVCarryIncumbent, replace: d512AVCarryBlock)
+            if q.1 == 1, a.1 == 1, b.1 == 1, c.1 == 1 {
+                qk = q.0
+                av = a.0
+                avVec = b.0
+                avORS = c.0
+                carryKey = "_kvc2"
+            }
+        }
+
+        if d512UnrollEnabled {
+            let s = d512Scalar4Rewrite(softmax)
+            let sv = d512Scalar4Rewrite(softmaxVec)
+            let a = d512BlockRewrite(
+                av, find: d512AVUnrollIncumbent, replace: d512AVUnrollBlock)
+            let b = d512BlockRewrite(
+                avVec, find: d512AVUnrollIncumbent, replace: d512AVUnrollBlock)
+            let c = d512BlockRewrite(
+                avORS, find: d512AVUnrollIncumbent, replace: d512AVUnrollBlock)
+            if s.1 == 6, sv.1 == 8, a.1 == 1, b.1 == 1, c.1 == 1 {
+                softmax = s.0
+                softmaxVec = sv.0
+                av = a.0
+                avVec = b.0
+                avORS = c.0
+                unrollKey = "_unr"
+            }
+        }
+
+        return (qk, softmax, softmaxVec, av, avVec, avORS, carryKey, unrollKey)
+    }()
+
+    /// A changed body takes a changed name. Dispatch 1 carries only the carry
+    /// suffix, dispatch 2 only the unroll suffix, dispatch 3 both.
+    private static let d512QKKey = d512Scheduled.carryKey
+    private static let d512SoftmaxKey = d512Scheduled.unrollKey
+    private static let d512AVKey = d512Scheduled.carryKey + d512Scheduled.unrollKey
+
+    /// WRITE-022 keeps the plain and fenced dispatch-1 objects structurally
+    /// identical, so both read the scheduled source.
+    private static var qkSource: String { d512Scheduled.qk }
+
+    private static let qkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_xfold_v3_vec1\(d512QKKey)",
+        inputNames: [
+            "queries",
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "params",
+        ],
+        outputNames: ["scores"],
+        source: qkSource,
+        ensureRowContiguous: true
+    )
+
+    private static let qkFencedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_xfold_v3_vec1\(d512QKKey)",
+        inputNames: [
+            "queries",
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "params", "store_fence",
+        ],
+        outputNames: ["scores"],
+        source: qkSource,
+        ensureRowContiguous: true
+    )
+
+    /// Dispatch 2 — softmax. A verbatim transcription of
+    /// `softmax_single_row` (block_softmax_precise, AccT=float, N_READS=4)
+    /// over the 128 score rows; the CALLER sizes the threadgroup exactly
+    /// like softmax.cpp:64-68 (32·ceil(ceil(kL/4)/32)). params[0] = kL.
+    private static let softmaxKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1\(d512SoftmaxKey)",
+        inputNames: ["scores", "params"],
+        outputNames: ["probs"],
+        source: d512Scheduled.softmax,
+        ensureRowContiguous: true
+    )
+
+    /// CUT-13: alignment-gated vec4 twins of dispatch 2 and dispatch 3.
+    ///
+    /// The probability-row stride is `key_length`, which is not always a
+    /// multiple of four, so the softmax load/store loops and the AV
+    /// `p_coeff` loops above issue four scalar transactions per row chunk.
+    /// Each `_sv1` twin computes one threadgroup-uniform branch
+    /// `(axis_size & 3) == 0` (softmax) / `(key_length & 3) == 0` (AV) at
+    /// the top of the kernel. When the row is 4-aligned:
+    ///
+    /// - softmax: `gid * axis_size` and `lid * 4` are multiples of four
+    ///   elements, so each guarded chunk (`lid * 4 + 4 <= axis_size`) starts
+    ///   on an 8-byte boundary for bf16 and covers exactly the four elements
+    ///   the scalar run touches. Threads outside that guard — the whole
+    ///   masked tail threadgroup included — keep the scalar path, so no
+    ///   transaction is issued past the row end.
+    /// - AV: `prob_rows` is offset by `(row * 16 + kv_head * GQA) *
+    ///   key_length`, each head row by `h * key_length`, and `bm = 32 * i +
+    ///   4 * thrM`; all three terms are multiples of four elements when
+    ///   `key_length % 4 == 0`, and `bm + 4 <= 32 * n_iter <= key_length`
+    ///   keeps every vec4 inside the row. The leftover tail stays scalar.
+    ///
+    /// Exactness: identical per-element `static_cast<float>` conversions and
+    /// `static_cast<T>(... * normalizer)` store expressions, identical
+    /// simd_max/simd_sum reduction order, identical addresses; only the
+    /// memory transaction width changes. The scalar arm of every branch is
+    /// the promoted source verbatim. The ranked decode key length runs
+    /// 1024..1152, so about half the steps take the vector arm.
+    ///
+    /// Kill switch: `DARKBLOOM_GEMMA4_D512_SOFTMAX_VEC` set to
+    /// `0`/`false`/`no`/`off` restores all three promoted kernels byte for
+    /// byte, including their cached pipeline names. Default ON.
+    private static let softmaxVecEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_SOFTMAX_VEC"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let softmaxVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1_sv1\(d512SoftmaxKey)",
+        inputNames: ["scores", "params"],
+        outputNames: ["probs"],
+        source: d512Scheduled.softmaxVec,
+        ensureRowContiguous: true
+    )
+
+    private static var softmaxActive: MLXFast.MLXFastKernel {
+        softmaxVecEnabled ? softmaxVecKernel : softmaxKernel
+    }
+
+    /// AV-TILES-001: the column tiling of dispatch 3.
+    ///
+    /// probs·V is the heaviest byte stream of the D=512 decode chain — it
+    /// reads every row's whole value plane once per full-attention layer, and
+    /// nothing else in the chain touches that much memory. It shipped as 8
+    /// column tiles of 64 per row and kv head, so the launch is
+    /// `batch * kvHeads * 8` = 128 threadgroups of four simdgroups. Every
+    /// threadgroup walks the entire key length, so they all cost the same,
+    /// and 128 divides no shipped core count evenly: the cores that draw one
+    /// threadgroup more than their neighbours hold the whole dispatch open
+    /// for a full extra tile while the rest stand idle.
+    ///
+    /// Halving the tile to 32 columns doubles the launch to 256 threadgroups
+    /// of two simdgroups, which cuts that residue term roughly in half at the
+    /// same total thread count and the same per-lane register footprint.
+    ///
+    /// Exactness: a simdgroup keeps its lane→column stride, its 4×4 value
+    /// tile, its key-major walk over the same 32-key blocks and the same
+    /// cross-lane butterfly, because none of those read `sg`. Only the base
+    /// column a simdgroup starts from moves, so every output element is
+    /// accumulated from the same terms in the same order. The value plane
+    /// stays partitioned into disjoint column runs and a simdgroup still
+    /// issues one 32-byte contiguous run per key row, so the coalescing is
+    /// unchanged too; only the probability rows, which are small next to the
+    /// value plane and stay resident, are re-read by twice as many tiles.
+    ///
+    /// `DARKBLOOM_GEMMA4_D512_AV_TILES=8` restores the incumbent geometry.
+    private static let avColumnTiles: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_AV_TILES"], let value = Int(raw)
+        else { return 16 }
+        return value == 8 || value == 16 ? value : 16
+    }()
+
+    /// Columns one threadgroup of dispatch 3 owns, and the simdgroups it
+    /// needs to cover them at the frozen 16 columns per simdgroup.
+    private static let avTileColumns = headDim / avColumnTiles
+    private static let avSimdgroups = avTileColumns / 16
+
+    /// Dispatch 3 — probs·V. Grid: (row, kv head, column tile) × 32·SG
+    /// threads. Replays the stock GEMVTKernel<bf16,1,4,8,4,4,4> row-striding
+    /// and butterfly for all 8 heads of the GQA group at once (shared V tile
+    /// loads). params as dispatch 1.
+    private static let avKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1\(d512AVKey)",
+        inputNames: [
+            "probs",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "params",
+        ],
+        outputNames: ["out"],
+        source: d512Scheduled.av,
+        ensureRowContiguous: true
+    )
+
+    /// CUT-13: alignment-gated vec4 twin of dispatch 3 above. Identical to
+    /// the promoted kernel except for the threadgroup-uniform
+    /// `(key_length & 3) == 0` gate and the `p_coeff` loop: the 4-aligned
+    /// arm loads each head's probability chunk as one `vec<T, 4>` from
+    /// `prob_rows + h * key_length + bm`, an address that is a multiple of
+    /// four elements (row base `(row * 16 + kv_head * GQA) * key_length`,
+    /// head stride `h * key_length`, `bm = 32 * i + 4 * thrM` all are, and
+    /// `bm + 4 <= 32 * n_iter <= key_length` stays in row). Per-element
+    /// `static_cast<float>`, the XFOLD butterfly and every store are
+    /// unchanged; the scalar arm and the leftover tail are the promoted
+    /// source verbatim.
+    private static let avVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_sv1\(d512AVKey)",
+        inputNames: [
+            "probs",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "params",
+        ],
+        outputNames: ["out"],
+        source: d512Scheduled.avVec,
+        ensureRowContiguous: true
+    )
+
+    private static var avActive: MLXFast.MLXFastKernel {
+        softmaxVecEnabled ? avVecKernel : avKernel
+    }
+
+    /// ORS-D512: how many per-threadgroup partials one o_proj 64-group of the
+    /// activation is split into. At the AV-TILES-001 default of 32-column
+    /// tiles a 64-group spans two threadgroups, so dispatch 3 emits a
+    /// `[8, 256]` pair table and the o_proj kernel adds each pair (the
+    /// prepass's own final xor-4 stage); at `DARKBLOOM_GEMMA4_D512_AV_TILES=8`
+    /// the group sits inside one threadgroup and the `[8, 128]` table is
+    /// emitted whole.
+    private static let avORunsumPartials = avColumnTiles / 8
+
+    /// ORS-D512 twin of the CUT-13 dispatch-3 kernel: the same body verbatim,
+    /// plus an epilogue that emits the o_proj run-sum table (or its pair
+    /// partials) for the activation this dispatch just stored, so the
+    /// standalone `cbv2_b8_rs_table_dyn_v1` prepass never runs on a full
+    /// layer.
+    ///
+    /// Exactness. The prepass lane `fm` reads the eight consecutive BF16
+    /// values `64g + 8fm ... + 7` of the o_proj input, forms the two quads
+    /// `((x0+x1)+x2)+x3` and `((x4+x5)+x6)+x7` in T, adds them into a float
+    /// as `(0 + qA) + qB`, then butterflies xor 1, 2, 4 over `fm`. Here the
+    /// o_proj input is this kernel's own `out` plane read back head-major
+    /// (column `head * 512 + d`), and after the XFOLD every lane holds the
+    /// four consecutive stored columns `out_col ... + 3` of head `thrM`, so
+    /// the octet `fm` is the lane pair `(thrN, thrN ^ 1)` of one simdgroup:
+    /// the even lane holds `x0..x3`, the odd lane `x4..x7`. Each lane
+    /// gathers the partner's four stored bit patterns, writes the two quads
+    /// and the float sum as the prepass's own statements in the prepass's
+    /// order, and both lanes of the pair hold the identical octet value.
+    /// `fm` bit 0 is lane bit 1 (`simd_shuffle_xor 2`), bit 1 is the
+    /// simdgroup pair (threadgroup memory), bit 2 is the second simdgroup
+    /// pair at 64-column tiles or the neighbouring threadgroup at 32-column
+    /// tiles (the pair table). Every node adds the same two subtrees the
+    /// prepass's butterfly adds; float addition is commutative, so the
+    /// left/right order at a node is immaterial. The `out` store, the
+    /// accumulation and the fold above it are the promoted text.
+    private static let avVecORunsumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_sv1_ors1\(d512AVKey)",
+        inputNames: [
+            "probs",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "params",
+        ],
+        outputNames: ["out", "rs"],
+        source: d512Scheduled.avORS,
         ensureRowContiguous: true
     )
 

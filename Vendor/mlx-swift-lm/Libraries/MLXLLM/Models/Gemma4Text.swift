@@ -1080,6 +1080,7 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
     source: """
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
+        constexpr uint row_simds = row_threads / 32;
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
         const uint lid = tid - slot * row_threads;
@@ -1088,7 +1089,6 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
         const uint row_simd = lid / 32;
 
         threadgroup float partials[RPT][32];
-        threadgroup float inv_rms[RPT];
         threadgroup T rounded[RPT][D];
         threadgroup uint row_position[RPT];
 
@@ -1139,22 +1139,21 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        // Slots 2..31 stay exactly zero, so the 32-lane combine returns the
-        // two simdgroup partials' sum whatever order the tree adds them in.
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
-            if (lane == 0) {
-                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // PG2-COMBINE-1779. Every simdgroup of the row reduces the same
+        // thirty-two operands the incumbent's first simdgroup reduced: the
+        // partials below row_simds, and the zero-fill's 0.0f from a register
+        // above it. simd_sum's tree therefore returns the bit-identical
+        // value in every simdgroup, so the row's inverse rms needs neither
+        // the zero-fill pass nor the publish-back barrier the incumbent
+        // spends to broadcast one simdgroup's answer.
+        sum = simd_sum(lane < row_simds ? partials[slot][lane] : 0.0f);
+        const float row_inverse_rms =
+            metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
 
         if (row >= TOTAL_ROWS) return;
-        const float inverse_rms = inv_rms[slot];
+        const float inverse_rms = row_inverse_rms;
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
             if (APPLY_ROPE) {
@@ -1280,6 +1279,7 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
     source: """
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
+        constexpr uint row_simds = row_threads / 32;
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
         const uint lid = tid - slot * row_threads;
@@ -1288,7 +1288,6 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
         const uint row_simd = lid / 32;
 
         threadgroup float partials[RPT][32];
-        threadgroup float inv_rms[RPT];
         threadgroup T rounded[RPT][D];
         threadgroup uint row_position[RPT];
 
@@ -1343,20 +1342,21 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
-            if (lane == 0) {
-                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // PG2-COMBINE-1779. Every simdgroup of the row reduces the same
+        // thirty-two operands the incumbent's first simdgroup reduced: the
+        // partials below row_simds, and the zero-fill's 0.0f from a register
+        // above it. simd_sum's tree therefore returns the bit-identical
+        // value in every simdgroup, so the row's inverse rms needs neither
+        // the zero-fill pass nor the publish-back barrier the incumbent
+        // spends to broadcast one simdgroup's answer.
+        sum = simd_sum(lane < row_simds ? partials[slot][lane] : 0.0f);
+        const float row_inverse_rms =
+            metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
 
         if (row >= TOTAL_ROWS) return;
-        const float inverse_rms = inv_rms[slot];
+        const float inverse_rms = row_inverse_rms;
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
             if (APPLY_ROPE && weighted) {
@@ -1420,6 +1420,7 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
     source: """
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
+        constexpr uint row_simds = row_threads / 32;
         constexpr uint mirror_row_words = D / 8 + D / 64;
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
@@ -1429,7 +1430,6 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
         const uint row_simd = lid / 32;
 
         threadgroup float partials[RPT][32];
-        threadgroup float inv_rms[RPT];
         threadgroup T rounded[RPT][D];
         threadgroup uint row_position[RPT];
         threadgroup T final_vals[RPT][D];
@@ -1492,20 +1492,21 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
-            if (lane == 0) {
-                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // PG2-COMBINE-1779. Every simdgroup of the row reduces the same
+        // thirty-two operands the incumbent's first simdgroup reduced: the
+        // partials below row_simds, and the zero-fill's 0.0f from a register
+        // above it. simd_sum's tree therefore returns the bit-identical
+        // value in every simdgroup, so the row's inverse rms needs neither
+        // the zero-fill pass nor the publish-back barrier the incumbent
+        // spends to broadcast one simdgroup's answer.
+        sum = simd_sum(lane < row_simds ? partials[slot][lane] : 0.0f);
+        const float row_inverse_rms =
+            metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
 
         if (valid) {
-            const float inverse_rms = inv_rms[slot];
+            const float inverse_rms = row_inverse_rms;
             for (uint i = 0; i < reads; ++i) {
                 const T normalized = T(float(input[i]) * inverse_rms);
                 if (APPLY_ROPE && weighted) {
@@ -5254,6 +5255,12 @@ private let gemma4DenseGateUpJoinEnabled: Bool = {
 /// never builds the paired plane, so the kernel predicate can never observe
 /// its geometry and the incumbent path runs exactly as before.
 /// Engage mark: `dense-geglu-epilogue-prefill`.
+///
+/// This switch is PREFILL ONLY. The decode-side fold of the same activation
+/// (DA3-DECODE, engage mark `dense-geglu-epilogue-decode`) is a separate
+/// mechanism on a separate road with its own switch,
+/// `DARKBLOOM_GEMMA4_DENSE_GEGLU_EPILOGUE_DECODE`; neither switch touches the
+/// other's arm.
 private let gemma4DenseGeGLUEpilogueEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_DENSE_GEGLU_EPILOGUE"]
@@ -5487,6 +5494,39 @@ private class Gemma4MLP: Module {
         )
     }
 
+    /// DA3-DECODE. One decode dispatch over the joined gate|up plane whose
+    /// store epilogue closes the dense GeGLU, so the activated `[8, 1, 2112]`
+    /// plane comes back directly and the standalone product dispatch -- which
+    /// reads 4,224 columns back out of device memory only to write 2,112 --
+    /// leaves the tape. Same storage, same weights, same admission as
+    /// `zipGateUp`; the joined plane is a plain concatenation and stays one.
+    ///
+    /// A nil keeps `zipGateUp` plus `gemma4GeluProduct` exactly as they are.
+    /// The kill switch lives on the kernel host
+    /// (`CBv2DenseMLPQMVV1.mma8GateUpGeGLUEnabled`,
+    /// `DARKBLOOM_GEMMA4_DENSE_GEGLU_EPILOGUE_DECODE`), so one variable turns
+    /// the whole mechanism off end to end.
+    fileprivate func zipGateUpGeGLU(_ x: MLXArray) -> MLXArray? {
+        guard gemma4DenseGateUpJoinEnabled,
+            let storage = fusedGateUpStorage,
+            let gate = gateProj as? QuantizedLinear,
+            let up = upProj as? QuantizedLinear,
+            gate.bias == nil, up.bias == nil,
+            gate.groupSize == 64, up.groupSize == gate.groupSize,
+            gate.bits == 8, up.bits == gate.bits,
+            gate.mode == .affine, up.mode == gate.mode,
+            let activated = CBv2DenseMLPQMVV1.matmulGeGLU(
+                x: x,
+                weight: storage.weight,
+                scales: storage.scales,
+                biases: storage.biases,
+                groupSize: gate.groupSize,
+                bits: gate.bits,
+                mode: gate.mode)
+        else { return nil }
+        return activated
+    }
+
     fileprivate func zipDown(_ activated: MLXArray) -> MLXArray {
         denseProjection(downProj, activated)
     }
@@ -5569,6 +5609,49 @@ private enum Gemma4ZipRouterV1 {
         let routeTable: SwitchRouteTable?
     }
 
+    /// Stage 2's tail and stage 3, together, because DA3-DECODE deletes the
+    /// boundary between them.
+    ///
+    /// Incumbent: the joined gate|up QMV writes a `[8, 1, 4224]` plane, and a
+    /// separate compiled-tape dispatch reads both halves back and writes the
+    /// `[8, 1, 2112]` activated plane. That dispatch owns a barrier stage of
+    /// its own -- the router has no partner for it -- and `held` is the edge
+    /// that fences it behind the router's scores.
+    ///
+    /// DA3-DECODE: the GeGLU is closed in the QMV's store epilogue, so the
+    /// activated plane IS the QMV's output and stage 3 has no dispatch left.
+    /// The ordering edge is re-expressed against that single node: naming
+    /// `expertScores` as a dependency of the fused output keeps the router QMV
+    /// encoded no later than the dense chain's second node, which is the
+    /// pairing stage 2 already has. Every later edge -- the argPartition /
+    /// dense-down pairing, the expert fence -- reads `activated` and is
+    /// untouched. `gateUpFence` is what plan 2 named as `[gate, up]`, so the
+    /// plan-2 arm keeps its exact incumbent schedule when the fused arm is off.
+    private static func denseActivated(
+        mlp: Gemma4MLP,
+        denseIn: MLXArray,
+        sums: CBv2DenseMLPQMVV1.ActivationSums?,
+        expertScores: MLXArray
+    ) -> (activated: MLXArray, gateUpFence: [MLXArray]) {
+        if let fused = mlp.zipGateUpGeGLU(denseIn) {
+            return (
+                MLX.depends(input: fused, dependencies: [expertScores]), [fused]
+            )
+        }
+        let gate: MLXArray
+        let up: MLXArray
+        if let joined = mlp.zipGateUp(denseIn, sums) {
+            (gate, up) = joined
+        } else {
+            gate = mlp.zipGate(denseIn, sums)
+            up = mlp.zipUp(denseIn, sums)
+        }
+        // Stage 3: the dense GeLU product, which the router has no partner
+        // for -- the argPartition is deliberately NOT paired with it.
+        let held = MLX.depends(inputs: [gate, up], dependencies: [expertScores])
+        return (gemma4GeluProduct(held[0], held[1]), [gate, up])
+    }
+
     /// PREFIX-001 admission lives beside the ZIP admission so the eager
     /// custom producer is never built unless this exact consumer will use all
     /// of its outputs.
@@ -5639,34 +5722,21 @@ private enum Gemma4ZipRouterV1 {
 
         // Stage 2: router QMV | dense gate + up.
         let expertScores: MLXArray
-        let gate: MLXArray
-        let up: MLXArray
+        let dense: (activated: MLXArray, gateUpFence: [MLXArray])
         if Gemma4FusedLayerGlue.denseXSumElideEnabled {
             expertScores = router.zipScores(normed)
             let denseIn = MLX.depends(input: n1, dependencies: [normed])
-            if let joined = mlp.zipGateUp(denseIn, nil) {
-                (gate, up) = joined
-            } else {
-                gate = mlp.zipGate(denseIn, nil)
-                up = mlp.zipUp(denseIn, nil)
-            }
+            dense = denseActivated(
+                mlp: mlp, denseIn: denseIn, sums: nil, expertScores: expertScores)
         } else {
             guard let sums = producerSums ?? mlp.zipActivationSums(n1) else { return nil }
             expertScores = router.zipScores(
                 MLX.depends(input: normed, dependencies: [sums.dependencyHandle]))
             let denseIn = MLX.depends(input: n1, dependencies: [normed])
-            if let joined = mlp.zipGateUp(denseIn, sums) {
-                (gate, up) = joined
-            } else {
-                gate = mlp.zipGate(denseIn, sums)
-                up = mlp.zipUp(denseIn, sums)
-            }
+            dense = denseActivated(
+                mlp: mlp, denseIn: denseIn, sums: sums, expertScores: expertScores)
         }
-
-        // Stage 3: the dense GeLU product, which the router has no partner
-        // for -- the argPartition is deliberately NOT paired with it.
-        let held = MLX.depends(inputs: [gate, up], dependencies: [expertScores])
-        let activated = gemma4GeluProduct(held[0], held[1])
+        let activated = dense.activated
 
         // Stage 4: router argPartition | dense down projection. The sort is
         // 8 us and the down projection 25 us, so this is the pairing that
@@ -5677,7 +5747,7 @@ private enum Gemma4ZipRouterV1 {
         var routeTable: SwitchRouteTable? = nil
         if plan == 2 {
             let partition = router.zipPartition(
-                MLX.depends(input: expertScores, dependencies: [gate, up]))
+                MLX.depends(input: expertScores, dependencies: dense.gateUpFence))
             topKIndices = router.zipSelected(
                 MLX.depends(input: partition, dependencies: [activated]))
             denseOut = mlp.zipDown(

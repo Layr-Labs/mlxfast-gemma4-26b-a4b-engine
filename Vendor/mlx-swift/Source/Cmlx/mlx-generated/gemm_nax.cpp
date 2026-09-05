@@ -246,6 +246,32 @@ namespace steel {
 // NAX Steel with new tiles
 ///////////////////////////////////////////////////////////////////////////////
 
+// DARKBLOOM GEMMA4 NAX FRAG-VEC.
+// BaseNAXFrag::load reads the four contiguous elements a lane holds of a
+// fragment row as one 8-byte vector whenever the stride along the row is the
+// compile-time unit stride, the element type is two bytes wide and the source
+// element type equals the fragment element type; the four values land in the
+// same register slots the scalar statements fill. Every operand these kernels
+// read this way is row-contiguous with a leading dimension that is a multiple
+// of four elements (device operands) or a 72-element padded row of a
+// threadgroup tile, and every fragment column offset is a multiple of four,
+// so each such vector starts on an 8-byte boundary.
+// Kill switch: DARKBLOOM_GEMMA4_NAX_FRAG_VEC 0 folds the load back to the
+// scalar statements.
+#ifndef DARKBLOOM_GEMMA4_NAX_FRAG_VEC
+#define DARKBLOOM_GEMMA4_NAX_FRAG_VEC 1
+#endif
+
+template <typename U>
+METAL_FUNC metal::vec<U, 4> nax_frag_load4(const device U* p) {
+  return *reinterpret_cast<const device metal::vec<U, 4>*>(p);
+}
+
+template <typename U>
+METAL_FUNC metal::vec<U, 4> nax_frag_load4(const threadgroup U* p) {
+  return *reinterpret_cast<const threadgroup metal::vec<U, 4>*>(p);
+}
+
 struct BaseNAXFrag {
   STEEL_CONST short kFragRows = 16;
   STEEL_CONST short kFragCols = 16;
@@ -303,9 +329,20 @@ struct BaseNAXFrag {
       const auto c = off_y;
 
       if constexpr (metal::is_same_v<StrY, Int<1>>) {
-        STEEL_PRAGMA_UNROLL
-        for (short j = 0; j < kElemCols; j++) {
-          dst[i * kElemCols + j] = static_cast<T>(src[r * str_x + c + j]);
+        if constexpr (
+            (DARKBLOOM_GEMMA4_NAX_FRAG_VEC != 0) && kElemCols == 4 &&
+            sizeof(T) == 2 &&
+            metal::is_same_v<pointer_element_t<SrcPtrType>, T>) {
+          const metal::vec<T, 4> v4 = nax_frag_load4(src + (r * str_x + c));
+          dst[i * kElemCols + 0] = v4.x;
+          dst[i * kElemCols + 1] = v4.y;
+          dst[i * kElemCols + 2] = v4.z;
+          dst[i * kElemCols + 3] = v4.w;
+        } else {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < kElemCols; j++) {
+            dst[i * kElemCols + j] = static_cast<T>(src[r * str_x + c + j]);
+          }
         }
       } else {
         STEEL_PRAGMA_UNROLL

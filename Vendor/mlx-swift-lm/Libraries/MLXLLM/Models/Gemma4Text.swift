@@ -903,7 +903,7 @@ private class RMSNormNoScale: Module {
     }
 }
 
-private struct Gemma4QKVRopeParameters {
+internal struct Gemma4QKVRopeParameters {
     let log2Base: MLXArray
     let frequencies: MLXArray
     let usesFrequencies: Bool
@@ -1070,14 +1070,7 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
 /// why the stock three-norm chain is slow here. `RPT` rows share one 512-wide
 /// threadgroup, and each row keeps its own 64 threads and its own two
 /// simdgroups, so the reduction tree is the stock one row for row.
-private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_v2",
-    inputNames: [
-        "q", "k", "q_weight", "k_weight",
-        "position_offsets", "rope_freqs",
-    ],
-    outputNames: ["q_out", "k_out", "v_out"],
-    source: """
+private let gemma4QKVNormPrefillSource = """
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
         const uint tid = thread_position_in_threadgroup.x;
@@ -1195,9 +1188,34 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
                 output_row[pair + D / 2] = static_cast<T>(rx2);
             }
         }
-    """,
-    ensureRowContiguous: true
-)
+    """
+
+private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
+    name: "gemma4_qkv_rms_norm_head_major_v2",
+    inputNames: ["q", "k", "q_weight", "k_weight", "position_offsets", "rope_freqs"],
+    outputNames: ["q_out", "k_out", "v_out"],
+    source: gemma4QKVNormPrefillSource, ensureRowContiguous: true)
+
+// The ordinary kernel's arithmetic and Q/K row order remain unchanged.
+// Only the final query's position differs from the full key rectangle.
+private let gemma4LastQueryNormRopeKernel: MLXFast.MLXFastKernel = {
+    let anchor = "row_position[slot] = l;"
+    precondition(gemma4QKVNormPrefillSource.components(separatedBy: anchor).count == 3)
+    var source = gemma4QKVNormPrefillSource
+    let first = source.range(of: anchor)!
+    source.replaceSubrange(first, with: "row_position[slot] = l + Q_POSITION_DELTA;")
+    return MLXFast.metalKernel(
+        name: "gemma4_qkv_rms_norm_head_major_lastquery_offset_v1",
+        inputNames: ["q", "k", "q_weight", "k_weight", "position_offsets", "rope_freqs"],
+        outputNames: ["q_out", "k_out", "v_out"], source: source,
+        ensureRowContiguous: true)
+}()
+
+internal let gemma4LastQueryNormRopeEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_LASTQUERY_NORM_ROPE"] else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
 
 private let gemma4QKVNormPrefillEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
@@ -1208,14 +1226,15 @@ private let gemma4QKVNormPrefillEnabled: Bool = {
 
 /// `(qNorm(q), kNorm(k), vNorm(k))` already in `[B, H, L, D]`. Returns `nil`
 /// off the plane, including for every non-`k_eq_v` projection.
-private func gemma4FusedQKVNormHeadMajor(
+internal func gemma4FusedQKVNormHeadMajor(
     q: MLXArray,
     k: MLXArray,
     qWeight: MLXArray,
     kWeight: MLXArray,
     eps: Float,
     keyValueShared: Bool, positionOffsets: MLXArray,
-    ropeParameters: Gemma4QKVRopeParameters, applyRope: Bool
+    ropeParameters: Gemma4QKVRopeParameters, applyRope: Bool,
+    queryPositionDelta: Int = 0
 ) -> (q: MLXArray, k: MLXArray, v: MLXArray, appliedRope: Bool)? {
     guard gemma4QKVNormPrefillEnabled, keyValueShared, eps == 1.0e-6,
         positionOffsets.dtype == .int32,
@@ -1242,17 +1261,25 @@ private func gemma4FusedQKVNormHeadMajor(
     let rowThreads = dimension / 4
     let rowsPerGroup = 512 / rowThreads
     let groups = (rows + rowsPerGroup - 1) / rowsPerGroup
+    let asymmetricLastQuery = gemma4LastQueryNormRopeEnabled
+        && batch == 8 && lq == 1 && lk > 1 && hq == 16 && hk == 2 && dimension == 512
+        && queryPositionDelta == lk - 1
     let fusedRope = gemma4QKVNormRopeEnabled && applyRope
+        && (queryPositionDelta == 0 || asymmetricLastQuery)
         && ropeParameters.usesFrequencies
         && ropeParameters.frequencies.size == q.dim(3) / 2
-    let outputs = gemma4QKVNormPrefillKernel(
+    let useLastQueryKernel = fusedRope && asymmetricLastQuery
+    var template: [(String, any KernelTemplateArg)] = [
+        ("T", q.dtype), ("D", dimension), ("Q_ROWS", qRows),
+        ("TOTAL_ROWS", rows), ("RPT", rowsPerGroup),
+        ("LQ", lq), ("HQ", hq), ("LK", lk), ("HK", hk),
+        ("APPLY_ROPE", fusedRope),
+    ]
+    if useLastQueryKernel { template.append(("Q_POSITION_DELTA", queryPositionDelta)) }
+    let kernel = useLastQueryKernel ? gemma4LastQueryNormRopeKernel : gemma4QKVNormPrefillKernel
+    let outputs = kernel(
         [q, k, qWeight, kWeight, positionOffsets, ropeParameters.frequencies],
-        template: [
-            ("T", q.dtype), ("D", dimension), ("Q_ROWS", qRows),
-            ("TOTAL_ROWS", rows), ("RPT", rowsPerGroup),
-            ("LQ", lq), ("HQ", hq), ("LK", lk), ("HK", hk),
-            ("APPLY_ROPE", fusedRope),
-        ],
+        template: template,
         grid: (groups * rowsPerGroup * rowThreads, 1, 1),
         threadGroup: (rowsPerGroup * rowThreads, 1, 1),
         outputShapes: [
@@ -1261,6 +1288,7 @@ private func gemma4FusedQKVNormHeadMajor(
         ],
         outputDTypes: [q.dtype, q.dtype, q.dtype]
     )
+    if useLastQueryKernel { CBv2EngageMark.once("lastquery-norm-rope") }
     if fusedRope { CBv2EngageMark.once("qkv-norm-rope-prefill") }
     return (outputs[0], outputs[1], outputs[2], fusedRope)
 }
@@ -2847,7 +2875,9 @@ private class Gemma4Attention: Module {
             q: queryRaw, k: kRaw,
             qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps,
             keyValueShared: vProj == nil, positionOffsets: capturedOffsets,
-            ropeParameters: qkvRopeParameters, applyRope: lastQueryCache == nil)
+            ropeParameters: qkvRopeParameters,
+            applyRope: lastQueryCache == nil || gemma4LastQueryNormRopeEnabled,
+            queryPositionDelta: lastQueryCache == nil ? 0 : outputStart)
         {
             // Written head-major, so the three transposes are already applied.
             (queries, k, v) = (headMajor.q, headMajor.k, headMajor.v)

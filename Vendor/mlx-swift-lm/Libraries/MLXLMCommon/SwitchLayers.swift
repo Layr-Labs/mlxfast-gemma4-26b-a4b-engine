@@ -1553,6 +1553,201 @@ public class SwitchGLU: Module {
         return (storage, contract.groupSize, contract.bits, contract.mode)
     }
 
+    // MARK: - DECODE-GATEUP-FUSE: one dispatch for the decode MoE gate+up pair
+
+    /// Kill switch: `DARKBLOOM_GEMMA4_DECODE_GATEUP_FUSE` set to
+    /// `0`/`false`/`no`/`off` restores the two stock gather-QMV dispatches.
+    /// Default ON. Engage mark: `decode-gateup-fuse`.
+    private let decodeGateUpFuseEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DECODE_GATEUP_FUSE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Loads-only dual-stream mirror of the stock singleton gather-QMV arm
+    /// (`qmv_affine4_g64_singles_impl`, KFIX 2816, WVEC word loads, no
+    /// prefetch, no tail) for the exact B=8/top-8 decode geometry.
+    ///
+    /// Grid MUST be (1, 88, 64) groups of (32, 2, 1): tid.z is the
+    /// assignment (0..63), tid.y the N-tile (0..87) covering 8 outputs each.
+    /// Run formation is intentionally NOT mirrored: the twin's RUN-QUAD
+    /// comment records that pair/triple/quad bodies keep each (output,
+    /// input) pair's own accumulator, K-loop order and qdot, i.e.
+    /// per-element values identical to the singleton arm evaluated here, so
+    /// every assignment runs the singleton-equivalent dual sequence and no
+    /// leader election exists. Each thread loads its x slice ONCE and runs
+    /// the stock gate K-loop then the stock up K-loop with verbatim
+    /// per-element sequences (`load_vector` bits==4 scaling,
+    /// `qdot_affine4_g64_word` with explicit `float()` converts,
+    /// `scale * accum + sum * bias` close, `simd_sum`, lane-0 store), writing
+    /// the gate half and the up half. Halves are bit-identical to the two
+    /// stock dispatches; only loads are shared (one x read instead of two)
+    /// and one dispatch is deleted. Prefix-bounds tags are banned by
+    /// admission (fail-closed); the body decodes raw expert ids only.
+    private let decodeGateUpFuseKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_decode_gateup_fuse_m1_b64_n704_v1",
+            inputNames: [
+                "gate_w", "gate_scales", "gate_biases",
+                "up_w", "up_scales", "up_biases",
+                "x", "lhs", "rhs",
+            ],
+            outputNames: ["y_gate", "y_up"],
+            source: """
+                const uint assignment = threadgroup_position_in_grid.z;
+                const uint ytile = threadgroup_position_in_grid.y;
+                const uint lid = thread_index_in_simdgroup;
+                const uint gid = simdgroup_index_in_threadgroup;
+                const uint out_row = ytile * 8u + gid * 4u;
+                if (out_row >= 704u) { return; }
+                const uint used = out_row < 700u ? out_row : 700u;
+                const uint x_row = (uint)lhs[assignment];
+                const uint expert = (uint)rhs[assignment];
+                // Expert slice bases, hardcoded contiguous pitches from the
+                // admitted shapes ([128,704,352]u32, [128,704,44]bf16).
+                const uint gw_base = expert * 247808u + used * 352u;
+                const uint gs_base = expert * 30976u + used * 44u + lid / 8u;
+                const uint uw_base = expert * 247808u + used * 352u;
+                const uint us_base = expert * 30976u + used * 44u + lid / 8u;
+                const uint x_base = x_row * 2816u + lid * 8u;
+                float xt[8];
+                float rg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                float ru[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                for (uint b = 0u; b < 11u; b++) {
+                    // load_vector bits==4 verbatim: scaled lane packet plus
+                    // the plain sum, shared by both streams (same x).
+                    float sum = 0.0f;
+                    #pragma clang loop unroll(full)
+                    for (uint i = 0u; i < 8u; i += 4u) {
+                        const float v0 = static_cast<float>(x[x_base + b * 256u + i]);
+                        const float v1 = static_cast<float>(x[x_base + b * 256u + i + 1u]);
+                        const float v2 = static_cast<float>(x[x_base + b * 256u + i + 2u]);
+                        const float v3 = static_cast<float>(x[x_base + b * 256u + i + 3u]);
+                        sum += v0 + v1 + v2 + v3;
+                        xt[i] = v0;
+                        xt[i + 1u] = v1 / 16.0f;
+                        xt[i + 2u] = v2 / 256.0f;
+                        xt[i + 3u] = v3 / 4096.0f;
+                    }
+                    #pragma clang loop unroll(full)
+                    for (uint r = 0u; r < 4u; r++) {
+                        // Gate stream: qdot_affine4_g64_word verbatim.
+                        const uint vg = (uint)gate_w[gw_base + b * 32u + r * 352u + lid];
+                        const float sg = static_cast<float>(gate_scales[gs_base + b * 4u + r * 44u]);
+                        const float bg = static_cast<float>(gate_biases[gs_base + b * 4u + r * 44u]);
+                        const uint glo = vg & 0x0000FFFFu;
+                        const uint ghi = vg >> 16;
+                        float ag = 0.0f;
+                        ag += (xt[0] * float(glo & 0x000fu) + xt[1] * float(glo & 0x00f0u)
+                            + xt[2] * float(glo & 0x0f00u) + xt[3] * float(glo & 0xf000u));
+                        ag += (xt[4] * float(ghi & 0x000fu) + xt[5] * float(ghi & 0x00f0u)
+                            + xt[6] * float(ghi & 0x0f00u) + xt[7] * float(ghi & 0xf000u));
+                        rg[r] += sg * ag + sum * bg;
+                        // Up stream: identical sequence on its own slice.
+                        const uint vu = (uint)up_w[uw_base + b * 32u + r * 352u + lid];
+                        const float su = static_cast<float>(up_scales[us_base + b * 4u + r * 44u]);
+                        const float bu = static_cast<float>(up_biases[us_base + b * 4u + r * 44u]);
+                        const uint ulo = vu & 0x0000FFFFu;
+                        const uint uhi = vu >> 16;
+                        float au = 0.0f;
+                        au += (xt[0] * float(ulo & 0x000fu) + xt[1] * float(ulo & 0x00f0u)
+                            + xt[2] * float(ulo & 0x0f00u) + xt[3] * float(ulo & 0xf000u));
+                        au += (xt[4] * float(uhi & 0x000fu) + xt[5] * float(uhi & 0x00f0u)
+                            + xt[6] * float(uhi & 0x0f00u) + xt[7] * float(uhi & 0xf000u));
+                        ru[r] += su * au + sum * bu;
+                    }
+                }
+                #pragma clang loop unroll(full)
+                for (uint r = 0u; r < 4u; r++) {
+                    rg[r] = simd_sum(rg[r]);
+                    ru[r] = simd_sum(ru[r]);
+                    if (lid == 0u) {
+                        y_gate[assignment * 704u + used + r] = static_cast<T>(rg[r]);
+                        y_up[assignment * 704u + used + r] = static_cast<T>(ru[r]);
+                    }
+                }
+            """,
+            ensureRowContiguous: true
+        )
+
+    /// Cached module contract for the fused decode gate/up path: the exact
+    /// production tensor geometry whose hardcoded pitches the kernel above
+    /// assumes. Evaluated once per module, not per forward.
+    private lazy var decodeGateUpFuseEligible: Bool = {
+        guard gateUpProj == nil,
+            let gate = gateProj as? QuantizedSwitchLinear,
+            let up = upProj as? QuantizedSwitchLinear,
+            gate.inputDims == 2816 && gate.outputDims == 704
+                && gate.numExperts == 128
+                && gate.groupSize == 64 && gate.bits == 4
+                && gate.mode == .affine && gate.bias == nil,
+            up.inputDims == 2816 && up.outputDims == 704
+                && up.numExperts == 128
+                && up.groupSize == 64 && up.bits == 4
+                && up.mode == .affine && up.bias == nil,
+            let gateBiases = gate.biases, let upBiases = up.biases,
+            gate.weight.shape == [128, 704, 352]
+                && gate.scales.shape == [128, 704, 44]
+                && gateBiases.shape == [128, 704, 44]
+                && up.weight.shape == [128, 704, 352]
+                && up.scales.shape == [128, 704, 44]
+                && upBiases.shape == [128, 704, 44],
+            gate.weight.dtype == .uint32
+                && gate.scales.dtype == .bfloat16
+                && gateBiases.dtype == .bfloat16
+                && up.weight.dtype == .uint32
+                && up.scales.dtype == .bfloat16
+                && upBiases.dtype == .bfloat16
+        else { return false }
+        return true
+    }()
+
+    /// Fused decode gate/up GEMV. Returns nil (fail-closed to the two stock
+    /// dispatches) unless every geometric, dtype, and tagging condition
+    /// holds: bf16 activations, raw uint32 route tables, no prefix-bounds
+    /// tags, exact decode shapes.
+    /// Grid convention (read `custom_kernel.cpp` before touching this):
+    /// MLX dispatches *threads*, not groups
+    /// (`dispatch_threads(grid, group)`), so the grid tuple below is
+    /// groups-times-group-dims: 1 x-group of 88 N-tiles x 64 assignments,
+    /// each a (32, 2, 1)-thread group. Passing (1, 88, 64) would launch
+    /// 44 y-groups and leave the upper output half unwritten.
+    private func decodeGateUpFused(
+        x: MLXArray,
+        gate: SwitchLinear?,
+        up: SwitchLinear?,
+        lhsIndices: MLXArray?,
+        rhsIndices: MLXArray?,
+        prefixBounds: Bool
+    ) -> (MLXArray, MLXArray)? {
+        guard decodeGateUpFuseEnabled, decodeGateUpFuseEligible,
+            !prefixBounds,
+            let gate = gate as? QuantizedSwitchLinear,
+            let up = up as? QuantizedSwitchLinear,
+            let gateBiases = gate.biases, let upBiases = up.biases,
+            x.shape == [8, 1, 2816], x.dtype == .bfloat16,
+            let lhsIndices, lhsIndices.size == 64,
+            lhsIndices.dtype == .uint32,
+            let rhsIndices, rhsIndices.size == 64,
+            rhsIndices.dtype == .uint32
+        else { return nil }
+        CBv2EngageMark.once("decode-gateup-fuse")
+        let outs = decodeGateUpFuseKernel(
+            [
+                gate.weight, gate.scales, gateBiases,
+                up.weight, up.scales, upBiases,
+                x, lhsIndices, rhsIndices,
+            ],
+            template: [("T", x.dtype)],
+            grid: (32, 176, 64),
+            threadGroup: (32, 2, 1),
+            outputShapes: [[64, 1, 704], [64, 1, 704]],
+            outputDTypes: [.bfloat16, .bfloat16]
+        )
+        return (outs[0], outs[1])
+    }
+
     private func projectExperts(
         _ x: MLXArray, _ indices: MLXArray,
         sortedPlane: SwitchSortedPlaneProducer? = nil,
@@ -1677,6 +1872,16 @@ public class SwitchGLU: Module {
                 x = downProj(
                     activated, idx, lhsIndices: downLhs, sortedIndices: true)
                 return (x, inverseOrder, true)
+            } else if let fusedGateUp = decodeGateUpFused(
+                x: x, gate: gateProj, up: upProj,
+                lhsIndices: lhsIndices, rhsIndices: idx,
+                prefixBounds: useExpertPrefixBounds
+            ) {
+                // DECODE-GATEUP-FUSE: one dispatch streams x once through
+                // the dual gate/up K-loops and writes both halves; the
+                // downstream GeGLU and down projection below are untouched.
+                xGate = fusedGateUp.0
+                xUp = fusedGateUp.1
             } else {
                 xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
                 xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)

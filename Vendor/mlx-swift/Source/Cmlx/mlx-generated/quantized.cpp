@@ -3643,6 +3643,28 @@ template <
 }
 
 template <typename T, int group_size, int bits>
+// GATHER-ZORDER: the two gather_qmv entry points re-derive their work indices from the linear
+// launch position before any other statement runs, so that the gathered-assignment index varies
+// fastest across the grid instead of the output-column tile.
+//
+// EXACTNESS. The dispatch grid is (M, ceil(N/8), B) and the launch position is enumerated with x
+// fastest, so lin = tid.y + tid.z * ceil(N/8) runs over [0, ceil(N/8) * B) exactly once. Rewriting it
+// as (lin / B, lin % B) is a bijection onto the same set of (column tile, assignment) pairs: the same
+// threadgroups run, each carries a pair it carried before, and no pair is dropped or duplicated.
+// gather_qmv writes one output tile per threadgroup from accumulators private to that threadgroup: no
+// threadgroup reads another's result, no threadgroup memory is shared across the grid, and the kernel
+// contains no grid-wide barrier and no atomic, so no output element depends on the order in which the
+// grid is enumerated. The run-length election reads rhs_indices, which is a buffer, not a launch index.
+// Every output element is therefore the same sum of the same products accumulated in the same sequence.
+//
+// The remap is taken only when batch_ndims == 1, where B is batch_shape[0]; every other shape keeps the
+// incumbent index byte for byte. bn is a compile-time 8 at the only dispatch site.
+//
+// Kill switch: DARKBLOOM_GEMMA4_GATHER_ZORDER 0 restores the incumbent index read byte for byte.
+#ifndef DARKBLOOM_GEMMA4_GATHER_ZORDER
+#define DARKBLOOM_GEMMA4_GATHER_ZORDER 1
+#endif
+
 [[kernel]] void affine_gather_qmv_fast(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -3665,9 +3687,20 @@ template <typename T, int group_size, int bits>
     const constant int* batch_shape [[buffer(18)]],
     const constant int64_t* lhs_strides [[buffer(19)]],
     const constant int64_t* rhs_strides [[buffer(20)]],
-    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tid_lin [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
+  uint3 tid = tid_lin;
+#if DARKBLOOM_GEMMA4_GATHER_ZORDER
+  if (batch_ndims == 1) {
+    const uint zo_ntiles = (uint(out_vec_size) + 7u) / 8u;
+    const uint zo_b = uint(batch_shape[0]);
+    if (zo_b > 0u && zo_ntiles > 0u) {
+      const uint zo_lin = tid_lin.y + tid_lin.z * zo_ntiles;
+      tid = uint3(tid_lin.x, zo_lin / zo_b, zo_lin % zo_b);
+    }
+  }
+#endif
   int M = x_shape[x_batch_ndims];
   adjust_matrix_offsets<T>(
       x,
@@ -4043,9 +4076,20 @@ template <typename T, int group_size, int bits>
     const constant int* batch_shape [[buffer(18)]],
     const constant int64_t* lhs_strides [[buffer(19)]],
     const constant int64_t* rhs_strides [[buffer(20)]],
-    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tid_lin [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
+  uint3 tid = tid_lin;
+#if DARKBLOOM_GEMMA4_GATHER_ZORDER
+  if (batch_ndims == 1) {
+    const uint zo_ntiles = (uint(out_vec_size) + 7u) / 8u;
+    const uint zo_b = uint(batch_shape[0]);
+    if (zo_b > 0u && zo_ntiles > 0u) {
+      const uint zo_lin = tid_lin.y + tid_lin.z * zo_ntiles;
+      tid = uint3(tid_lin.x, zo_lin / zo_b, zo_lin % zo_b);
+    }
+  }
+#endif
   int M = x_shape[x_batch_ndims];
   const bool gemma4_pair_geometry =
       group_size == 64 && bits == 4 && M == 1 && batch_ndims == 1 &&

@@ -2525,8 +2525,34 @@ for (int element = 0; element < values_per_lane; ++element) {
             raw.trimmingCharacters(in: .whitespaces).lowercased())
     }()
 
+    /// SLIDE-PAIRED-NIBBLE. DISCLOSED PORT of the decode-side mechanism from
+    /// submission `b9910e88-e416-498c-9d13-2bf5cb8de10f` by `exakoss`
+    /// (commit `7c007056f88afdc45c90dfa293fe655d32ad29cc`, parent
+    /// `58b251df`). Only that submission's
+    /// `RaggedTwoPassDecodeAttentionV1.swift` delta is taken here; its
+    /// `ComposedPrefillSDPAV1.swift` host micro is not.
+    ///
+    /// Decode-only paired nibble conversion for the active affine-fold walk.
+    /// Two 4-bit codes are expanded at once: OR the pair into the mantissa of
+    /// `half(1024)` (`0x6400`) and subtract `1024`, which is exact for every
+    /// code in `0 ... 15` because a half's ULP at 1024 is exactly one. The
+    /// resulting float codes are consumed in the incumbent `0 ... 7` element
+    /// order, so the accumulation order and every rounding step are unchanged.
+    /// The disabled arm preserves the accepted source generation byte for byte.
+    static let slidingPairedNibbleEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_SLIDE_PAIRED_NIBBLE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
     private static var slidingAffineFoldActive: Bool {
         slidingSoftRefMode == 2 && slidingAffineFoldEnabled
+    }
+
+    private static var slidingPairedNibbleActive: Bool {
+        slidingAffineFoldActive && slidingPairedNibbleEnabled
     }
 
     /// Prologue constants the fold needs: the per-lane query sum for each of
@@ -2597,6 +2623,59 @@ for (int element = 0; element < values_per_lane; ++element) {
 }
 """
 
+    /// Each half2 encodes nibbles (p, p + 4). OR with half 1024, then
+    /// subtract half 1024, converts both 4-bit integers exactly. The second
+    /// loop consumes the resulting float codes in the incumbent 0...7 order.
+    private static let slidingAffineFoldPairedScoreBlock = """
+float score_lo = 0.0f;
+float score_hi = 0.0f;
+float key_code_el[values_per_lane];
+#pragma clang loop unroll(full)
+for (int p = 0; p < values_per_lane / 2; ++p) {
+    const half2 nib = as_type<half2>(
+        (((kw >> (4 * p)) & 0xfu)
+         | (((kw >> (4 * p + 16)) & 0xfu) << 16))
+        | 0x64006400u) - half2(1024.0h, 1024.0h);
+    key_code_el[p] = float(nib.x);
+    key_code_el[p + values_per_lane / 2] = float(nib.y);
+}
+#pragma clang loop unroll(full)
+for (int element = 0; element < values_per_lane; ++element) {
+    const float key_code = key_code_el[element];
+    score_lo += q_lo[element] * key_code;
+    score_hi += q_hi[element] * key_code;
+}
+score_lo = fma(ks, score_lo, kb * qsum_lo);
+score_hi = fma(ks, score_hi, kb * qsum_hi);
+"""
+
+    private static let slidingAffineFoldPairedStepBlock = """
+const float weight_lo = fast::exp(min(score_lo - max_lo, 60.0f));
+const float weight_hi = fast::exp(min(score_hi - max_hi, 60.0f));
+sum_lo += weight_lo;
+sum_hi += weight_hi;
+const float value_scale_lo = weight_lo * vs;
+const float value_scale_hi = weight_hi * vs;
+vbias_lo = fma(weight_lo, vb, vbias_lo);
+vbias_hi = fma(weight_hi, vb, vbias_hi);
+float value_code_el[values_per_lane];
+#pragma clang loop unroll(full)
+for (int p = 0; p < values_per_lane / 2; ++p) {
+    const half2 nib = as_type<half2>(
+        (((vw >> (4 * p)) & 0xfu)
+         | (((vw >> (4 * p + 16)) & 0xfu) << 16))
+        | 0x64006400u) - half2(1024.0h, 1024.0h);
+    value_code_el[p] = float(nib.x);
+    value_code_el[p + values_per_lane / 2] = float(nib.y);
+}
+#pragma clang loop unroll(full)
+for (int element = 0; element < values_per_lane; ++element) {
+    const float value_code = value_code_el[element];
+    acc_lo[element] = fma(value_scale_lo, value_code, acc_lo[element]);
+    acc_hi[element] = fma(value_scale_hi, value_code, acc_hi[element]);
+}
+"""
+
     private static let slidingSoftRefFixedBlock = """
 const float weight_lo = fast::exp(min(score_lo - max_lo, 60.0f));
 const float weight_hi = fast::exp(min(score_hi - max_hi, 60.0f));
@@ -2620,7 +2699,9 @@ for (int element = 0; element < values_per_lane; ++element) {
         let block = slidingSoftRefIncumbentBlock
         let replacement = (
             slidingAffineFoldActive
-                ? slidingAffineFoldStepBlock
+                ? (slidingPairedNibbleActive
+                    ? slidingAffineFoldPairedStepBlock
+                    : slidingAffineFoldStepBlock)
                 : (slidingSoftRefMode == 2
                     ? slidingSoftRefFixedBlock
                     : slidingSoftRefBlock))
@@ -2654,7 +2735,10 @@ for (int element = 0; element < values_per_lane; ++element) {
             return (lines.joined(separator: "\n"), applied)
         }
         let score = slidingAffineFoldIncumbentScore
-        let scoreBody = slidingAffineFoldScoreBlock
+        let scoreBody = (
+            slidingPairedNibbleActive
+                ? slidingAffineFoldPairedScoreBlock
+                : slidingAffineFoldScoreBlock)
             .components(separatedBy: "\n")
             .filter { !$0.isEmpty }
         var scoreIndex = 0
@@ -2711,7 +2795,8 @@ for (int element = 0; element < values_per_lane; ++element) {
     private static let slidingSoftRefKey: String = {
         guard slidingSoftRefWalks.applied else { return "" }
         if slidingSoftRefMode == 2 {
-            return slidingAffineFoldActive ? "_sr2_af1" : "_sr2"
+            let base = slidingAffineFoldActive ? "_sr2_af1" : "_sr2"
+            return slidingPairedNibbleActive ? base + "_pn1" : base
         }
         return slidingSoftRefSpan == 32
             ? "_sr1"
@@ -3733,6 +3818,9 @@ for (int element = 0; element < values_per_lane; ++element) {
                     CBv2EngageMark.once("sliding-softmax-ref")
                     if slidingAffineFoldActive {
                         CBv2EngageMark.once("sliding-affine-fold")
+                        if slidingPairedNibbleActive {
+                            CBv2EngageMark.once("sliding-paired-nibble")
+                        }
                     }
                 }
                 return (resident[0], resident[1])

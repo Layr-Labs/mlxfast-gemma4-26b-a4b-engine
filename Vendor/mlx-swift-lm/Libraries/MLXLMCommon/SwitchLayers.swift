@@ -1309,6 +1309,50 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
 /// `0`/`false`/`no`/`off` leaves the split arrays as loaded and restores the
 /// two split gathers. Engage marks: `prefill-gateup-fuse` and
 /// `prefill-gateup-gelu-epilogue`.
+/// EGU-V3. The decode-side fold of the routed-expert GeGLU into the fused
+/// gate|up gather epilogue.
+///
+/// Incumbent decode chain, per MoE layer, per step: two `gather_qmv`
+/// dispatches over the split `[128, 704, 352]` gate and up planes (each
+/// re-reading the eight-row cohort activation and re-walking the same 64
+/// sorted assignments), a `[64, 1, 704]` bfloat16 gate plane and up plane
+/// written to device memory, then a third compiled elementwise dispatch
+/// (`compiledGeGLUShaped`) that reads both back to produce the activation the
+/// down gather consumes. This arm issues ONE `gather_qmv` over the paired16
+/// `[128, 1408, 352]` gate|up plane already built at load time for the prefill
+/// arm, and closes `geluApprox(gate) * up` inside that kernel's store
+/// epilogue. The second gather and the whole GeGLU dispatch disappear, and the
+/// two intermediate planes never reach device memory.
+///
+/// Exactness. The paired16 plane is a pure row permutation of the two split
+/// planes -- the same frozen quantized bytes, scales and biases, nothing
+/// re-quantized or re-represented. Under the kernel's `GEGLU` arm a simdgroup
+/// owns physical rows {0, 1, 16, 17} off its base instead of {0, 1, 2, 3}:
+/// two adjacent gate columns and their two matching up columns. Every output
+/// column therefore keeps its own accumulator, its own K-loop order, its own
+/// per-group affine dequant and its own `simd_sum`, identical to the split
+/// gather that produced it. Each accumulator is rounded to bfloat16 at exactly
+/// the boundary the split gathers stored at, and the epilogue then runs
+/// `gemma4_geglu_compiled_tape` -- the typed tape that reproduces every
+/// bfloat16 temporary of `compiledGeGLU`, already validated by the prefill
+/// epilogue -- and stores one bfloat16.
+///
+/// Routing. Admitted only at the exact decode geometry: sorted, cohort
+/// left-hand indices of 64 assignments over 128 experts, K = 2816, hidden
+/// 704, bfloat16, GeGLU activation, and the paired storage present. Prefill,
+/// speculative verification and every other SwitchGLU keep their incumbent
+/// paths.
+///
+/// Kill switch: `DARKBLOOM_GEMMA4_DECODE_GATEUP_GEGLU` set to
+/// `0`/`false`/`no`/`off` restores the two split decode gathers and the
+/// standalone GeGLU dispatch. Engage mark: `egu-v3-decode-gateup-geglu`.
+public let switchGateUpGeGLUDecodeEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DECODE_GATEUP_GEGLU"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 public let switchGateUpFusePrefillEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_PREFILL_GATEUP_FUSE"]
@@ -1639,6 +1683,45 @@ public class SwitchGLU: Module {
         } else {
             guard let gateProj, let upProj else {
                 preconditionFailure("SwitchGLU requires gate_up_proj or gate_proj/up_proj")
+            }
+            // EGU-V3: one fused gate|up gather that closes the GeGLU in its
+            // own store epilogue, for the eight-row decode cohort. See
+            // `switchGateUpGeGLUDecodeEnabled` for the exactness argument.
+            if switchGateUpGeGLUDecodeEnabled,
+                doSort, useLhsIndices,
+                let decodeLhs = lhsIndices,
+                decodeLhs.ndim == 1, decodeLhs.size == 64,
+                idx.ndim == 1, idx.size == 64,
+                inputDims == 2816, hiddenDims == 704, numExperts == 128,
+                isGeluActivation, activationProduct == nil,
+                x.ndim == 3, x.dim(-2) == 1, x.dim(-1) == inputDims,
+                x.dtype == .bfloat16,
+                let fusedDecode = fusedGateUpDispatch(),
+                fusedDecode.groupSize == 64, fusedDecode.bits == 4,
+                fusedDecode.mode == .affine
+            {
+                CBv2EngageMark.once("egu-v3-decode-gateup-geglu")
+                let xGateUp = MLX.gatherQuantizedMM(
+                    x,
+                    fusedDecode.storage.weight,
+                    scales: fusedDecode.storage.scales,
+                    biases: fusedDecode.storage.biases,
+                    lhsIndices: decodeLhs,
+                    rhsIndices: idx,
+                    transpose: true,
+                    groupSize: fusedDecode.groupSize,
+                    bits: fusedDecode.bits,
+                    mode: fusedDecode.mode,
+                    sortedIndices: true
+                )
+                // The epilogue stores the compact [64, 1, 704] GeGLU plane in
+                // the first physical half of the [64, 1, 1408] allocation.
+                let activated = xGateUp.flattened()[..<(xGateUp.size / 2)]
+                    .reshaped(64, 1, hiddenDims)
+                x = downProj(
+                    activated, idx, lhsIndices: switchDownIdentity64,
+                    sortedIndices: true)
+                return (x, inverseOrder, true)
             }
             // GATEUP-FUSE-PREFILL: the sorted right-hand-side plane (the
             // production prefill) reads its gathered activations once through

@@ -212,9 +212,21 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         public let normalizedValues: MLXArray?
     }
 
+    private static let residentProductsSlotEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_RESIDENT_PRODUCTS_SLOT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let residentProductsLock = NSLock()
+    /// The producer publishes one product bundle and Gemma consumes it before
+    /// the next layer can publish. A keyed single slot preserves the identity
+    /// check without allocating or hashing a Dictionary entry on every decode
+    /// handoff. A mismatched entry is never consumed by the wrong output, and
+    /// the next synchronous publication bounds any stale carrier to one bundle.
     nonisolated(unsafe) private static var residentProducts:
-        [ObjectIdentifier: ResidentProducts] = [:]
+        (output: ObjectIdentifier, products: ResidentProducts)? = nil
 
     /// Shared with the D=512 chain (`CBv2RaggedComposedD512DecodeAttentionV1`),
     /// whose NORMROPE-D512 / ORS-D512 folds publish through the same carrier.
@@ -222,14 +234,13 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     fileprivate static func publishResidentProducts(
         _ products: ResidentProducts, for output: MLXArray
     ) {
+        guard residentProductsSlotEnabled else { return }
         residentProductsLock.lock()
-        // The intended consumer takes the entry synchronously. Keep misuse or
-        // old call sites bounded without retaining an unbounded lazy graph.
-        if residentProducts.count >= 64 {
-            residentProducts.removeAll(keepingCapacity: true)
-        }
-        residentProducts[ObjectIdentifier(output)] = products
+        residentProducts = (
+            output: ObjectIdentifier(output),
+            products: products)
         residentProductsLock.unlock()
+        CBv2EngageMark.once("resident-products-single-slot")
     }
 
     /// Consume the extra outputs associated with this exact attention array.
@@ -238,8 +249,19 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// the same consumer branch as the parity-proven F4-on/F2-off state.
     @inline(__always)
     public static func takeResidentProducts(for output: MLXArray) -> ResidentProducts? {
+        guard residentProductsSlotEnabled else {
+            return ResidentProducts(
+                runsumTable: nil, normalizedKeys: nil, normalizedValues: nil)
+        }
         residentProductsLock.lock()
-        let products = residentProducts.removeValue(forKey: ObjectIdentifier(output))
+        let outputID = ObjectIdentifier(output)
+        let products: ResidentProducts?
+        if let entry = residentProducts, entry.output == outputID {
+            products = entry.products
+            residentProducts = nil
+        } else {
+            products = nil
+        }
         residentProductsLock.unlock()
         // The F4 kill switch is also a hard consumer-side barrier. Even if a
         // future call-site ordering bug leaves a carrier behind, OFF cannot

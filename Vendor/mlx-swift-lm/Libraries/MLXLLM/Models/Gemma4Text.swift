@@ -6451,6 +6451,17 @@ enum Gemma4FusedScaledEmbedding {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// EMB-RS0-001. Default ON. The independent switch restores the exact
+    /// two-dispatch decode chain (scaled embedding, then layer-zero input
+    /// norm/run-sum) without disabling the established embedding fusion for
+    /// any other geometry.
+    static let inputNormRunsumEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_EMBED_INPUT_NORM_RS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// This checkpoint's embedding quantization. Anything else fails closed.
     private static let groupSize = 64
     private static let bits = 4
@@ -6499,6 +6510,147 @@ enum Gemma4FusedScaledEmbedding {
             """,
         ensureRowContiguous: true
     )
+
+    /// EMB-RS0-001: at the exact live CBv2 decode cell, layer zero otherwise
+    /// follows the scaled embedding immediately with
+    /// `inputNormWithQKVRunsum`. Use that norm kernel's 704x4 ownership here,
+    /// dequantize the four input values into registers, and publish all three
+    /// products in one dispatch: the materialized residual, its layer-zero
+    /// input norm, and the affine-QMV run-sum table.
+    private static let inputNormRunsumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_scaled_embedding_input_norm_qkv_rs_b8_2816_bf16_v1",
+        inputNames: ["tokens", "w", "scales", "biases", "embed_scale", "norm_w"],
+        outputNames: ["hidden", "normed", "qkv_rs"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_sums[32];
+
+            // Match rms_single_row<T, 4>: one logical thread owns four
+            // adjacent hidden values. Two adjacent logical threads share one
+            // affine-4 packed word but consume disjoint nibble halves.
+            const uint base = row * 2816u + lid * 4u;
+            const uint word_col = lid >> 1;
+            const uint code_base = (lid & 1u) << 2;
+            const int raw_token = tokens[row];
+            const int vocab = w_shape[0];
+            const size_t token = size_t(
+                raw_token < 0 ? raw_token + vocab : raw_token);
+            const uint packed = w[token * 352u + size_t(word_col)];
+            const size_t gindex = token * 44u + size_t(lid >> 4);
+            const T scale = scales[gindex];
+            const T bias = biases[gindex];
+            const T es = embed_scale;
+
+            T hiddenv[4];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 4; ++i) {
+                const uint8_t d =
+                    (packed >> (4u * (code_base + uint(i)))) & 0x0f;
+                // Preserve both stock BF16 boundaries in their original order.
+                const T dequantized = scale * d + bias;
+                hiddenv[i] = dequantized * es;
+                hidden[base + uint(i)] = hiddenv[i];
+            }
+
+            // Exact active inputNormWithQKVRunsum tree: four ordered squares,
+            // one SIMD reduction, the same 22 populated cross-SIMD lanes, and
+            // precise rsqrt. Every SIMD group repeats the final deterministic
+            // combine, which is the existing one-barrier broadcast form.
+            float acc = 0.0f;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 4; ++i) {
+                const float xi = float(hiddenv[i]);
+                acc += xi * xi;
+            }
+            acc = simd_sum(acc);
+            if (simd_lane_id == 0) {
+                local_sums[simd_group_id] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            acc = simd_sum(
+                simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
+            const float inv = metal::precise::rsqrt(
+                acc / 2816.0f + 1e-06f);
+
+            T normedv[4];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 4; ++i) {
+                normedv[i] = norm_w[lid * 4u + uint(i)]
+                    * static_cast<T>(float(hiddenv[i]) * inv);
+                normed[base + uint(i)] = normedv[i];
+            }
+
+            // Byte-for-byte arithmetic/order of qkvRunsumEpilogue(normedv).
+            float qkv_sum = 0.0f;
+            qkv_sum += normedv[0] + normedv[1] + normedv[2] + normedv[3];
+            qkv_sum += simd_shuffle_xor(qkv_sum, 1u);
+            qkv_sum += simd_shuffle_xor(qkv_sum, 2u);
+            qkv_sum += simd_shuffle_xor(qkv_sum, 4u);
+            qkv_sum += simd_shuffle_xor(qkv_sum, 8u);
+            if ((lid & 15u) == 0u) {
+                qkv_rs[row * 44u + lid / 16u] = qkv_sum;
+            }
+            """,
+        ensureRowContiguous: true
+    )
+
+    /// Returns nil unless every target-specific pin holds. The caller then
+    /// evaluates the established scaled-embedding and layer-zero norm/RS chain.
+    static func applyWithInputNormRunsum(
+        tokens: MLXArray,
+        embedding: Embedding,
+        embedScale: Float,
+        hiddenSize: Int,
+        inputNormWeight: MLXArray,
+        eps: Float
+    ) -> (hidden: MLXArray, normed: MLXArray, qkvRunsumTable: MLXArray)? {
+        guard enabled, decodeEnabled, inputNormRunsumEnabled,
+            CBv2AttentionQKVMMA8V1.rsPrepassEnabled,
+            tokens.dtype == .int32,
+            tokens.shape == [8, 1],
+            hiddenSize == 2816,
+            embedScale == Float(hiddenSize).squareRoot(),
+            eps == 1e-6,
+            inputNormWeight.dtype == .bfloat16,
+            inputNormWeight.shape == [hiddenSize],
+            let quantized = embedding as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            quantized.bits == bits,
+            quantized.groupSize == groupSize,
+            let biases = quantized.biases
+        else { return nil }
+
+        let weight = quantized.weight
+        let scales = quantized.scales
+        guard weight.dtype == .uint32,
+            weight.ndim == 2,
+            weight.dim(1) == hiddenSize / codesPerWord,
+            scales.dtype == .bfloat16,
+            scales.shape == [weight.dim(0), hiddenSize / groupSize],
+            biases.dtype == .bfloat16,
+            biases.shape == scales.shape
+        else { return nil }
+
+        let outputs = inputNormRunsumKernel(
+            [
+                tokens, weight, scales, biases,
+                embedScale.asMLXArray(dtype: .bfloat16), inputNormWeight,
+            ],
+            template: [("T", DType.bfloat16)],
+            grid: (8 * 704, 1, 1),
+            threadGroup: (704, 1, 1),
+            outputShapes: [[8, 1, hiddenSize], [8, 1, hiddenSize], [8, hiddenSize / groupSize]],
+            outputDTypes: [.bfloat16, .bfloat16, .float32]
+        )
+        guard let table = CBv2AttentionQKVMMA8V1.runsumTable(
+            produced: outputs[2], for: outputs[1])
+        else { return nil }
+        CBv2EngageMark.once("scaled-embedding-input-norm-rs")
+        return (outputs[0], outputs[1], table)
+    }
 
     /// Returns the scaled hidden state, or `nil` when any pin fails — the
     /// caller then evaluates the pre-existing expression unchanged.
@@ -6886,6 +7038,25 @@ public class Gemma4TextModelInner: Module {
         // policy check while the host is building the decode graph.
         let inputBatchSize = inputs.dim(0)
         let inputLength = inputs.dim(1)
+        // Resolve the cache layout before building the embedding graph so the
+        // EMB-RS0-001 producer can use the existing CBv2 semantic gate without
+        // adding a second cache scan to each decode forward.
+        var fullCache: [KVCache?]
+        if let cache {
+            fullCache = cache.map { Optional($0) }
+            while fullCache.count < config.numHiddenLayers {
+                fullCache.append(nil)
+            }
+        } else {
+            fullCache = Array(repeating: nil, count: config.numHiddenLayers)
+        }
+        // CBv2 caches own attention and masking. Legacy/direct B8 forwards must
+        // retain their established embedding graph despite matching the shape.
+        let isCBv2 = fullCache.contains {
+            ($0 as? (any CBv2AttendingLayerCache)) != nil
+        }
+        var layerZeroInputCarry:
+            (source: MLXArray, normed: MLXArray, rs: MLXArray?)? = nil
 
         // Vision prefill (mirrors the inline VLM twin `TextModel.callAsFunction`):
         // `inputEmbedding` — the scaled text embeddings with image soft-token
@@ -6895,15 +7066,26 @@ public class Gemma4TextModelInner: Module {
         var h: MLXArray
         if let inputEmbedding {
             h = inputEmbedding.ndim == 2 ? inputEmbedding.expandedDimensions(axis: 0) : inputEmbedding
+        } else if isCBv2, let firstLayer = layers.first,
+            let fused = Gemma4FusedScaledEmbedding.applyWithInputNormRunsum(
+                tokens: inputs,
+                embedding: embedTokens,
+                embedScale: embedScale,
+                hiddenSize: config.hiddenSize,
+                inputNormWeight: firstLayer.inputLayernorm.weight,
+                eps: config.rmsNormEps)
+        {
+            h = fused.hidden
+            layerZeroInputCarry = (
+                source: fused.hidden, normed: fused.normed,
+                rs: fused.qkvRunsumTable)
+        } else if let fused = Gemma4FusedScaledEmbedding.apply(
+            tokens: inputs, embedding: embedTokens, embedScale: embedScale,
+            hiddenSize: config.hiddenSize)
+        {
+            h = fused
         } else {
-            if let fused = Gemma4FusedScaledEmbedding.apply(
-                tokens: inputs, embedding: embedTokens, embedScale: embedScale,
-                hiddenSize: config.hiddenSize)
-            {
-                h = fused
-            } else {
-                h = embedTokens(inputs) * embedScale
-            }
+            h = embedTokens(inputs) * embedScale
         }
 
         // Compute per-layer inputs (PLE)
@@ -6940,22 +7122,6 @@ public class Gemma4TextModelInner: Module {
             perLayerInputs = Array(repeating: nil, count: config.numHiddenLayers)
         }
 
-        // Extend cache array for shared layers (which get nil caches)
-        var fullCache: [KVCache?]
-        if let cache {
-            fullCache = cache.map { Optional($0) }
-            while fullCache.count < config.numHiddenLayers {
-                fullCache.append(nil)
-            }
-        } else {
-            fullCache = Array(repeating: nil, count: config.numHiddenLayers)
-        }
-
-        // ContinuousBatchingV2 detection: v2 layer caches own attention AND
-        // masking, so the trunk builds no masks at all on that path (there is
-        // no padding and no shared frontier to mask). In v2 mode every layer
-        // (including KV-shared ones) has a cache object.
-        let isCBv2 = fullCache.contains { ($0 as? (any CBv2AttendingLayerCache)) != nil }
         // All-contiguous banks expose one position chain. Snapshot it before
         // the first layer advances the chain, then reuse that same lazy array
         // for every Q/K RoPE call in this forward.
@@ -7012,8 +7178,11 @@ public class Gemma4TextModelInner: Module {
             repeating: (nil, nil), count: config.numHiddenLayers)
 
         // GLUE-003: one chain box per forward; layer L's fused tail hands
-        // layer L+1 its input norm through it.
+        // layer L+1 its input norm through it. EMB-RS0-001 seeds the same
+        // identity-checked carrier for layer zero when its embedding producer
+        // already emitted the exact norm and run-sum table.
         let glueChain = Gemma4GlueChainBox()
+        glueChain.pending = layerZeroInputCarry
         for (idx, layer) in layers.enumerated() {
             let prevIdx = previousKvs[idx]
             let sharedKV = intermediates[prevIdx].kv

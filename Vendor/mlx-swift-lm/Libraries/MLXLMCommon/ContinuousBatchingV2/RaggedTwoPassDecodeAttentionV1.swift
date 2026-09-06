@@ -100,9 +100,16 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         let ropeInverseFrequencies: MLXArray?
     }
 
+    private static let residentNormRopeSlotEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_RESIDENT_NORM_ROPE_SLOT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let residentNormRopeLock = NSLock()
     nonisolated(unsafe) private static var residentNormRopeInputs:
-        [ObjectIdentifier: ResidentNormRopeInputs] = [:]
+        (queries: ObjectIdentifier, inputs: ResidentNormRopeInputs)? = nil
 
     /// Register the raw producer inputs behind an already-built exact
     /// norm+RoPE fallback. The fallback arrays remain what the generic cache
@@ -124,7 +131,8 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         eps: Float,
         appliedRope: Bool
     ) -> Bool {
-        guard q4ResidentNormRopeEnabled,
+        guard residentNormRopeSlotEnabled,
+            q4ResidentNormRopeEnabled,
             appliedRope,
             eps == 1.0e-6,
             enabled,
@@ -167,11 +175,9 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         }
 
         residentNormRopeLock.lock()
-        if residentNormRopeInputs.count >= 64 {
-            residentNormRopeInputs.removeAll(keepingCapacity: true)
-        }
-        residentNormRopeInputs[ObjectIdentifier(normalizedQueries)] =
-            ResidentNormRopeInputs(
+        residentNormRopeInputs = (
+            queries: ObjectIdentifier(normalizedQueries),
+            inputs: ResidentNormRopeInputs(
                 normalizedKeys: ObjectIdentifier(normalizedKeys),
                 normalizedValues: ObjectIdentifier(normalizedValues),
                 rawQueries: rawQueries,
@@ -181,7 +187,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 kWeight: kWeight,
                 positionOffsets: positionOffsets,
                 ropeLog2Base: ropeLog2Base,
-                ropeInverseFrequencies: ropeInverseFrequencies)
+                ropeInverseFrequencies: ropeInverseFrequencies))
         residentNormRopeLock.unlock()
         return true
     }
@@ -190,9 +196,16 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static func takeResidentNormRope(
         queries: MLXArray, keys: MLXArray, values: MLXArray
     ) -> ResidentNormRopeInputs? {
+        guard residentNormRopeSlotEnabled else { return nil }
         residentNormRopeLock.lock()
-        let inputs = residentNormRopeInputs.removeValue(
-            forKey: ObjectIdentifier(queries))
+        let queryID = ObjectIdentifier(queries)
+        let inputs: ResidentNormRopeInputs?
+        if let entry = residentNormRopeInputs, entry.queries == queryID {
+            inputs = entry.inputs
+            residentNormRopeInputs = nil
+        } else {
+            inputs = nil
+        }
         residentNormRopeLock.unlock()
         guard let inputs,
             inputs.normalizedKeys == ObjectIdentifier(keys),
@@ -212,9 +225,16 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         public let normalizedValues: MLXArray?
     }
 
+    private static let residentProductsSlotEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_RESIDENT_PRODUCTS_SLOT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let residentProductsLock = NSLock()
     nonisolated(unsafe) private static var residentProducts:
-        [ObjectIdentifier: ResidentProducts] = [:]
+        (output: ObjectIdentifier, products: ResidentProducts)? = nil
 
     /// Shared with the D=512 chain (`CBv2RaggedComposedD512DecodeAttentionV1`),
     /// whose NORMROPE-D512 / ORS-D512 folds publish through the same carrier.
@@ -222,13 +242,11 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     fileprivate static func publishResidentProducts(
         _ products: ResidentProducts, for output: MLXArray
     ) {
+        guard residentProductsSlotEnabled else { return }
         residentProductsLock.lock()
-        // The intended consumer takes the entry synchronously. Keep misuse or
-        // old call sites bounded without retaining an unbounded lazy graph.
-        if residentProducts.count >= 64 {
-            residentProducts.removeAll(keepingCapacity: true)
-        }
-        residentProducts[ObjectIdentifier(output)] = products
+        residentProducts = (
+            output: ObjectIdentifier(output),
+            products: products)
         residentProductsLock.unlock()
     }
 
@@ -238,8 +256,19 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// the same consumer branch as the parity-proven F4-on/F2-off state.
     @inline(__always)
     public static func takeResidentProducts(for output: MLXArray) -> ResidentProducts? {
+        guard residentProductsSlotEnabled else {
+            return ResidentProducts(
+                runsumTable: nil, normalizedKeys: nil, normalizedValues: nil)
+        }
         residentProductsLock.lock()
-        let products = residentProducts.removeValue(forKey: ObjectIdentifier(output))
+        let outputID = ObjectIdentifier(output)
+        let products: ResidentProducts?
+        if let entry = residentProducts, entry.output == outputID {
+            products = entry.products
+            residentProducts = nil
+        } else {
+            products = nil
+        }
         residentProductsLock.unlock()
         // The F4 kill switch is also a hard consumer-side barrier. Even if a
         // future call-site ordering bug leaves a carrier behind, OFF cannot
@@ -4315,9 +4344,16 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let ropeFrequencies: MLXArray
     }
 
+    private static let fullNormRopeSlotEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_FULL_NORM_ROPE_SLOT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let fullNormRopeLock = NSLock()
     nonisolated(unsafe) private static var fullNormRopeInputs:
-        [ObjectIdentifier: FullNormRopeInputs] = [:]
+        FullNormRopeInputs? = nil
 
     /// NORMROPE-D512: register the raw full-attention decode projections
     /// behind the already-built exact norm+RoPE arrays. The fallback arrays
@@ -4341,7 +4377,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         eps: Float,
         appliedRope: Bool
     ) -> Bool {
-        guard normRopeFoldEnabled,
+        guard fullNormRopeSlotEnabled,
+            normRopeFoldEnabled,
             enabled,
             storeDispatchEnabled,
             appliedRope,
@@ -4368,11 +4405,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         else { return false }
 
         fullNormRopeLock.lock()
-        if fullNormRopeInputs.count >= 64 {
-            fullNormRopeInputs.removeAll(keepingCapacity: true)
-        }
-        fullNormRopeInputs[ObjectIdentifier(normalizedQueries)] =
-            FullNormRopeInputs(
+        fullNormRopeInputs = FullNormRopeInputs(
                 normalizedQueries: normalizedQueries,
                 normalizedKeys: normalizedKeys,
                 normalizedValues: normalizedValues,
@@ -4390,9 +4423,15 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     private static func takeFullNormRope(
         queries: MLXArray, keys: MLXArray, values: MLXArray
     ) -> FullNormRopeInputs? {
+        guard fullNormRopeSlotEnabled else { return nil }
         fullNormRopeLock.lock()
-        let inputs = fullNormRopeInputs.removeValue(
-            forKey: ObjectIdentifier(queries))
+        let inputs: FullNormRopeInputs?
+        if let entry = fullNormRopeInputs, entry.normalizedQueries === queries {
+            inputs = entry
+            fullNormRopeInputs = nil
+        } else {
+            inputs = nil
+        }
         fullNormRopeLock.unlock()
         guard let inputs,
             inputs.normalizedQueries === queries,

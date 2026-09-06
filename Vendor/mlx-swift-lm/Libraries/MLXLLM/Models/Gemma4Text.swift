@@ -6703,6 +6703,193 @@ enum Gemma4FusedScaledEmbedding {
     }
 }
 
+/// PREFILL-EMB-NORM-001: the strict production prefill entry rectangle can
+/// produce the scaled embedding and layer 0 input RMSNorm in one dispatch.
+/// The word thread keeps the two EMB-001 bf16 boundaries, then stages the two
+/// four-value square sums which the stock 704 logical RMS threads would own.
+/// Replaying those staged values as 22 ordered SIMD trees plus the stock
+/// 32-slot final tree makes the second output bit-identical to
+/// `layers[0].inputLayernorm(hidden)`.
+enum Gemma4PrefillEmbeddingFirstNorm {
+    /// Default ON. A false value falls through to the exact incumbent EMB-001 path.
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_EMBED_FIRST_NORM"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let batch = 8
+    private static let length = 1024
+    private static let axis = 2816
+    private static let groupSize = 64
+    private static let bits = 4
+    private static let codesPerWord = 8
+    private static let wordsPerGroup = 8
+    private static let wordsPerRow = axis / codesPerWord
+    private static let stockThreads = axis / 4
+    private static let physicalSIMDGroups = wordsPerRow / 32
+    private static let stockSIMDGroups = stockThreads / 32
+    private static let eps: Float = 1e-6
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_embed_first_norm_affine4_g64_b8_l1024_bf16_v1",
+        inputNames: [
+            "tokens", "w", "scales", "biases", "embed_scale", "norm_weight",
+        ],
+        outputNames: ["hidden", "normed"],
+        source: """
+            const uint word = thread_position_in_threadgroup.x;
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lane = thread_index_in_simdgroup;
+            const uint physical_simd_group = simdgroup_index_in_threadgroup;
+
+            // One physical thread owns one packed word. Its two ordered groups
+            // of four are the exact values owned by stock virtual lids 2*word
+            // and 2*word+1 in rms_single_row<T, 4>.
+            const int raw_token = tokens[row];
+            const int vocab = w_shape[0];
+            const size_t token = size_t(
+                raw_token < 0 ? raw_token + vocab : raw_token);
+            const uint packed = w[
+                token * size_t(352) + size_t(word)];
+            const size_t group_index =
+                token * size_t(352 >> 3)
+                + size_t(word >> 3);
+
+            T scale = scales[group_index];
+            T bias = biases[group_index];
+            T embedding_scale = embed_scale;
+            T hidden_values[8];
+
+            // The staging slab is in stock virtual-lid order. It lets 352 word
+            // threads replay the same 704-thread reduction without changing a
+            // single four-square accumulation or SIMD-tree membership.
+            threadgroup float virtual_acc[704];
+            threadgroup float local_sums[32];
+            threadgroup float local_inv[1];
+
+            #pragma clang loop unroll(full)
+            for (int half_index = 0; half_index < 2; ++half_index) {
+                float acc = 0.0f;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    const int i = half_index * 4 + j;
+                    const uint8_t d = (packed >> (4 * i)) & 0x0f;
+                    // EMB-001 boundary 1: affine_dequantize stores T here.
+                    const T dequantized = scale * d + bias;
+                    // EMB-001 boundary 2: stock scalar is already T here.
+                    const T value = dequantized * embedding_scale;
+                    hidden_values[i] = value;
+                    const float xi = (float)value;
+                    acc += xi * xi;
+                }
+                virtual_acc[word * 2 + uint(half_index)] = acc;
+            }
+            if (word < 32) {
+                local_sums[word] = 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // 352 is exactly eleven SIMD groups. The first tree pass covers
+            // stock virtual lids 0...351; the second covers 352...703. Thus
+            // slots 0...21 match the stock 22 SIMD trees in the same order.
+            float first_tree = simd_sum(virtual_acc[word]);
+            float second_tree = simd_sum(virtual_acc[word + 352]);
+            if (lane == 0) {
+                local_sums[physical_simd_group] = first_tree;
+                local_sums[physical_simd_group + 11] = second_tree;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Stock publishes the first 22 partials and zeroes the unused
+            // tail, then has SIMD group zero perform this final 32-lane tree.
+            if (physical_simd_group == 0) {
+                float total = simd_sum(local_sums[lane]);
+                if (lane == 0) {
+                    local_inv[0] = metal::precise::rsqrt(
+                        total / 2816.0f + 1.0e-6f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const size_t output_base =
+                (size_t(row) * size_t(352)
+                    + size_t(word)) * 8;
+            const uint weight_base = word * 8;
+            const float inverse_rms = local_inv[0];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 8; ++i) {
+                const T value = hidden_values[i];
+                hidden[output_base + size_t(i)] = value;
+                // Stock rms_single_row casts x*inv back to bf16 before the
+                // learnable bf16 weight multiplication.
+                normed[output_base + size_t(i)] =
+                    norm_weight[weight_base + uint(i)]
+                        * static_cast<T>((float)value * inverse_rms);
+            }
+            """,
+        ensureRowContiguous: true
+    )
+
+    static func apply(
+        tokens: MLXArray,
+        embedding: Embedding,
+        embedScale: Float,
+        hiddenSize: Int,
+        inputNormWeight: MLXArray,
+        inputNormEps: Float
+    ) -> (hidden: MLXArray, normed: MLXArray)? {
+        guard enabled, Gemma4FusedScaledEmbedding.enabled,
+            hiddenSize == axis,
+            embedScale == Float(axis).squareRoot(),
+            inputNormEps == eps,
+            tokens.ndim == 2,
+            tokens.shape == [batch, length],
+            tokens.dtype == .int32,
+            let quantized = embedding as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            quantized.bits == bits,
+            quantized.groupSize == groupSize,
+            let biases = quantized.biases
+        else { return nil }
+
+        let weight = quantized.weight
+        let scales = quantized.scales
+        guard weight.dtype == .uint32,
+            weight.ndim == 2,
+            weight.dim(1) == wordsPerRow,
+            scales.dtype == .bfloat16,
+            scales.ndim == 2,
+            scales.shape == [weight.dim(0), axis / groupSize],
+            biases.dtype == .bfloat16,
+            biases.shape == scales.shape,
+            inputNormWeight.dtype == .bfloat16,
+            inputNormWeight.shape == [axis],
+            wordsPerRow % wordsPerGroup == 0,
+            physicalSIMDGroups == 11,
+            stockSIMDGroups == 22
+        else { return nil }
+
+        let outputs = kernel(
+            [
+                tokens, weight, scales, biases,
+                embedScale.asMLXArray(dtype: .bfloat16), inputNormWeight,
+            ],
+            template: [("T", DType.bfloat16)],
+            grid: (wordsPerRow, batch * length, 1),
+            threadGroup: (wordsPerRow, 1, 1),
+            outputShapes: [
+                [batch, length, axis],
+                [batch, length, axis],
+            ],
+            outputDTypes: [.bfloat16, .bfloat16]
+        )
+        CBv2EngageMark.once("prefill-embed-first-norm")
+        return (outputs[0], outputs[1])
+    }
+}
+
 // MARK: - Text Model
 
 /// FINAL-NORM-XSum. The ranked tied head consumes one exact affine activation
@@ -7066,6 +7253,18 @@ public class Gemma4TextModelInner: Module {
         var h: MLXArray
         if let inputEmbedding {
             h = inputEmbedding.ndim == 2 ? inputEmbedding.expandedDimensions(axis: 0) : inputEmbedding
+        } else if schedulePrefill, let firstLayer = layers.first,
+            let fused = Gemma4PrefillEmbeddingFirstNorm.apply(
+                tokens: inputs,
+                embedding: embedTokens,
+                embedScale: embedScale,
+                hiddenSize: config.hiddenSize,
+                inputNormWeight: firstLayer.inputLayernorm.weight,
+                inputNormEps: config.rmsNormEps)
+        {
+            h = fused.hidden
+            layerZeroInputCarry = (
+                source: fused.hidden, normed: fused.normed, rs: nil)
         } else if isCBv2, let firstLayer = layers.first,
             let fused = Gemma4FusedScaledEmbedding.applyWithInputNormRunsum(
                 tokens: inputs,

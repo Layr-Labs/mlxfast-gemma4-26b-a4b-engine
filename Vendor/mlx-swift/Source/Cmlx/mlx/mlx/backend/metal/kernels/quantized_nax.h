@@ -1522,6 +1522,8 @@ template <
 // function constant magnitude (pipeline-key law).
 MLX_MTL_CONST bool kGatherRhsSegmentElide = true;
 MLX_MTL_CONST bool kGatherRhsSortedEndpointElide = true;
+// Source-level switch; never encode policy in a function-constant magnitude.
+MLX_MTL_CONST bool kGatherRhsSegmentRowOrigin = true;
 
 // Loads one 16-row fragment row of an A tile from device memory. The
 // address arithmetic matches NAXTile::load exactly for that fragment row
@@ -1673,6 +1675,12 @@ template <
   const bool gemma4_gather_rhs_geglu =
       transpose && metal::is_same_v<T, bfloat> && group_size == 64 &&
       bits == 4 && M >= 512 && N == 1408 && K == 2816;
+  // Rebase only exact affine-4 Gemma prefill expert segments. This changes
+  // the output-row origin, never K order, values, quantization or routing.
+  const bool segment_row_origin = kGatherRhsSegmentRowOrigin &&
+      transpose && metal::is_same_v<T, bfloat> && group_size == 64 &&
+      bits == 4 && M >= 512 &&
+      ((N == 1408 && K == 2816) || (N == 2816 && K == 704));
   const int y_row = tid.y * BM;
   const int y_col = tid.x * BN;
   const size_t y_row_long = size_t(y_row);
@@ -1762,14 +1770,25 @@ template <
     }
     threadgroup_barrier(mem_flags::mem_none);
 
+    // A segment starts at its own row origin, so a short segment crossing
+    // an old16-row boundary need not occupy two independent MMA fragments.
+    // Require a complete shifted physical BM-row tile. The final/partial
+    // tile keeps its original load bounds and alignment branches verbatim.
+    const bool rebase_segment = segment_row_origin &&
+        M - y_row >= int(offset) + BM;
+    const short segment_tm = tm + (rebase_segment ? offset : 0);
+    const short segment_sgp_sm = rebase_segment ? SM : sgp_sm;
+    const bool segment_aligned_m =
+        rebase_segment || align_M || !is_unaligned_sm;
+
     NAXTile<AccumType, TM, TN> Dtile;
     Dtile.clear();
 
-    const device T* xn = x + tm * K;
+    const device T* xn = x + segment_tm * K;
 
     // This simdgroup's stored row band for the current expert segment,
     // hoisted ahead of the K-loop (it depends only on offset, offset_next,
-    // tm and sgp_sm, all known here). The stock path computes the full
+    // segment_tm and segment_sgp_sm, all known here). The stock path computes the full
     // tile and discards rows outside [seg_lo, seg_hi) at store_slice; with
     // the elision enabled those rows' A loads and MMA ops are skipped
     // instead. Cooperative weight loads and every threadgroup_barrier stay
@@ -1777,11 +1796,11 @@ template <
     // uniform within a simdgroup (offset/offset_next are threadgroup
     // uniform). With the enable off both flags fold to false and only the
     // stock path below runs.
-    const short seg_lo = min(int(sgp_sm), max(0, offset - tm));
-    const short seg_hi = min(int(sgp_sm), max(0, offset_next - tm));
+    const short seg_lo = min(int(segment_sgp_sm), max(0, offset - segment_tm));
+    const short seg_hi = min(int(segment_sgp_sm), max(0, offset_next - segment_tm));
     const bool seg_empty = kGatherRhsSegmentElide && (seg_hi <= seg_lo);
     const bool seg_partial = kGatherRhsSegmentElide && !seg_empty &&
-        !(seg_lo == 0 && seg_hi == sgp_sm);
+        !(seg_lo == 0 && seg_hi == segment_sgp_sm);
 
     // Prepare threadgroup loading operations
     thread loader_w_t loader_w(
@@ -1793,7 +1812,7 @@ template <
         simd_group_id,
         simd_lane_id);
 
-    dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
+    dispatch_bool(segment_aligned_m, [&](auto kAlignedM) {
       dispatch_bool(align_N || !is_unaligned_bn, [&](auto kAlignedN) {
         for (int k = 0; k < K_it; k++) {
           threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1852,7 +1871,7 @@ template <
               if constexpr (kAlignedM.value) {
                 Atile.load(xn + kk1, K);
               } else {
-                Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+                Atile.load_safe(xn + kk1, K, short2(SK, segment_sgp_sm));
               }
 
               if constexpr (transpose) {
@@ -1895,7 +1914,7 @@ template <
               volatile int compiler_barrier;
 
               const short psk = min(int(SK), max(0, (BK - kk1)));
-              Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
+              Atile.load_safe(xn + kk1, K, short2(psk, segment_sgp_sm));
 
               if constexpr (transpose) {
                 Btile.template load<T, BK_padded, 1>(
@@ -1945,7 +1964,7 @@ template <
             device T* compact_y =
                 y - y_row_long * N - y_col_long +
                 y_row_long * (N / 2) + size_t(tid.x) * (BN / 2) +
-                tm * (N / 2) + tn / 2;
+                segment_tm * (N / 2) + tn / 2;
             if (seg_lo == 0 && seg_hi == SM) {
               Otile.store(compact_y, N / 2);
             } else {
@@ -1962,14 +1981,14 @@ template <
           if (!seg_empty) {
             if constexpr (kAlignedN.value) {
               if (seg_lo == 0 && seg_hi == SM) {
-                Dtile.store(y + tm * N + tn, N);
+                Dtile.store(y + segment_tm * N + tn, N);
               } else {
                 Dtile.store_slice(
-                    y + tm * N + tn, N, short2(0, seg_lo), short2(SN, seg_hi));
+                    y + segment_tm * N + tn, N, short2(0, seg_lo), short2(SN, seg_hi));
               }
             } else {
               Dtile.store_slice(
-                  y + tm * N + tn,
+                  y + segment_tm * N + tn,
                   N,
                   short2(0, seg_lo),
                   short2(sgp_sn, seg_hi));

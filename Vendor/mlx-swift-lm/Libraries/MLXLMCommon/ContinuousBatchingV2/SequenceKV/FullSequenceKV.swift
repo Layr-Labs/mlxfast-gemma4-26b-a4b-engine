@@ -255,7 +255,7 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         absoluteOffset += 1
     }
 
-    public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
+    private func appendStorage(keys newKeys: MLXArray, values newValues: MLXArray) {
         let n = newKeys.dim(2)
         precondition(newKeys.dim(0) == 1 && newValues.dim(0) == 1,
             "CBv2FullSequenceKV holds ONE sequence; got batch \(newKeys.dim(0))")
@@ -269,13 +269,11 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         )
 
         if let pool = cohortPool {
-            // Pooled twin of the private-buffer append below: same values
-            // into the same slots, same returned-view strides.
             pool.rowAppend(
                 index: cohortIndex, keys: newKeys, values: newValues,
                 at: absoluteOffset, count: n)
             absoluteOffset += n
-            return pool.rowViews(index: cohortIndex, upTo: absoluteOffset)
+            return
         }
 
         ensureCapacity(absoluteOffset + n, keyTemplate: newKeys, valueTemplate: newValues)
@@ -283,11 +281,29 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         keys![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newKeys
         values![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newValues
         absoluteOffset += n
+    }
 
+    public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
+        appendStorage(keys: newKeys, values: newValues)
+        if let pool = cohortPool {
+            return pool.rowViews(index: cohortIndex, upTo: absoluteOffset)
+        }
         return (
             keys![.ellipsis, ..<absoluteOffset, 0...],
             values![.ellipsis, ..<absoluteOffset, 0...]
         )
+    }
+
+    /// Append without constructing temporal prefix views when the caller
+    /// consumes the full backing buffers directly after the write.
+    public func updateWithoutViews(
+        keys newKeys: MLXArray, values newValues: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        appendStorage(keys: newKeys, values: newValues)
+        precondition(
+            cohortPool == nil && keys != nil && values != nil,
+            "CBv2FullSequenceKV: no-view append requires private storage")
+        return (keys!, values!)
     }
 
     /// Confirm this row's slot of a pool-level `batchAppend` (the batched

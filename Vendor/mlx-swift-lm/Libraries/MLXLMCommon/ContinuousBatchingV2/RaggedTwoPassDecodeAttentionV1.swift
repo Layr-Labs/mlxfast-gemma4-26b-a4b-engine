@@ -5829,6 +5829,16 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+    /// D512-APPEND-NO-VIEWS: the fallback append below reads each row's full
+    /// backing buffers immediately after writing them, so its temporal prefix
+    /// views are dead. `0` restores the incumbent view-producing update.
+    private static let appendNoViewsEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_APPEND_NO_VIEWS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
 
     /// WRITE-022 store dispatch: one threadgroup per (row, kv head) — 16
     /// threadgroups of 128 threads — each thread writing 4 contiguous
@@ -6426,25 +6436,35 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             else { return nil }
         }
 
-        // Byte-identical per-row appends — the same `update` calls, in the
-        // same row order, as the established per-row loop. Only the
-        // returned temporal views go unused; the kernels read the full
-        // backing buffers (contiguous, so no `ensureRowContiguous` copy)
-        // with kL/capacity as runtime scalars.
+        // D512-APPEND-NO-VIEWS: the byte-identical per-row appends remain in
+        // the same order, but the full-buffer consumer no longer constructs
+        // the unused temporal prefix views.
         var keyBuffers: [MLXArray] = []
         var valueBuffers: [MLXArray] = []
         keyBuffers.reserveCapacity(batch)
         valueBuffers.reserveCapacity(batch)
         var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
         params.reserveCapacity(batch + 2)
+        let noViewAppend = appendNoViewsEnabled
+        if noViewAppend {
+            CBv2EngageMark.once("d512-append-no-views")
+        }
         for (index, row) in fullRows.enumerated() {
-            _ = row.update(
-                keys: keys[index ..< (index + 1)],
-                values: values[index ..< (index + 1)])
-            let state = row.cbv2InnerState()
-            keyBuffers.append(state[0])
-            valueBuffers.append(state[1])
-            params.append(UInt32(state[0].dim(2)))
+            let state: (MLXArray, MLXArray)
+            if noViewAppend {
+                state = row.updateWithoutViews(
+                    keys: keys[index ..< (index + 1)],
+                    values: values[index ..< (index + 1)])
+            } else {
+                _ = row.update(
+                    keys: keys[index ..< (index + 1)],
+                    values: values[index ..< (index + 1)])
+                let stored = row.cbv2InnerState()
+                state = (stored[0], stored[1])
+            }
+            keyBuffers.append(state.0)
+            valueBuffers.append(state.1)
+            params.append(UInt32(state.0.dim(2)))
         }
         return dispatchChain(
             queries: queries, keyBuffers: keyBuffers, valueBuffers: valueBuffers,

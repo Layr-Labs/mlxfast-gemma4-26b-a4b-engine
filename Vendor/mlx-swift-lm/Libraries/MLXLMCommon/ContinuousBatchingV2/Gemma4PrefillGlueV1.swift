@@ -495,6 +495,112 @@ public enum Gemma4PrefillGlueV1 {
         ensureRowContiguous: true
     )
 
+    /// Read the row's `K` sorted positions into registers before the first
+    /// store of the scatter, instead of once per store burst.
+    ///
+    /// `inverse` and `out` are both device pointers, so a store through `out`
+    /// is a potential write to `inverse` as far as the compiler's alias
+    /// analysis is concerned. The shipped loop therefore cannot keep
+    /// `inverse[assignment_base + k]` in flight across the burst that precedes
+    /// it: each of the `K` iterations re-issues a dependent scalar load, waits
+    /// for it, computes `obase`, and only then issues four stores. The scatter
+    /// is the widest plane this file writes -- one full `[rows * topK, 1,
+    /// 2816]` copy of the expert input -- and every store burst in it sits
+    /// behind a four-byte load that the row already knew the answer to.
+    ///
+    /// Loading all `K` positions up front breaks that chain. The loads have no
+    /// dependence on each other and none of them depends on a store, so they
+    /// issue together and the burst addresses are resolved by the time the
+    /// first store retires.
+    ///
+    /// This is the mechanism the current frontier promoted in the sibling
+    /// expert-unsort tail chain in this same file, where the eight
+    /// `inverse_order` entries and eight route weights were being reloaded per
+    /// hidden feature. The scatter is the one remaining kernel here that
+    /// reloads the same row-invariant route metadata inside its inner walk.
+    ///
+    /// Exactness. `sorted_pos[k]` is filled from `inverse[assignment_base + k]`
+    /// before any store, and `out` and `inverse` are distinct allocations: the
+    /// output is a fresh `[rows * topK, 1, 2816]` array this dispatch
+    /// allocates, and `inverse` is the counting sort's inverse order, so no
+    /// store in this kernel can change a value the hoist captured. The store
+    /// loop then writes the same `normed[i]` to the same `pos * GLUE_AXIS +
+    /// lid * GLUE_NREADS + i` addresses in the same `k`-ascending, `i`-ascending
+    /// order. No arithmetic, no dtype, no rounding point and no address
+    /// changes; only when the four-byte index read happens.
+    ///
+    /// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_SCATTER_IDX_HOIST` set to
+    /// `0`/`false`/`no`/`off` selects `preNormScatterKernel` and its shipped
+    /// name byte for byte. Engage mark: `prefill-scatter-idx-hoist`.
+    static let scatterIndexHoistEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_SCATTER_IDX_HOIST"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// `preNormScatterKernel` with the `K` index reads lifted above the stores.
+    private static let preNormScatterHoistKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_prefill_glue_prenorm_scatter_2816_idxhoist_v3",
+            inputNames: ["x", "w", "inverse"],
+            outputNames: ["out"],
+            source: """
+                threadgroup float local_sums[32];
+                threadgroup float local_inv[1];
+
+                const uint row = threadgroup_position_in_grid.y;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+                const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+                float xv[GLUE_NREADS];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    xv[i] = static_cast<float>(x[base + i]);
+                }
+
+                const float inv = glue_inv_rms(
+                    xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+                // The stored value is the identical expression `dualPreNorm`
+                // stores for its second output; it is rounded to T here, once,
+                // and copied verbatim to every sorted position.
+                T normed[GLUE_NREADS];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    const uint j = lid * GLUE_NREADS + i;
+                    const T scaled = static_cast<T>(xv[i] * inv);
+                    normed[i] = w[j] * scaled;
+                }
+
+                // Assignment t * K + k of this row owns sorted position
+                // inverse[t * K + k]. The inverse order is a permutation of the
+                // plane rows, so every plane row is written exactly once. The
+                // K positions are read here, before the first store, so that no
+                // store burst waits on its own index load.
+                const size_t assignment_base = size_t(row) * K;
+                uint sorted_pos[K];
+                #pragma clang loop unroll(full)
+                for (int k = 0; k < K; k++) {
+                    sorted_pos[k] = inverse[assignment_base + k];
+                }
+                #pragma clang loop unroll(full)
+                for (int k = 0; k < K; k++) {
+                    const size_t pos = size_t(sorted_pos[k]);
+                    const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
+                    #pragma clang loop unroll(full)
+                    for (int i = 0; i < GLUE_NREADS; i++) {
+                        out[obase + i] = normed[i];
+                    }
+                }
+                """,
+            header: kernelHeader,
+            ensureRowContiguous: true
+        )
+
     /// `dualPreNorm`'s second output written straight into expert-sorted
     /// order. One threadgroup per token row, as before; the row's normed
     /// values are computed once into registers and stored to each of the
@@ -588,7 +694,14 @@ public enum Gemma4PrefillGlueV1 {
         else { return nil }
 
         CBv2EngageMark.once("prefill-prenorm-gather")
-        return preNormScatterKernel(
+        let scatter: MLXFast.MLXFastKernel
+        if scatterIndexHoistEnabled {
+            CBv2EngageMark.once("prefill-scatter-idx-hoist")
+            scatter = preNormScatterHoistKernel
+        } else {
+            scatter = preNormScatterKernel
+        }
+        return scatter(
             [x, weight, inverseOrder],
             template: [("T", x.dtype), ("K", topK)],
             grid: (threadsPerRow, rows, 1),

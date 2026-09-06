@@ -2266,13 +2266,15 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// only the issue point of a load moves earlier -- at the cost of eleven
     /// more registers per thread per extra phase pair.
     ///
-    /// `DARKBLOOM_CBV2_SLIDING_PREFETCH_DEPTH=4` selects it; anything else
-    /// keeps the promoted two.
+    /// Default. `DARKBLOOM_CBV2_SLIDING_PREFETCH_DEPTH=2` restores the
+    /// promoted two-phase walk and its `_spd2_lp1` registration byte for
+    /// byte; `=1` restores the shipped depth-one walk; anything else keeps
+    /// four.
     private static let slidingPrefetchPhases: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_SLIDING_PREFETCH_DEPTH"], let value = Int(raw),
-            value == 4
-        else { return 2 }
+            value == 2
+        else { return 4 }
         return value
     }()
 

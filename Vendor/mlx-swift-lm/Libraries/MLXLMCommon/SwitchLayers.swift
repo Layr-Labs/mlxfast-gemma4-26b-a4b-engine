@@ -1688,7 +1688,8 @@ public class SwitchGLU: Module {
             let fused = fusedGateUpDispatch()
         {
             let activated = Gemma4DecodeFusedGUV1.call(
-                x: x, storage: fused.storage, lhs: lhsIndices, rhs: idx)
+                x: x, storage: fused.storage, lhs: lhsIndices, rhs: idx,
+                prefixBounds: useExpertPrefixBounds)
             let output = tightDecodeDown(activated, idx, sorted: true)
                 ?? downProj(activated, idx, lhsIndices: switchDownIdentity64, sortedIndices: true)
             return (output, inverseOrder, true)

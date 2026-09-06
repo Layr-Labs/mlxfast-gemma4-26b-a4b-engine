@@ -4,10 +4,31 @@ import MLX
 /// B8 affine-4/group-64 expert gate/up with explicit BF16 closes before GeGLU.
 public enum Gemma4DecodeFusedGUV1 {
     static let enabled = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DECODE_FUSED_GEGLU"] != "0"
+    /// Compile-time specialization kill switch. `0`/`false`/`no`/`off`
+    /// retains the dynamic route-word reader while leaving the fused kernel
+    /// itself enabled.
+    private static let routePrefixSpecializationEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DECODE_ROUTE_PREFIX_SPECIALIZE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
 
-    static func call(x: MLXArray, storage: SwitchGateUpFusedStorage,
-        lhs: MLXArray, rhs: MLXArray) -> MLXArray {
-        kernel([storage.weight, storage.scales, storage.biases, x, lhs, rhs],
+    /// `prefixBounds` selects the route-word ABI at compile time. Tagged
+    /// expert-prefix words carry their run offset and count, so the production
+    /// decode variant does not retain the raw-key backward scan.
+    static func call(
+        x: MLXArray, storage: SwitchGateUpFusedStorage,
+        lhs: MLXArray, rhs: MLXArray, prefixBounds: Bool
+    ) -> MLXArray {
+        if prefixBounds && routePrefixSpecializationEnabled {
+            CBv2EngageMark.once("decode-route-prefix-specialized")
+        }
+        return kernel([storage.weight, storage.scales, storage.biases, x, lhs, rhs],
+            template: [
+                ("GU_PREFIX_BOUNDS",
+                    prefixBounds && routePrefixSpecializationEnabled ? 1 : 0)
+            ],
             grid: (32, 176 * 2, 64), threadGroup: (32, 2, 1),
             outputShapes: [[64, 1, 704]], outputDTypes: [.bfloat16])[0]
     }
@@ -1085,19 +1106,30 @@ inline T gemma4_geglu_compiled_tape(T gate, T up) {
 #ifndef GU_PAIRS
 #define GU_PAIRS 1
 #endif
+#ifndef GU_PREFIX_BOUNDS
+#define GU_PREFIX_BOUNDS 0
+#endif
 constant int guPairs=GU_PAIRS;
+constant bool guPrefixBounds=(GU_PREFIX_BOUNDS != 0);
 constant int guK=2816,guN=704,guSliceN=8;
 struct ExpertRun { uint expert; uint count; bool leader; };
 METAL_FUNC ExpertRun expert_run(const device uint* rhs,uint assignment) {
-    const uint word=rhs[assignment];const bool tagged=(word&0x80000000u)!=0u;
+    const uint word=rhs[assignment];
+    const bool tagged=guPrefixBounds || ((word&0x80000000u)!=0u);
     const uint expert=tagged ? word&0xffu:word;
     uint offset=0;
-    if(tagged)offset=(word>>8)&0x3fu;
-    else for(uint p=assignment;p>0;--p){if(rhs[p-1]!=expert)break;++offset;}
+    if(tagged) {
+        offset=(word>>8)&0x3fu;
+    } else {
+        for(uint p=assignment;p>0;--p){if(rhs[p-1]!=expert)break;++offset;}
+    }
     if((offset&3u)!=0u)return {expert,0,false};
     uint count=1;
-    if(tagged)count=min(4u,((word>>14)&0x3fu)+1u);
-    else while(count<4 && assignment+count<64 && rhs[assignment+count]==expert)++count;
+    if(tagged) {
+        count=min(4u,((word>>14)&0x3fu)+1u);
+    } else {
+        while(count<4 && assignment+count<64 && rhs[assignment+count]==expert)++count;
+    }
     return {expert,count,true};
 }
 template<typename T>

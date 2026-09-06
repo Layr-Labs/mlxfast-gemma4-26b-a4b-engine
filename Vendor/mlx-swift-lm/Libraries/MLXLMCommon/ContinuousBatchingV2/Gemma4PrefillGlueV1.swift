@@ -796,7 +796,7 @@ public enum Gemma4PrefillGlueV1 {
     /// same `[tokens, hidden]` expert result. Produce each reduced expert value
     /// in the tail thread that consumes it, removing the intermediate tensor.
     private static let expertTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_expert_unsort_tail_chain_2816_unroll_v2",
+        name: "gemma4_prefill_expert_unsort_tail_chain_2816_meta_vec4_v7",
         inputNames: [
             "sorted", "inverse_order", "route_weights", "h1",
             "w1", "w2", "w3", "res2", "s", "wn",
@@ -814,19 +814,33 @@ public enum Gemma4PrefillGlueV1 {
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
             const uint assignment_base = row * 8;
 
+            // The route metadata is invariant across this thread's four
+            // features. Keep one copy per thread instead of reloading both
+            // arrays in every feature/slot iteration.
+            uint inv_orders[8];
+            float route_weight_values[8];
+            #pragma clang loop unroll(full)
+            for (uint slot = 0; slot < 8; ++slot) {
+                const uint assignment = assignment_base + slot;
+                inv_orders[slot] = uint(inverse_order[assignment]);
+                route_weight_values[slot] = float(route_weights[assignment]);
+            }
+
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
+            const vec<T, 4> h1_values =
+                *((const device vec<T, 4>*)(h1 + base));
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint feature = lid * GLUE_NREADS + i;
-                av[i] = static_cast<float>(h1[base + i]);
+                av[i] = static_cast<float>(h1_values[i]);
                 T accumulator = (T)0;
+                #pragma clang loop unroll(full)
                 for (uint slot = 0; slot < 8; ++slot) {
-                    const uint assignment = assignment_base + slot;
-                    const uint sorted_row = (uint)inverse_order[assignment];
+                    const uint sorted_row = inv_orders[slot];
                     const T weighted = (T)(
                         (float)sorted[size_t(sorted_row) * GLUE_AXIS + feature]
-                        * (float)route_weights[assignment]);
+                        * route_weight_values[slot]);
                     accumulator = accumulator + weighted;
                 }
                 bv[i] = static_cast<float>(accumulator);
@@ -854,28 +868,34 @@ public enum Gemma4PrefillGlueV1 {
                 simd_lane_id, simd_group_id, GLUE_EPS);
 
             const T scalar = s[0];
+            const vec<T, 4> residual_values =
+                *((const device vec<T, 4>*)(res2 + base));
             float ov[GLUE_NREADS];
+            vec<T, 4> out_values;
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T normed3 = static_cast<T>(
                     w3[j] * static_cast<T>(tv[i] * inv_t));
-                const T summed = static_cast<T>(res2[base + i] + normed3);
+                const T summed = static_cast<T>(residual_values[i] + normed3);
                 const T scaled = static_cast<T>(summed * scalar);
-                out[base + i] = scaled;
+                out_values[i] = scaled;
                 ov[i] = static_cast<float>(scaled);
             }
+            *((device vec<T, 4>*)(out + base)) = out_values;
 
             const float inv_n = glue_inv_rms(
                 ov, local_sums_a, local_inv2,
                 simd_lane_id, simd_group_id, GLUE_EPS);
 
+            vec<T, 4> normed_values;
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
-                normed[base + i] =
+                normed_values[i] =
                     wn[j] * static_cast<T>(ov[i] * inv_n);
             }
+            *((device vec<T, 4>*)(normed + base)) = normed_values;
         """,
         header: kernelHeader,
         ensureRowContiguous: true

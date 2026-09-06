@@ -6297,22 +6297,23 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
         params.reserveCapacity(batch + 2)
         for row in fullRows {
-            let state = row.cbv2InnerState()
-            guard state.count == 2,
-                state[0].dtype == .bfloat16,
-                state[1].dtype == .bfloat16,
-                state[0].ndim == 4,
-                state[0].dim(0) == 1,
-                state[0].dim(1) == kvHeads,
-                state[0].dim(3) == headDim,
-                state[1].shape == state[0].shape,
-                state[1].dtype == state[0].dtype,
-                state[0].dim(2) >= keyLength
+            guard let buffers = row.d512DecodeBuffers(),
+                buffers.keys.dtype == .bfloat16,
+                buffers.values.dtype == .bfloat16,
+                buffers.keys.ndim == 4,
+                buffers.keys.dim(0) == 1,
+                buffers.keys.dim(1) == kvHeads,
+                buffers.keys.dim(3) == headDim,
+                buffers.values.shape == buffers.keys.shape,
+                buffers.values.dtype == buffers.keys.dtype,
+                buffers.keys.dim(2) >= keyLength
             else { return nil }
-            keyBuffers.append(state[0])
-            valueBuffers.append(state[1])
-            params.append(UInt32(state[0].dim(2)))
+            keyBuffers.append(buffers.keys)
+            valueBuffers.append(buffers.values)
+            params.append(UInt32(buffers.keys.dim(2)))
         }
+        CBv2EngageMark.once("d512-direct-row-buffers")
+
         let paramsArray = getD512ParamsArray(params: params)
 
         let template: [(String, any KernelTemplateArg)] = [
@@ -6500,22 +6501,23 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
         params.reserveCapacity(batch + 2)
         for row in fullRows {
-            let state = row.cbv2InnerState()
-            guard state.count == 2,
-                state[0].dtype == .bfloat16,
-                state[1].dtype == .bfloat16,
-                state[0].ndim == 4,
-                state[0].dim(0) == 1,
-                state[0].dim(1) == kvHeads,
-                state[0].dim(3) == headDim,
-                state[1].shape == state[0].shape,
-                state[1].dtype == state[0].dtype,
-                state[0].dim(2) >= keyLength
+            guard let buffers = row.d512DecodeBuffers(),
+                buffers.keys.dtype == .bfloat16,
+                buffers.values.dtype == .bfloat16,
+                buffers.keys.ndim == 4,
+                buffers.keys.dim(0) == 1,
+                buffers.keys.dim(1) == kvHeads,
+                buffers.keys.dim(3) == headDim,
+                buffers.values.shape == buffers.keys.shape,
+                buffers.values.dtype == buffers.keys.dtype,
+                buffers.keys.dim(2) >= keyLength
             else { return nil }
-            keyBuffers.append(state[0])
-            valueBuffers.append(state[1])
-            params.append(UInt32(state[0].dim(2)))
+            keyBuffers.append(buffers.keys)
+            valueBuffers.append(buffers.values)
+            params.append(UInt32(buffers.keys.dim(2)))
         }
+        CBv2EngageMark.once("d512-direct-row-buffers")
+
         let paramsArray = getD512ParamsArray(params: params)
 
         let template: [(String, any KernelTemplateArg)] = [

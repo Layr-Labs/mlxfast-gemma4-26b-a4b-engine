@@ -415,6 +415,20 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         return [keys, values].compactMap { $0 }
     }
 
+    /// D512-DECODE-DIRECT-BUFFERS: expose the established private K/V
+    /// allocations as a tuple for the lockstep full-attention writer. The
+    /// writer already rejects pooled rows, so returning the two references
+    /// directly avoids materializing the transient `[MLXArray]` carrier that
+    /// `cbv2InnerState()` creates on every row.
+    ///
+    /// This is a view only: no storage, offset, shape, or ownership changes.
+    /// Pooled rows fail closed so the D512 writer cannot accidentally treat a
+    /// pool-wide batch allocation as a per-row buffer.
+    func d512DecodeBuffers() -> (keys: MLXArray, values: MLXArray)? {
+        guard cohortPool == nil, let keys, let values else { return nil }
+        return (keys, values)
+    }
+
     // MARK: - ATT-008 cohort pooling
 
     /// Resolve (or form) the shared decode pool for `rows`, or nil when the

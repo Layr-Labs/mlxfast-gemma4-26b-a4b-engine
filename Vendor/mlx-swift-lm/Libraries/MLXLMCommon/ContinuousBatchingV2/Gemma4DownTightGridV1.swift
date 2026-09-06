@@ -37,6 +37,19 @@ public enum Gemma4DownTightGridV1 {
         return 4
         #endif
     }()
+    /// SPAN-FUSE (P2 sep06-mb1 E1): fuse the span-2 pair-leader walk so the two
+    /// tiles share one K loop and one x0/x1 load per K block. Bit-exact by
+    /// construction (per-element order untouched). Kill switch restores the
+    /// incumbent t-walk byte-for-byte under the incumbent kernel name.
+    static let spanFuseEnabled: Bool = {
+        #if os(macOS)
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_SPAN_FUSE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+        #else
+        return false
+        #endif
+    }()
 
     /// Bound to the immutable sanitized checkpoint, like the fused gate/up storage.
     public final class Storage {
@@ -67,7 +80,8 @@ public enum Gemma4DownTightGridV1 {
         func call(
             x: MLXArray, lhsIndices: MLXArray, indices: MLXArray, span: Int
         ) -> MLXArray {
-            kernel(
+            if spanFuseEnabled && span == 2 { CBv2EngageMark.once("down-span2-fused") }
+            return kernel(
                 [weight, scales, biases, x, lhsIndices, indices],
                 template: [("T", DType.bfloat16), ("SPAN", span)],
                 grid: (32, (352 / span) * 2, 64), threadGroup: (32, 2, 1),
@@ -77,7 +91,7 @@ public enum Gemma4DownTightGridV1 {
     }
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_down_qmv_span4_tight_zorder_v1",
+        name: spanFuseEnabled ? "gemma4_b8_down_qmv_span2fused_tight_zorder_v1" : "gemma4_b8_down_qmv_span4_tight_zorder_v1",
         inputNames: ["w", "scales", "biases", "x", "lhs_indices", "rhs_indices"],
         outputNames: ["y"],
         source: #"""
@@ -94,7 +108,7 @@ gather_qmv_gemma4_down_tile<T, 64, 4, SPAN>(
     704, 2816 * 704 / 8, 2816 * 704 / 64, 2816 * 704 / 64,
     tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
 """#,
-        header: #"""
+        header: "#define GEMMA4_DOWN_SPAN_FUSE \(spanFuseEnabled ? 1 : 0)\n" + #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helper bodies verified byte-identical to 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -811,6 +825,137 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     }
   }
 }
+// SPAN-FUSE (P2 sep06-mb1 E1): span-2 pair-leader walk with ONE K loop over
+// both tiles. Per (tile, row, lane, K-block) the operations and their order
+// are identical to two sequential qmv_affine4_g64_pair_impl calls at
+// tile_tid.y = tid.y and tid.y + 1, so output is bit-identical; the x0/x1
+// vector loads and affine-sum chains issue once per K block instead of twice.
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine4_g64_span2fused_pair_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    device T* y0,
+    device T* y1,
+    const constant int& in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 8;
+  constexpr int tiles = 2;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x0_thread[values_per_thread];
+  thread float x1_thread[values_per_thread];
+  thread uint packed[tiles][results_per_simdgroup];
+  thread float scale_local[tiles][results_per_simdgroup];
+  thread float bias_local[tiles][results_per_simdgroup];
+  thread float result0[tiles][results_per_simdgroup] = {};
+  thread float result1[tiles][results_per_simdgroup] = {};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row_base = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+  const device uint8_t* ws_t[tiles] = {
+    ws + out_row_base * in_vec_size_w + simd_lid * bytes_per_thread,
+    ws + (out_row_base + num_simdgroups * results_per_simdgroup) * in_vec_size_w + simd_lid * bytes_per_thread
+  };
+  const device T* scales_t[tiles] = {
+    scales + out_row_base * in_vec_size_g + simd_lid / scale_step_per_thread,
+    scales + (out_row_base + num_simdgroups * results_per_simdgroup) * in_vec_size_g + simd_lid / scale_step_per_thread
+  };
+  const device T* biases_t[tiles] = {
+    biases + out_row_base * in_vec_size_g + simd_lid / scale_step_per_thread,
+    biases + (out_row_base + num_simdgroups * results_per_simdgroup) * in_vec_size_g + simd_lid / scale_step_per_thread
+  };
+  device T* y0_t[tiles] = { y0 + out_row_base, y0 + out_row_base + num_simdgroups * results_per_simdgroup };
+  device T* y1_t[tiles] = { y1 + out_row_base, y1 + out_row_base + num_simdgroups * results_per_simdgroup };
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    for (int t = 0; t < tiles; t++) {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        packed[t][row] = *((const device uint*)(ws_t[t] + row * in_vec_size_w));
+        scale_local[t][row] = scales_t[t][row * in_vec_size_g];
+        bias_local[t][row] = biases_t[t][row * in_vec_size_g];
+      }
+    }
+
+    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+    float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+
+    for (int t = 0; t < tiles; t++) {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        float dot0;
+        float dot1;
+        qdot_affine4_pair_word<float, values_per_thread>(
+            packed[t][row], x0_thread, x1_thread, scale_local[t][row], bias_local[t][row], sum0, sum1, dot0, dot1);
+        result0[t][row] += dot0;
+        result1[t][row] += dot1;
+      }
+    }
+
+    for (int t = 0; t < tiles; t++) {
+      ws_t[t] += block_size / 2;
+      scales_t[t] += block_size / 64;
+      biases_t[t] += block_size / 64;
+    }
+    x0 += block_size;
+    x1 += block_size;
+  }
+
+  // Every Gemma 4 caller entering this specialized g64 path has K aligned to
+  // 64.  The final block therefore contains an integral number of complete
+  // eight-value lane packets (32 lanes for K=2816, 24 for expert down_proj
+  // K=704); no active lane needs the generic dynamic safe-tail loops.
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    for (int t = 0; t < tiles; t++) {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        packed[t][row] = *((const device uint*)(ws_t[t] + row * in_vec_size_w));
+        scale_local[t][row] = scales_t[t][row * in_vec_size_g];
+        bias_local[t][row] = biases_t[t][row * in_vec_size_g];
+      }
+    }
+
+    float sum0 =
+        load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+    float sum1 =
+        load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+    for (int t = 0; t < tiles; t++) {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        float dot0;
+        float dot1;
+        qdot_affine4_pair_word<float, values_per_thread>(
+            packed[t][row], x0_thread, x1_thread, scale_local[t][row], bias_local[t][row], sum0, sum1, dot0, dot1);
+        result0[t][row] += dot0;
+        result1[t][row] += dot1;
+      }
+    }
+  }
+
+  for (int t = 0; t < tiles; t++) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[t][row] = simd_sum(result0[t][row]);
+      result1[t][row] = simd_sum(result1[t][row]);
+      if (simd_lid == 0) {
+        y0_t[t][row] = static_cast<T>(result0[t][row]);
+        y1_t[t][row] = static_cast<T>(result1[t][row]);
+      }
+    }
+  }
+}
 
 template <typename T, int group_size, int bits, int span>
 METAL_FUNC void gather_qmv_gemma4_down_tile(
@@ -870,6 +1015,23 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device T* tile_x1 =
         x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
     device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+#if GEMMA4_DOWN_SPAN_FUSE
+    if (gemma4_down_tile_span == 2) {
+      qmv_affine4_g64_span2fused_pair_impl<T, group_size, bits>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_x1,
+          tile_y0,
+          tile_y1,
+          in_vec_size,
+          tid,
+          simd_gid,
+          simd_lid);
+      return;
+    }
+#endif
     for (int t = 0; t < gemma4_down_tile_span; t++) {
       uint3 tile_tid = tid;
       tile_tid.y = tid.y + uint(t);

@@ -6237,6 +6237,19 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         """,
         ensureRowContiguous: true)
 
+    /// D512-ROW-CAST: skip the per-call typed `[CBv2FullSequenceKV]`
+    /// `compactMap` in the production writer. The CBv2 full-attention
+    /// decode caller already supplies eight private full rows; the direct
+    /// admission below validates those existential elements in place and
+    /// keeps the incumbent array-building path behind this switch.
+    /// `DARKBLOOM_GEMMA4_D512_DIRECT_FULL_ROW_CAST=0` restores that path.
+    private static let directFullRowCastEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_DIRECT_FULL_ROW_CAST"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// WRITE-022 kill switch: `DARKBLOOM_GEMMA4_D512_STORE_DISPATCH=0` falls
     /// back to the v2 fold (and its own switch falls back to the append path).
     private static let storeDispatchEnabled: Bool = {
@@ -6277,18 +6290,42 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         else { return nil }
         guard case .full = kind.attention else { return nil }
 
-        let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
-        guard fullRows.count == batch else { return nil }
+        let legacyFullRows: [CBv2FullSequenceKV]?
+        if directFullRowCastEnabled {
+            legacyFullRows = nil
+        } else {
+            let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
+            guard fullRows.count == batch else { return nil }
+            legacyFullRows = fullRows
+        }
 
-        let offset = fullRows[0].absoluteOffset
+        let firstRow: CBv2FullSequenceKV
+        if let fullRows = legacyFullRows {
+            firstRow = fullRows[0]
+        } else {
+            guard let row = rows[0] as? CBv2FullSequenceKV else { return nil }
+            firstRow = row
+        }
+        let offset = firstRow.absoluteOffset
         let keyLength = offset + 1
         guard offset > 0,
             keyLength >= minKeyLength,
-            keyLength <= maxKeyLength,
-            fullRows.allSatisfy({ $0.cohortPool == nil }),
-            fullRows.allSatisfy({ $0.absoluteOffset == offset }),
-            fullRows.allSatisfy({ keyLength <= $0.maxLength })
+            keyLength <= maxKeyLength
         else { return nil }
+        if let fullRows = legacyFullRows {
+            guard fullRows.allSatisfy({ $0.cohortPool == nil }),
+                fullRows.allSatisfy({ $0.absoluteOffset == offset }),
+                fullRows.allSatisfy({ keyLength <= $0.maxLength })
+            else { return nil }
+        } else {
+            for row in rows {
+                guard let full = row as? CBv2FullSequenceKV,
+                    full.cohortPool == nil,
+                    full.absoluteOffset == offset,
+                    keyLength <= full.maxLength
+                else { return nil }
+            }
+        }
 
         var keyBuffers: [MLXArray] = []
         var valueBuffers: [MLXArray] = []
@@ -6296,7 +6333,16 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         valueBuffers.reserveCapacity(batch)
         var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
         params.reserveCapacity(batch + 2)
-        for row in fullRows {
+        for index in 0 ..< batch {
+            let row: CBv2FullSequenceKV
+            if let fullRows = legacyFullRows {
+                row = fullRows[index]
+            } else {
+                guard let full = rows[index] as? CBv2FullSequenceKV else {
+                    return nil
+                }
+                row = full
+            }
             let state = row.cbv2InnerState()
             guard state.count == 2,
                 state[0].dtype == .bfloat16,
@@ -6319,6 +6365,9 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             ("T", queries.dtype)
         ]
         let scratchShape = [batch, queryHeads, 1, keyLength]
+        if legacyFullRows == nil {
+            CBv2EngageMark.once("d512-direct-full-row-cast")
+        }
 
         // NORMROPE-D512: with the raw projections registered for this exact
         // (queries, keys, values) triple, the store dispatch normalizes and
@@ -6434,8 +6483,12 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 for: output)
         }
 
-        for row in fullRows {
-            row.advanceAfterFusedAppend()
+        for index in 0 ..< batch {
+            if let fullRows = legacyFullRows {
+                fullRows[index].advanceAfterFusedAppend()
+            } else {
+                (rows[index] as! CBv2FullSequenceKV).advanceAfterFusedAppend()
+            }
         }
         return (output, storeFence)
     }

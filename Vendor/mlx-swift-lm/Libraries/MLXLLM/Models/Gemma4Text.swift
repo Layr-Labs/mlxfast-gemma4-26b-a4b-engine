@@ -3634,7 +3634,10 @@ private enum Gemma4RouterFinalistsWeightsV1 {
 /// break ties. The optional native-max path encodes that same ordering once per
 /// expert, then reads the original selected score for the unchanged weight
 /// arithmetic. The staged `sel` array holds the selected expert IDs, and the
-/// rank-scatter phase retains stable assignment order for equal IDs.
+/// rank-scatter phase retains stable assignment order for equal IDs. The
+/// prefix-bounds variant counts equal keys during those same 64 broadcasts and
+/// emits the existing tagged expert/run word. It changes no row or inverse
+/// order and adds no route-table dispatch.
 ///
 /// Any geometry outside the pinned decode cell, a disabled finalists stage,
 /// or a disabled fold returns nil so the caller retains its existing fallback.
@@ -3663,10 +3666,52 @@ private enum Gemma4RouteGlueFoldV1 {
         let table: SwitchRouteTable
     }
 
-    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: orderKeysEnabled
+    /// These compile-time source fragments preserve the raw-key GLUE-FOLD
+    /// kernels when the prefix-bounds kill switch is off.
+    private static let routePrefixStateSource =
+        switchRouteGluePrefixBoundsEnabled
+        ? """
+                uint run_offset = 0;
+                uint run_length = 0;
+          """
+        : ""
+    private static let routePrefixLowSource =
+        switchRouteGluePrefixBoundsEnabled
+        ? """
+                    run_offset += other_low == key && source < assignment;
+                    run_length += other_low == key;
+          """
+        : ""
+    private static let routePrefixHighSource =
+        switchRouteGluePrefixBoundsEnabled
+        ? """
+                    run_offset += other_high == key && high_assignment < assignment;
+                    run_length += other_high == key;
+          """
+        : ""
+    private static let routeSortedKeySource =
+        switchRouteGluePrefixBoundsEnabled
+        ? """
+                const uint run_remaining = run_length - run_offset;
+                sorted_keys[rank] = 0x80000000u | key
+                    | (run_offset << 8) | ((run_remaining - 1) << 14);
+          """
+        : """
+                sorted_keys[rank] = key;
+          """
+
+    /// Four distinct names keep raw/tagged and sorting-network/native-max
+    /// pipeline-cache entries from ever aliasing.
+    private static let kernelName = switchRouteGluePrefixBoundsEnabled
+        ? (orderKeysEnabled
+            ? "gemma4_route_monolithic_top8_e128_k8_bf16_max8_sg1_prefix_v1"
+            : "gemma4_route_monolithic_top8_e128_k8_bf16_prefix_v1")
+        : (orderKeysEnabled
             ? "gemma4_route_monolithic_top8_e128_k8_bf16_max8_sg1_v1"
-            : "gemma4_route_monolithic_top8_e128_k8_bf16_v2",
+            : "gemma4_route_monolithic_top8_e128_k8_bf16_v2")
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: kernelName,
         inputNames: ["scores", "pes"],
         outputNames: ["indices", "weights", "row_order", "sorted_keys", "inverse_order"],
         source: orderKeysEnabled ? """
@@ -3726,18 +3771,21 @@ private enum Gemma4RouteGlueFoldV1 {
                 const uint key_low = sel[lane];
                 const uint key_high = sel[32u + lane];
                 uint rank = 0;
+        \(routePrefixStateSource)
                 #pragma clang loop unroll(full)
                 for (uint source = 0; source < 32; ++source) {
                     const uint other_low = simd_broadcast(key_low, ushort(source));
                     rank += (other_low < key)
                         || (other_low == key && source < assignment);
+        \(routePrefixLowSource)
                     const uint other_high = simd_broadcast(key_high, ushort(source));
                     const uint high_assignment = 32u + source;
                     rank += (other_high < key)
                         || (other_high == key && high_assignment < assignment);
+        \(routePrefixHighSource)
                 }
                 row_order[rank] = assignment / 8;
-                sorted_keys[rank] = key;
+        \(routeSortedKeySource)
                 inverse_order[assignment] = rank;
             }
         """ : """
@@ -3824,18 +3872,21 @@ private enum Gemma4RouteGlueFoldV1 {
                 const uint key_low = sel[lane];
                 const uint key_high = sel[32u + lane];
                 uint rank = 0;
+        \(routePrefixStateSource)
                 #pragma clang loop unroll(full)
                 for (uint source = 0; source < 32; ++source) {
                     const uint other_low = simd_broadcast(key_low, ushort(source));
                     rank += (other_low < key)
                         || (other_low == key && source < assignment);
+        \(routePrefixLowSource)
                     const uint other_high = simd_broadcast(key_high, ushort(source));
                     const uint high_assignment = 32u + source;
                     rank += (other_high < key)
                         || (other_high == key && high_assignment < assignment);
+        \(routePrefixHighSource)
                 }
                 row_order[rank] = assignment / 8;
-                sorted_keys[rank] = key;
+        \(routeSortedKeySource)
                 inverse_order[assignment] = rank;
             }
         """,
@@ -3894,6 +3945,9 @@ private enum Gemma4RouteGlueFoldV1 {
         else { return nil }
         CBv2EngageMark.once("glue-fold")
         if orderKeysEnabled { CBv2EngageMark.once("router-native-max8-sg1-decode") }
+        if switchRouteGluePrefixBoundsEnabled {
+            CBv2EngageMark.once("route-glue-prefix-bounds")
+        }
         let outs = kernel(
             [scores, perExpertScale],
             grid: (orderKeysEnabled ? 256 : 1024, 1, 1),
@@ -3907,7 +3961,8 @@ private enum Gemma4RouteGlueFoldV1 {
             table: SwitchRouteTable(
                 rowOrder: outs[2],
                 sortedKeys: outs[3],
-                inverseOrder: outs[4]))
+                inverseOrder: outs[4],
+                hasExpertPrefixBounds: switchRouteGluePrefixBoundsEnabled))
     }
 }
 

@@ -90,7 +90,7 @@ public enum Gemma4MMAQuantizedGEMV {
     /// Output columns one simdgroup owns (one 8x8 tile).
     private static let colsPerSimdgroup = 8
     /// Simdgroups per threadgroup.
-    private static let simdgroupsPerThreadgroup = 4
+    private static let simdgroupsPerThreadgroup = 2
     /// Output columns one threadgroup owns in versions 1...14.
     private static let colsPerThreadgroup = colsPerSimdgroup * simdgroupsPerThreadgroup
     /// Threads per threadgroup (one Apple simdgroup is 32 lanes).
@@ -699,7 +699,7 @@ public enum Gemma4MMAQuantizedGEMV {
     private static let sourceV3 = """
         constexpr uint M_ROWS = 8;
         constexpr uint GROUP = 64;
-        constexpr uint N_SG = 4;
+        constexpr uint N_SG = 2;
         constexpr uint N_PSG = 8;
         // Activation staged TRANSPOSED as [j][m], so X_STRIDE spans the eight
         // batch rows (+1 to break the power-of-two bank stride).
@@ -2566,7 +2566,7 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1",
+        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1_sg2",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["out"],
         source: sourceV27,
@@ -2750,7 +2750,7 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27Carry: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2",
+        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2_sg2",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["out"],
         source: sourceV27Carry,
@@ -3141,21 +3141,21 @@ public enum Gemma4MMAQuantizedGEMV {
 
         return RelayoutKernels(
             logits: MLXFast.metalKernel(
-                name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1_rl1",
+                name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1_rl1_sg2",
                 inputNames: ["x", "w", "scales", "biases", "xSums"],
                 outputNames: ["out"],
                 source: logits,
                 header: "#include <metal_simdgroup_matrix>\n",
                 ensureRowContiguous: true),
             carry: MLXFast.metalKernel(
-                name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2_rl1",
+                name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2_rl1_sg2",
                 inputNames: ["x", "w", "scales", "biases", "xSums"],
                 outputNames: ["out"],
                 source: carry,
                 header: "#include <metal_simdgroup_matrix>\n",
                 ensureRowContiguous: true),
             argmax: MLXFast.metalKernel(
-                name: "gemma4_mma_affine4_qmv_m8_v27_argmax_rl1"
+                name: "gemma4_mma_affine4_qmv_m8_v27_argmax_rl1_sg2"
                     + logitslessCarryKeySuffix,
                 inputNames: ["x", "w", "scales", "biases", "xSums"],
                 outputNames: ["pv", "pi"],
@@ -3481,7 +3481,7 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27Argmax: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_argmax" + logitslessCarryKeySuffix,
+        name: "gemma4_mma_affine4_qmv_m8_v27_argmax_sg2" + logitslessCarryKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["pv", "pi"],
         source: sourceV27Argmax,

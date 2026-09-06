@@ -2749,11 +2749,223 @@ public enum Gemma4MMAQuantizedGEMV {
         return result
     }()
 
+    // MARK: - HEAD-CARRY2 --- the weight operand carried two groups ahead
+
+    /// `false` only when `DARKBLOOM_GEMMA4_HEAD_CARRY2` is an explicit off
+    /// value, and always `false` when the one-deep carry itself is off. Off
+    /// restores `sourceV27Carry`, every derived twin and every kernel
+    /// registration name byte for byte.
+    private static let carry2Enabled: Bool = {
+        guard carryEnabled else { return false }
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_HEAD_CARRY2"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
+    /// Registration-name suffix for every kernel whose source text the deeper
+    /// carry changes. A changed body must never reuse a cached pipeline key.
+    private static let carry2KeySuffix = carry2Enabled ? "_hc2" : ""
+
+    /// The fused-argmax twin only carries when the logitsless carry is armed,
+    /// so its name only moves in that case.
+    private static let argmaxCarry2KeySuffix =
+        (carry2Enabled && logitslessCarryEnabled) ? "_hc2" : ""
+
+    /// HEAD-CARRY2. The incumbent carry keeps exactly ONE group --- 32 bytes of
+    /// packed codes plus four group scales --- outstanding per lane while the
+    /// current group's thirty-two matrix-unit steps run. At the tied head the
+    /// limiter is bytes in flight per lane, so a second register set doubles
+    /// the outstanding request depth to 64 bytes of codes and eight scales.
+    ///
+    /// Set A holds group `g`, set B holds group `g + 1`. Both are primed before
+    /// the group walk. Each trip consumes set A exactly where the incumbent
+    /// consumed its single set, then moves B into A and issues the `g + 2`
+    /// fetch at the very statement the incumbent's `g + 1` reload occupied.
+    /// `gNext` is clamped to the last valid group exactly as the one-deep carry
+    /// clamps it, so the final two look-aheads re-read a group already read and
+    /// their values are discarded at loop exit. The `g >= N_GROUPS` trips of
+    /// the unrolled tail block neither consume nor advance either set.
+    ///
+    /// Loads are pure reads of a read-only plane: their values do not depend on
+    /// when they issue. Every consume slot, every `simdgroup_multiply_accumulate`,
+    /// the `metal::fma` scale close, the batched affine-bias MMA, the
+    /// accumulation order and every rounding are the incumbent's word for word.
+    /// Only WHEN a load issues and WHICH register holds it changes. Output is
+    /// bit-identical to the one-deep carry's, hence to version 27's.
+    private static let sourceV27Carry2: String = {
+        var result = sourceV27Carry
+
+        func replaceOnce(_ old: String, with new: String) {
+            let count = result.components(separatedBy: old).count
+            precondition(
+                count == 2, "sourceV27Carry2 replacement count \(count): \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            """
+            uint4 carryLo0;
+            uint4 carryHi0;
+            uint4 carryLo1;
+            uint4 carryHi1;
+            uint4 carryLo2;
+            uint4 carryHi2;
+            uint4 carryLo3;
+            uint4 carryHi3;
+            T carryS0;
+            T carryS1;
+            T carryS2;
+            T carryS3;
+            """,
+            with: """
+            uint4 carryLo0;
+            uint4 carryHi0;
+            uint4 carryLo1;
+            uint4 carryHi1;
+            uint4 carryLo2;
+            uint4 carryHi2;
+            uint4 carryLo3;
+            uint4 carryHi3;
+            T carryS0;
+            T carryS1;
+            T carryS2;
+            T carryS3;
+            uint4 carry2Lo0;
+            uint4 carry2Hi0;
+            uint4 carry2Lo1;
+            uint4 carry2Hi1;
+            uint4 carry2Lo2;
+            uint4 carry2Hi2;
+            uint4 carry2Lo3;
+            uint4 carry2Hi3;
+            T carry2S0;
+            T carry2S1;
+            T carry2S2;
+            T carry2S3;
+            """
+        )
+
+        replaceOnce(
+            """
+                carryS0 = fragmentSRow0[0];
+                carryS1 = fragmentSRow1[0];
+                carryS2 = fragmentSRow2[0];
+                carryS3 = fragmentSRow3[0];
+            }
+            """,
+            with: """
+                carryS0 = fragmentSRow0[0];
+                carryS1 = fragmentSRow1[0];
+                carryS2 = fragmentSRow2[0];
+                carryS3 = fragmentSRow3[0];
+            }
+            {
+                const uint gPrime = min(1u, N_GROUPS - 1u);
+                const uint carryWordPrime = carryWordBase + gPrime * (GROUP / 8);
+                const device uint4* carryGroup =
+                    reinterpret_cast<const device uint4*>(w + carryWordPrime);
+                carry2Lo0 = carryGroup[0];
+                carry2Hi0 = carryGroup[1];
+                carryGroup = reinterpret_cast<const device uint4*>(
+                    w + carryWordPrime + carryTileStride);
+                carry2Lo1 = carryGroup[0];
+                carry2Hi1 = carryGroup[1];
+                carryGroup = reinterpret_cast<const device uint4*>(
+                    w + carryWordPrime + carryTileStride * 2);
+                carry2Lo2 = carryGroup[0];
+                carry2Hi2 = carryGroup[1];
+                carryGroup = reinterpret_cast<const device uint4*>(
+                    w + carryWordPrime + carryTileStride * 3);
+                carry2Lo3 = carryGroup[0];
+                carry2Hi3 = carryGroup[1];
+                carry2S0 = fragmentSRow0[gPrime];
+                carry2S1 = fragmentSRow1[gPrime];
+                carry2S2 = fragmentSRow2[gPrime];
+                carry2S3 = fragmentSRow3[gPrime];
+            }
+            """
+        )
+
+        replaceOnce(
+            """
+                const uint gNext = min(g + 1u, N_GROUPS - 1u);
+                const uint packedWordNext = carryWordBase + gNext * (GROUP / 8);
+                const device uint4* packedGroup =
+                    reinterpret_cast<const device uint4*>(w + packedWordNext);
+                carryLo0 = packedGroup[0];
+                carryHi0 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWordNext + carryTileStride);
+                carryLo1 = packedGroup[0];
+                carryHi1 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWordNext + carryTileStride * 2);
+                carryLo2 = packedGroup[0];
+                carryHi2 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWordNext + carryTileStride * 3);
+                carryLo3 = packedGroup[0];
+                carryHi3 = packedGroup[1];
+                carryS0 = fragmentSRow0[gNext];
+                carryS1 = fragmentSRow1[gNext];
+                carryS2 = fragmentSRow2[gNext];
+                carryS3 = fragmentSRow3[gNext];
+            """,
+            with: """
+                const uint gNext = min(g + 2u, N_GROUPS - 1u);
+                carryLo0 = carry2Lo0;
+                carryHi0 = carry2Hi0;
+                carryLo1 = carry2Lo1;
+                carryHi1 = carry2Hi1;
+                carryLo2 = carry2Lo2;
+                carryHi2 = carry2Hi2;
+                carryLo3 = carry2Lo3;
+                carryHi3 = carry2Hi3;
+                carryS0 = carry2S0;
+                carryS1 = carry2S1;
+                carryS2 = carry2S2;
+                carryS3 = carry2S3;
+                const uint packedWordNext = carryWordBase + gNext * (GROUP / 8);
+                const device uint4* packedGroup =
+                    reinterpret_cast<const device uint4*>(w + packedWordNext);
+                carry2Lo0 = packedGroup[0];
+                carry2Hi0 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWordNext + carryTileStride);
+                carry2Lo1 = packedGroup[0];
+                carry2Hi1 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWordNext + carryTileStride * 2);
+                carry2Lo2 = packedGroup[0];
+                carry2Hi2 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWordNext + carryTileStride * 3);
+                carry2Lo3 = packedGroup[0];
+                carry2Hi3 = packedGroup[1];
+                carry2S0 = fragmentSRow0[gNext];
+                carry2S1 = fragmentSRow1[gNext];
+                carry2S2 = fragmentSRow2[gNext];
+                carry2S3 = fragmentSRow3[gNext];
+            """
+        )
+
+        return result
+    }()
+
+    /// The carry body every twin below is derived from.
+    private static let sourceV27CarryLive: String =
+        carry2Enabled ? sourceV27Carry2 : sourceV27Carry
+
     private static let kernelV27Carry: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2",
+        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2"
+            + carry2KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["out"],
-        source: sourceV27Carry,
+        source: sourceV27CarryLive,
         header: "#include <metal_simdgroup_matrix>\n",
         ensureRowContiguous: true
     )
@@ -3058,6 +3270,238 @@ public enum Gemma4MMAQuantizedGEMV {
     ]
 
 
+    /// The relayout rewrite for the two-deep carry body. Same permuted lane
+    /// block as `relayoutCarryLanePairs`, with the second register set folded
+    /// into a single `uint4` pair exactly as the first one is.
+    private static let relayoutCarry2LanePairs: [(String, String)] = [
+        (
+            """
+            const uint carryWordBase = (sgN0 + fragmentRow) * W_ROW_U32;
+            """,
+            """
+            const uint carryWordBase =
+                (sgN0 / 32u) * (N_GROUPS * 256u) + lane * 8u;
+            """
+        ),
+        (
+            """
+            uint4 carryLo0;
+            uint4 carryHi0;
+            uint4 carryLo1;
+            uint4 carryHi1;
+            uint4 carryLo2;
+            uint4 carryHi2;
+            uint4 carryLo3;
+            uint4 carryHi3;
+            T carryS0;
+            T carryS1;
+            T carryS2;
+            T carryS3;
+            uint4 carry2Lo0;
+            uint4 carry2Hi0;
+            uint4 carry2Lo1;
+            uint4 carry2Hi1;
+            uint4 carry2Lo2;
+            uint4 carry2Hi2;
+            uint4 carry2Lo3;
+            uint4 carry2Hi3;
+            T carry2S0;
+            T carry2S1;
+            T carry2S2;
+            T carry2S3;
+            """,
+            """
+            uint4 carryA;
+            uint4 carryB;
+            T carryS0;
+            T carryS1;
+            T carryS2;
+            T carryS3;
+            uint4 carryA2;
+            uint4 carryB2;
+            T carry2S0;
+            T carry2S1;
+            T carry2S2;
+            T carry2S3;
+            """
+        ),
+        (
+            """
+                const device uint4* carryGroup =
+                    reinterpret_cast<const device uint4*>(w + carryWordBase);
+                carryLo0 = carryGroup[0];
+                carryHi0 = carryGroup[1];
+                carryGroup = reinterpret_cast<const device uint4*>(
+                    w + carryWordBase + carryTileStride);
+                carryLo1 = carryGroup[0];
+                carryHi1 = carryGroup[1];
+                carryGroup = reinterpret_cast<const device uint4*>(
+                    w + carryWordBase + carryTileStride * 2);
+                carryLo2 = carryGroup[0];
+                carryHi2 = carryGroup[1];
+                carryGroup = reinterpret_cast<const device uint4*>(
+                    w + carryWordBase + carryTileStride * 3);
+                carryLo3 = carryGroup[0];
+                carryHi3 = carryGroup[1];
+            """,
+            """
+                const device uint4* carryGroup =
+                    reinterpret_cast<const device uint4*>(w + carryWordBase);
+                carryA = carryGroup[0];
+                carryB = carryGroup[1];
+            """
+        ),
+        (
+            """
+                const uint carryWordPrime = carryWordBase + gPrime * (GROUP / 8);
+                const device uint4* carryGroup =
+                    reinterpret_cast<const device uint4*>(w + carryWordPrime);
+                carry2Lo0 = carryGroup[0];
+                carry2Hi0 = carryGroup[1];
+                carryGroup = reinterpret_cast<const device uint4*>(
+                    w + carryWordPrime + carryTileStride);
+                carry2Lo1 = carryGroup[0];
+                carry2Hi1 = carryGroup[1];
+                carryGroup = reinterpret_cast<const device uint4*>(
+                    w + carryWordPrime + carryTileStride * 2);
+                carry2Lo2 = carryGroup[0];
+                carry2Hi2 = carryGroup[1];
+                carryGroup = reinterpret_cast<const device uint4*>(
+                    w + carryWordPrime + carryTileStride * 3);
+                carry2Lo3 = carryGroup[0];
+                carry2Hi3 = carryGroup[1];
+            """,
+            """
+                const uint carryWordPrime = carryWordBase + gPrime * 256u;
+                const device uint4* carryGroup =
+                    reinterpret_cast<const device uint4*>(w + carryWordPrime);
+                carryA2 = carryGroup[0];
+                carryB2 = carryGroup[1];
+            """
+        ),
+        (
+            """
+                const uint4 packedLo0 = carryLo0;
+                const uint4 packedHi0 = carryHi0;
+                const uint4 packedLo1 = carryLo1;
+                const uint4 packedHi1 = carryHi1;
+                const uint4 packedLo2 = carryLo2;
+                const uint4 packedHi2 = carryHi2;
+                const uint4 packedLo3 = carryLo3;
+                const uint4 packedHi3 = carryHi3;
+            """,
+            """
+                const uint2 packedQ0 = carryA.xy;
+                const uint2 packedQ1 = carryA.zw;
+                const uint2 packedQ2 = carryB.xy;
+                const uint2 packedQ3 = carryB.zw;
+            """
+        ),
+        (
+            """
+                carryLo0 = carry2Lo0;
+                carryHi0 = carry2Hi0;
+                carryLo1 = carry2Lo1;
+                carryHi1 = carry2Hi1;
+                carryLo2 = carry2Lo2;
+                carryHi2 = carry2Hi2;
+                carryLo3 = carry2Lo3;
+                carryHi3 = carry2Hi3;
+            """,
+            """
+                carryA = carryA2;
+                carryB = carryB2;
+            """
+        ),
+        (
+            """
+                const uint packedWordNext = carryWordBase + gNext * (GROUP / 8);
+            """,
+            """
+                const uint packedWordNext = carryWordBase + gNext * 256u;
+            """
+        ),
+        (
+            """
+                const device uint4* packedGroup =
+                    reinterpret_cast<const device uint4*>(w + packedWordNext);
+                carry2Lo0 = packedGroup[0];
+                carry2Hi0 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWordNext + carryTileStride);
+                carry2Lo1 = packedGroup[0];
+                carry2Hi1 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWordNext + carryTileStride * 2);
+                carry2Lo2 = packedGroup[0];
+                carry2Hi2 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWordNext + carryTileStride * 3);
+                carry2Lo3 = packedGroup[0];
+                carry2Hi3 = packedGroup[1];
+            """,
+            """
+                const device uint4* packedGroup =
+                    reinterpret_cast<const device uint4*>(w + packedWordNext);
+                carryA2 = packedGroup[0];
+                carryB2 = packedGroup[1];
+            """
+        ),
+        (
+            """
+                    const uint packed0 = t < 4 ? packedLo0[t] : packedHi0[t - 4];
+                    const uint packed1 = t < 4 ? packedLo1[t] : packedHi1[t - 4];
+                    const uint packed2 = t < 4 ? packedLo2[t] : packedHi2[t - 4];
+                    const uint packed3 = t < 4 ? packedLo3[t] : packedHi3[t - 4];
+                    A0.thread_elements()[0] =
+                        float((packed0 >> (4 * fragmentCol)) & 0xFu);
+                    A0.thread_elements()[1] =
+                        float((packed0 >> (4 * (fragmentCol + 1))) & 0xFu);
+                    A1.thread_elements()[0] =
+                        float((packed1 >> (4 * fragmentCol)) & 0xFu);
+                    A1.thread_elements()[1] =
+                        float((packed1 >> (4 * (fragmentCol + 1))) & 0xFu);
+                    A2.thread_elements()[0] =
+                        float((packed2 >> (4 * fragmentCol)) & 0xFu);
+                    A2.thread_elements()[1] =
+                        float((packed2 >> (4 * (fragmentCol + 1))) & 0xFu);
+                    A3.thread_elements()[0] =
+                        float((packed3 >> (4 * fragmentCol)) & 0xFu);
+                    A3.thread_elements()[1] =
+                        float((packed3 >> (4 * (fragmentCol + 1))) & 0xFu);
+            """,
+            """
+                    // Byte t of the lane's quarter holds nibbles fragmentCol and
+                    // fragmentCol + 1 of word t: the incumbent's two operands.
+                    const uint packed0 = t < 4 ? packedQ0.x : packedQ0.y;
+                    const uint packed1 = t < 4 ? packedQ1.x : packedQ1.y;
+                    const uint packed2 = t < 4 ? packedQ2.x : packedQ2.y;
+                    const uint packed3 = t < 4 ? packedQ3.x : packedQ3.y;
+                    const uint nibbleShift = 8u * (t & 3u);
+                    A0.thread_elements()[0] =
+                        float((packed0 >> nibbleShift) & 0xFu);
+                    A0.thread_elements()[1] =
+                        float((packed0 >> (nibbleShift + 4u)) & 0xFu);
+                    A1.thread_elements()[0] =
+                        float((packed1 >> nibbleShift) & 0xFu);
+                    A1.thread_elements()[1] =
+                        float((packed1 >> (nibbleShift + 4u)) & 0xFu);
+                    A2.thread_elements()[0] =
+                        float((packed2 >> nibbleShift) & 0xFu);
+                    A2.thread_elements()[1] =
+                        float((packed2 >> (nibbleShift + 4u)) & 0xFu);
+                    A3.thread_elements()[0] =
+                        float((packed3 >> nibbleShift) & 0xFu);
+                    A3.thread_elements()[1] =
+                        float((packed3 >> (nibbleShift + 4u)) & 0xFu);
+            """
+        ),
+    ]
+
+    /// The carry rewrite pairs matching `sourceV27CarryLive`.
+    private static let relayoutCarryLanePairsLive: [(String, String)] =
+        carry2Enabled ? relayoutCarry2LanePairs : relayoutCarryLanePairs
+
     private static func relayoutRewrite(
         _ source: String, _ pairs: [(String, String)]
     ) -> String? {
@@ -3066,7 +3510,9 @@ public enum Gemma4MMAQuantizedGEMV {
             guard result.components(separatedBy: old).count == 2 else { return nil }
             result = result.replacingOccurrences(of: old, with: new)
         }
-        for leftover in ["packedLo", "packedHi", "carryLo", "carryHi"] {
+        for leftover in [
+            "packedLo", "packedHi", "carryLo", "carryHi", "carry2Lo", "carry2Hi",
+        ] {
             guard !result.contains(leftover) else { return nil }
         }
         return result
@@ -3129,10 +3575,11 @@ public enum Gemma4MMAQuantizedGEMV {
     private static let relayoutKernels: RelayoutKernels? = {
         guard relayoutEnabled else { return nil }
         guard let logits = relayoutRewrite(sourceV27, relayoutLanePairs),
-            let carry = relayoutRewrite(sourceV27Carry, relayoutCarryLanePairs),
+            let carry = relayoutRewrite(sourceV27CarryLive, relayoutCarryLanePairsLive),
             let argmax = relayoutRewrite(
                 sourceV27Argmax,
-                logitslessCarryEnabled ? relayoutCarryLanePairs : relayoutLanePairs)
+                logitslessCarryEnabled
+                    ? relayoutCarryLanePairsLive : relayoutLanePairs)
         else {
             FileHandle.standardError.write(
                 Data("[head-relayout] derivation mismatch; incumbent kept\n".utf8))
@@ -3148,7 +3595,8 @@ public enum Gemma4MMAQuantizedGEMV {
                 header: "#include <metal_simdgroup_matrix>\n",
                 ensureRowContiguous: true),
             carry: MLXFast.metalKernel(
-                name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2_rl1",
+                name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2_rl1"
+                    + carry2KeySuffix,
                 inputNames: ["x", "w", "scales", "biases", "xSums"],
                 outputNames: ["out"],
                 source: carry,
@@ -3156,7 +3604,7 @@ public enum Gemma4MMAQuantizedGEMV {
                 ensureRowContiguous: true),
             argmax: MLXFast.metalKernel(
                 name: "gemma4_mma_affine4_qmv_m8_v27_argmax_rl1"
-                    + logitslessCarryKeySuffix,
+                    + logitslessCarryKeySuffix + argmaxCarry2KeySuffix,
                 inputNames: ["x", "w", "scales", "biases", "xSums"],
                 outputNames: ["pv", "pi"],
                 source: argmax,
@@ -3284,6 +3732,7 @@ public enum Gemma4MMAQuantizedGEMV {
             case 27:
                 if carryEnabled {
                     CBv2EngageMark.once("mma-head-carry")
+                    if carry2Enabled { CBv2EngageMark.once("head-carry2") }
                     selected = relayoutKernels?.carry ?? kernelV27Carry
                 } else {
                     selected = relayoutKernels?.logits ?? kernelV27
@@ -3391,7 +3840,7 @@ public enum Gemma4MMAQuantizedGEMV {
     /// into `pv`/`pi`: `[8, N / 128]`, 128 KB at the tied head's geometry
     /// against the 4 MB the logits store cost.
     private static let sourceV27Argmax: String = {
-        var result = logitslessCarryEnabled ? sourceV27Carry : sourceV27
+        var result = logitslessCarryEnabled ? sourceV27CarryLive : sourceV27
 
         func replaceOnce(_ old: String, with new: String) {
             let count = result.components(separatedBy: old).count
@@ -3481,7 +3930,8 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27Argmax: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_argmax" + logitslessCarryKeySuffix,
+        name: "gemma4_mma_affine4_qmv_m8_v27_argmax" + logitslessCarryKeySuffix
+            + argmaxCarry2KeySuffix,
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["pv", "pi"],
         source: sourceV27Argmax,
@@ -3601,6 +4051,9 @@ public enum Gemma4MMAQuantizedGEMV {
             )[0]
         }
 
+        if carry2Enabled, logitslessCarryEnabled {
+            CBv2EngageMark.once("head-carry2")
+        }
         let headKernel: MLXFast.MLXFastKernel
         let plane: MLXArray
         if let relaid = relayoutKernels {

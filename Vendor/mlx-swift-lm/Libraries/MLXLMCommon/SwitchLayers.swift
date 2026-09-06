@@ -512,6 +512,17 @@ private let routeCountingSort64Enabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// ROUTE-GLUE-PREFIX-BOUNDS: emit the existing tagged expert/run-bounds ABI
+/// inside the already-fused Gemma decode router + route-table dispatch. The
+/// exact-shape consumer still checks its projection capability before accepting
+/// a tagged carrier. Set the kill switch false to keep the raw GLUE-FOLD table.
+public let switchRouteGluePrefixBoundsEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_ROUTE_GLUE_PREFIX_BOUNDS"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private let expertPrefixBoundsEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_EXPERT_PREFIX_BOUNDS"]
@@ -1114,19 +1125,28 @@ private func routeCountingSortPrefill(
 /// `sorted_keys`, `inverse_order`, each `[64]` uint32) computed upstream by a
 /// producer that already holds the router scores, so `projectExperts` never
 /// issues its standalone route-table dispatch. The arrays must be exactly what
-/// `gatherSortIndices` would have produced for the same `[8, 8]` indices --
-/// raw (untagged) sorted expert keys included -- and any shape, dtype or
-/// switch-state mismatch declines the carrier and re-issues the incumbent
-/// chain unchanged.
+/// `gatherSortIndices` would have produced for the same `[8, 8]` indices. Raw
+/// sorted expert keys are the default; a producer may explicitly mark the
+/// existing tagged prefix-bounds ABI. Any shape, dtype, tag-mode, switch-state,
+/// or projection-capability mismatch declines the carrier and re-issues the
+/// incumbent chain unchanged.
 public struct SwitchRouteTable {
     public let rowOrder: MLXArray
     public let sortedKeys: MLXArray
     public let inverseOrder: MLXArray
+    /// True only when `sortedKeys` carries the tagged expert/run-bounds ABI.
+    public let hasExpertPrefixBounds: Bool
 
-    public init(rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray) {
+    public init(
+        rowOrder: MLXArray,
+        sortedKeys: MLXArray,
+        inverseOrder: MLXArray,
+        hasExpertPrefixBounds: Bool = false
+    ) {
         self.rowOrder = rowOrder
         self.sortedKeys = sortedKeys
         self.inverseOrder = inverseOrder
+        self.hasExpertPrefixBounds = hasExpertPrefixBounds
     }
 }
 
@@ -1562,7 +1582,8 @@ public class SwitchGLU: Module {
             indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
             && x.ndim == 2 && x.shape == [8, inputDims]
         let useExpertPrefixBounds =
-            expertPrefixBoundsEnabled && useLhsIndices
+            (expertPrefixBoundsEnabled || routeTable?.hasExpertPrefixBounds == true)
+            && useLhsIndices
             && indices.dtype == .uint32 && x.dtype == .bfloat16
             && expertPrefixBoundsProjectionsEligible
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
@@ -1587,7 +1608,7 @@ public class SwitchGLU: Module {
                 // disabled incumbent rank path -- re-issues the incumbent
                 // chain, which produces byte-identical arrays.
                 if let table = routeTable,
-                    !useExpertPrefixBounds,
+                    table.hasExpertPrefixBounds == useExpertPrefixBounds,
                     routeSimdRank64Enabled,
                     numExperts == 128,
                     table.rowOrder.dtype == .uint32,

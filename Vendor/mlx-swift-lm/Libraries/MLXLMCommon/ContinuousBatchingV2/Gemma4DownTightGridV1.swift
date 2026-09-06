@@ -38,6 +38,58 @@ public enum Gemma4DownTightGridV1 {
         #endif
     }()
 
+    /// Threadgroup launch tile over the (row group, assignment) plane.
+    ///
+    /// The compact dispatch enumerates one launch index per surviving
+    /// threadgroup and the incumbent decodes it assignment-fastest: 64
+    /// consecutive threadgroups take all 64 assignments at one row group, then
+    /// step the row group. Those 64 assignments name up to 64 different
+    /// experts, so the weight bytes a co-resident wavefront touches are
+    /// scattered across the whole 128-expert plane, and each threadgroup's
+    /// activation row is read by exactly one member of the wavefront.
+    ///
+    /// Decoding the same index as an `aTile` by `64 / aTile` tile keeps the
+    /// co-resident set inside `aTile` assignments and `64 / aTile` consecutive
+    /// row groups instead. An expert's rows are then walked contiguously by
+    /// `64 / aTile` neighbours and each activation row is shared by the same
+    /// number, so both streams stay resident for a window instead of being
+    /// touched once and evicted. The map is a bijection on the launch index, so
+    /// the set of (row group, assignment) pairs, the work each pair does, the
+    /// pair election it runs and every store address are unchanged.
+    ///
+    /// Zero restores the promoted assignment-fastest decode, and its kernel
+    /// name, byte for byte in the same executable.
+    static let launchTile: Int = {
+        #if os(macOS)
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_ZTILE"]
+        else { return 8 }
+        return ["0", "false", "no", "off"].contains(raw.lowercased()) ? 0 : 8
+        #else
+        return 0
+        #endif
+    }()
+
+    /// The two statements that differ between the two decodes.
+    private static let launchDecode: String = {
+        guard launchTile > 0 else {
+            return """
+                tid.y = (linear / 64) * SPAN;
+                tid.z = linear % 64;
+                """
+        }
+        return """
+            const uint tile_a = \(launchTile);
+            const uint tile_rows = 64u / tile_a;
+            const uint tile_cols = 64u / tile_a;
+            const uint tile_index = linear / 64u;
+            const uint tile_slot = linear % 64u;
+            tid.z = (tile_index % tile_cols) * tile_a + (tile_slot % tile_a);
+            tid.y = ((tile_index / tile_cols) * tile_rows + (tile_slot / tile_a)) * SPAN;
+            """
+    }()
+
+    private static let launchKeySuffix = launchTile > 0 ? "_atile\(launchTile)" : ""
+
     /// Bound to the immutable sanitized checkpoint, like the fused gate/up storage.
     public final class Storage {
         private let weight: MLXArray
@@ -77,23 +129,23 @@ public enum Gemma4DownTightGridV1 {
     }
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_down_qmv_span4_tight_zorder_v1",
+        name: "gemma4_b8_down_qmv_span4_tight_zorder_v1" + launchKeySuffix,
         inputNames: ["w", "scales", "biases", "x", "lhs_indices", "rhs_indices"],
         outputNames: ["y"],
-        source: #"""
+        source: """
 uint3 tid = threadgroup_position_in_grid;
 const uint linear = tid.y + tid.z * (352 / SPAN);
-tid.y = (linear / 64) * SPAN;
-tid.z = linear % 64;
-// Preserve assignment-fast enumeration with 352 / SPAN surviving y groups.
-// Map compact y-group g to the old survivor SPAN*g. The helper, its pair
-// elections, per-tile walk, qdot chains, SIMD reductions and stores are verbatim.
+\(launchDecode)
+// Decode the compact launch index into 352 / SPAN surviving y groups and 64
+// assignments. Map compact y-group g to the old survivor SPAN*g. The helper,
+// its pair elections, per-tile walk, qdot chains, SIMD reductions and stores
+// are verbatim.
 gather_qmv_gemma4_down_tile<T, 64, 4, SPAN>(
     w, scales, biases, x, lhs_indices, rhs_indices, y,
     gemma4_tight_down_K, gemma4_tight_down_N, 1, 1,
     704, 2816 * 704 / 8, 2816 * 704 / 64, 2816 * 704 / 64,
     tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
-"""#,
+""",
         header: #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helper bodies verified byte-identical to 093e716.
 #include <metal_stdlib>

@@ -5277,6 +5277,269 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
+    private static let softmaxAVFusionEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_SOFTMAX_AV_FUSION"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// One 1024-thread group per row/KV head keeps the eight BF16 probability
+    /// rows in threadgroup memory, then assigns one SIMD group to each
+    /// 16-column AV slice. The softmax waves reproduce the active vector
+    /// kernel's four-score ownership and sequential cross-group reductions;
+    /// AV/XFOLD and the 32-column ORS pair table retain their existing order.
+    private static let softmaxAVORunsumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_softmax_av_bf16_g8_xfold_v1_ors_pairs",
+        inputNames: [
+            "scores",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "params",
+        ],
+        outputNames: ["out", "rs"],
+        source: """
+            constexpr int D = 512;
+            constexpr int GQA = 8;
+            constexpr int MAX_KEY_LENGTH = 1152;
+
+            const int key_length = int(params[0]);
+            const int row_kv = int(threadgroup_position_in_grid.z);
+            const int row = row_kv / 2;
+            const int kv_head = row_kv % 2;
+            const int sg = int(simdgroup_index_in_threadgroup);
+            const int lane = int(thread_index_in_simdgroup);
+            const int num_simdgroups = (key_length + 127) / 128;
+            const int heads_per_wave = 32 / num_simdgroups;
+            const int wave_count = (GQA + heads_per_wave - 1) / heads_per_wave;
+            const bool row_vec4 = (key_length & 3) == 0;
+
+            typedef vec<T, 4> T4;
+            threadgroup T local_probs[GQA * MAX_KEY_LENGTH];
+            threadgroup float local_max[4][32];
+            threadgroup float local_normalizer[4][32];
+
+            for (int wave = 0; wave < wave_count; ++wave) {
+                const int head_slot = sg / num_simdgroups;
+                const int local_sg = sg - head_slot * num_simdgroups;
+                const int head = wave * heads_per_wave + head_slot;
+                const bool active = head_slot < heads_per_wave && head < GQA;
+                const int logical_lid = local_sg * 32 + lane;
+                float ld[4];
+
+                if (active) {
+                    const device T* in = scores
+                        + size_t(row * 16 + kv_head * GQA + head) * key_length
+                        + logical_lid * 4;
+                    if (logical_lid * 4 + 4 <= key_length) {
+                        if (row_vec4) {
+                            const T4 raw = *reinterpret_cast<const device T4*>(in);
+                            for (int i = 0; i < 4; ++i) {
+                                ld[i] = static_cast<float>(raw[i]);
+                            }
+                        } else {
+                            for (int i = 0; i < 4; ++i) {
+                                ld[i] = static_cast<float>(in[i]);
+                            }
+                        }
+                    } else {
+                        for (int i = 0; i < 4; ++i) {
+                            ld[i] = logical_lid * 4 + i < key_length
+                                ? static_cast<float>(in[i]) : -INFINITY;
+                        }
+                    }
+
+                    float maxval = -3.402823466e+38F;
+                    for (int i = 0; i < 4; ++i) {
+                        maxval = maxval < ld[i] ? ld[i] : maxval;
+                    }
+                    maxval = simd_max(maxval);
+                    if (lane == 0) {
+                        local_max[head_slot][local_sg] = maxval;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (active) {
+                    float maxval = -3.402823466e+38F;
+                    for (int s = 0; s < num_simdgroups; ++s) {
+                        const float sm = local_max[head_slot][s];
+                        maxval = maxval < sm ? sm : maxval;
+                    }
+
+                    float normalizer = 0.0f;
+                    for (int i = 0; i < 4; ++i) {
+                        const float exp_x = fast::exp(ld[i] - maxval);
+                        ld[i] = exp_x;
+                        normalizer += exp_x;
+                    }
+                    normalizer = simd_sum(normalizer);
+                    if (lane == 0) {
+                        local_normalizer[head_slot][local_sg] = normalizer;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (active) {
+                    float normalizer = 0.0f;
+                    for (int s = 0; s < num_simdgroups; ++s) {
+                        normalizer += local_normalizer[head_slot][s];
+                    }
+                    const float inv_normalizer = 1.0f / normalizer;
+                    threadgroup T* out_row = local_probs + head * MAX_KEY_LENGTH
+                        + logical_lid * 4;
+                    if (logical_lid * 4 + 4 <= key_length) {
+                        for (int i = 0; i < 4; ++i) {
+                            out_row[i] = static_cast<T>(ld[i] * inv_normalizer);
+                        }
+                    } else {
+                        for (int i = 0; i < 4; ++i) {
+                            if (logical_lid * 4 + i < key_length) {
+                                out_row[i] = static_cast<T>(
+                                    ld[i] * inv_normalizer);
+                            }
+                        }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            const int row_capacity = int(params[2 + row]);
+            const device T* value_plane = v0;
+            switch (row) {
+                case 1: value_plane = v1; break;
+                case 2: value_plane = v2; break;
+                case 3: value_plane = v3; break;
+                case 4: value_plane = v4; break;
+                case 5: value_plane = v5; break;
+                case 6: value_plane = v6; break;
+                case 7: value_plane = v7; break;
+                default: break;
+            }
+            value_plane += size_t(kv_head) * size_t(row_capacity) * D;
+
+            const int thrM = lane / 4;
+            const int thrN = lane % 4;
+            int bm = thrM * 4;
+            const int out_col = 16 * sg + 4 * thrN;
+            float result[GQA * 4] = {0.0f};
+            T4 v_tile[4];
+            float p_coeff[4];
+            const int n_iter = key_length / 32;
+            const int leftover = key_length - n_iter * 32;
+
+            for (int i = 0; i < n_iter; ++i) {
+                #pragma clang loop unroll(full)
+                for (int tm = 0; tm < 4; ++tm) {
+                    v_tile[tm] = *reinterpret_cast<const device T4*>(
+                        value_plane + size_t(bm + tm) * D + out_col);
+                }
+                #pragma clang loop unroll(full)
+                for (int h = 0; h < GQA; ++h) {
+                    #pragma clang loop unroll(full)
+                    for (int tm = 0; tm < 4; ++tm) {
+                        p_coeff[tm] = static_cast<float>(
+                            local_probs[h * MAX_KEY_LENGTH + bm + tm]);
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int tm = 0; tm < 4; ++tm) {
+                        const float vc = p_coeff[tm];
+                        for (int tn = 0; tn < 4; ++tn) {
+                            result[h * 4 + tn] += vc * v_tile[tm][tn];
+                        }
+                    }
+                }
+                bm += 32;
+            }
+            if (leftover > 0) {
+                for (int tm = 0; tm < 4 && bm + tm < key_length; ++tm) {
+                    #pragma clang loop unroll(full)
+                    for (int tn = 0; tn < 4; ++tn) {
+                        v_tile[0][tn] = value_plane[
+                            size_t(bm + tm) * D + out_col + tn];
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        const float pc = static_cast<float>(
+                            local_probs[h * MAX_KEY_LENGTH + bm + tm]);
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            result[h * 4 + tn] += pc * v_tile[0][tn];
+                        }
+                    }
+                }
+            }
+            {
+                const bool hi = (lane & 16) != 0;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 16; ++j) {
+                    const float a = result[j];
+                    const float b = result[16 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(16));
+                }
+            }
+            {
+                const bool hi = (lane & 8) != 0;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 8; ++j) {
+                    const float a = result[j];
+                    const float b = result[8 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(8));
+                }
+            }
+            {
+                const bool hi = (lane & 4) != 0;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    const float a = result[j];
+                    const float b = result[4 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(4));
+                }
+            }
+            {
+                device T* out_ptr = out
+                    + size_t(row * 16 + kv_head * GQA + thrM) * D
+                    + out_col;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    out_ptr[j] = static_cast<T>(result[j]);
+                }
+            }
+
+            threadgroup float rs_partial[32][32];
+            {
+                thread ushort own[4];
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    own[j] = as_type<ushort>(static_cast<T>(result[j]));
+                }
+                const ushort partner = ushort(lane ^ 1);
+                const bool upper = (lane & 1) != 0;
+                thread T xt[8];
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    const ushort other = simd_shuffle(own[j], partner);
+                    xt[j] = as_type<T>(upper ? other : own[j]);
+                    xt[4 + j] = as_type<T>(upper ? own[j] : other);
+                }
+                float rsv = 0;
+                rsv += xt[0] + xt[1] + xt[2] + xt[3];
+                rsv += xt[4] + xt[5] + xt[6] + xt[7];
+                rsv += simd_shuffle_xor(rsv, 2u);
+                rs_partial[sg][lane] = rsv;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                rsv += rs_partial[sg ^ 1][lane];
+                if ((sg & 1) == 0 && thrN == 0) {
+                    const int pair = sg / 2;
+                    rs[row * 256 + (kv_head * GQA + thrM) * 16 + pair] = rsv;
+                }
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
     // ATTRIBUTION. Everything in this WRITE-016-D512 section, and the
     // matching hunks in AttentionV1.swift and SequenceKV/FullSequenceKV.swift,
     // is taken VERBATIM from public ranked submission
@@ -6194,46 +6457,70 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             outputDTypes: [.bfloat16]
         )[0]
 
-        let softmaxThreads = ((keyLength + 3) / 4 + 31) / 32 * 32
-        let probs = softmaxActive(
-            [scores, paramsArray],
-            template: template,
-            grid: (softmaxThreads * batch * queryHeads, 1, 1),
-            threadGroup: (softmaxThreads, 1, 1),
-            outputShapes: [scratchShape],
-            outputDTypes: [.bfloat16]
-        )[0]
-
         // ORS-D512: dispatch 3 also emits the o_proj run-sum table (or its
         // per-threadgroup pair partials) for the activation it stores.
         let output: MLXArray
         let oRunsum: MLXArray?
-        if oRunsumFoldEnabled, softmaxVecEnabled {
-            let attended = avVecORunsumKernel(
-                [probs] + valueBuffers + [paramsArray],
+        if softmaxAVFusionEnabled,
+            oRunsumFoldEnabled,
+            softmaxVecEnabled,
+            avColumnTiles == 16,
+            keyLength >= 1024,
+            keyLength <= 1152
+        {
+            let attended = softmaxAVORunsumKernel(
+                [scores] + valueBuffers + [paramsArray],
                 template: template,
-                grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
-                threadGroup: (32, avSimdgroups, 1),
+                grid: (1024, 1, batch * kvHeads),
+                threadGroup: (1024, 1, 1),
                 outputShapes: [
                     [batch, queryHeads, 1, headDim],
-                    [batch, queryHeads * headDim / 64 * avORunsumPartials],
+                    [batch, 256],
                 ],
                 outputDTypes: [.bfloat16, .float32]
             )
             output = attended[0]
             oRunsum = attended[1]
-            CBv2EngageMark.once(
-                avORunsumPartials == 1 ? "d512-ors-av-table" : "d512-ors-av-pairs")
+            CBv2EngageMark.once("d512-softmax-av-ors-fused")
         } else {
-            output = avActive(
-                [probs] + valueBuffers + [paramsArray],
+            let softmaxThreads = ((keyLength + 3) / 4 + 31) / 32 * 32
+            let probs = softmaxActive(
+                [scores, paramsArray],
                 template: template,
-                grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
-                threadGroup: (32, avSimdgroups, 1),
-                outputShapes: [[batch, queryHeads, 1, headDim]],
+                grid: (softmaxThreads * batch * queryHeads, 1, 1),
+                threadGroup: (softmaxThreads, 1, 1),
+                outputShapes: [scratchShape],
                 outputDTypes: [.bfloat16]
             )[0]
-            oRunsum = nil
+
+            if oRunsumFoldEnabled, softmaxVecEnabled {
+                let attended = avVecORunsumKernel(
+                    [probs] + valueBuffers + [paramsArray],
+                    template: template,
+                    grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
+                    threadGroup: (32, avSimdgroups, 1),
+                    outputShapes: [
+                        [batch, queryHeads, 1, headDim],
+                        [batch, queryHeads * headDim / 64 * avORunsumPartials],
+                    ],
+                    outputDTypes: [.bfloat16, .float32]
+                )
+                output = attended[0]
+                oRunsum = attended[1]
+                CBv2EngageMark.once(
+                    avORunsumPartials == 1
+                        ? "d512-ors-av-table" : "d512-ors-av-pairs")
+            } else {
+                output = avActive(
+                    [probs] + valueBuffers + [paramsArray],
+                    template: template,
+                    grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
+                    threadGroup: (32, avSimdgroups, 1),
+                    outputShapes: [[batch, queryHeads, 1, headDim]],
+                    outputDTypes: [.bfloat16]
+                )[0]
+                oRunsum = nil
+            }
         }
 
         if oRunsum != nil || normalizedKeys != nil {

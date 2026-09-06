@@ -638,7 +638,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     public static let multiTileEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_QKV_MMA8_MULTITILE"]
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 

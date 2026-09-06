@@ -14,6 +14,30 @@ public enum Gemma4DownTightGridV1 {
         #endif
     }()
 
+    /// Number of consecutive output-row groups one threadgroup walks.
+    ///
+    /// The dispatch covers a fixed 352 row groups of eight rows each, split
+    /// `352 / span` ways. `span` therefore trades threadgroup count against
+    /// how many times the per-threadgroup route election runs. The election is
+    /// one `rhs_indices` word plus, when the prefix-bound tag is absent, a
+    /// backward walk over at most 64 words; the walk it guards is a full
+    /// `704 x 8` affine-4 accumulation per row group, so the election is a
+    /// small fixed preamble either way.
+    ///
+    /// Span eight was measured on the ranked box and lost, which says this
+    /// dispatch is short enough that occupancy, not preamble, is what binds
+    /// it. Span two is the other direction: 176 threadgroups per layer instead
+    /// of 88, same arithmetic, same order.
+    static let tileSpan: Int = {
+        #if os(macOS)
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_TILE_SPAN2"]
+        else { return 2 }
+        return ["0", "false", "no", "off"].contains(raw.lowercased()) ? 4 : 2
+        #else
+        return 4
+        #endif
+    }()
+
     /// Bound to the immutable sanitized checkpoint, like the fused gate/up storage.
     public final class Storage {
         private let weight: MLXArray
@@ -37,10 +61,16 @@ public enum Gemma4DownTightGridV1 {
 
         /// The caller supplies the incumbent identity LHS and sorted RHS keys.
         func call(x: MLXArray, lhsIndices: MLXArray, indices: MLXArray) -> MLXArray {
+            call(x: x, lhsIndices: lhsIndices, indices: indices, span: tileSpan)
+        }
+
+        func call(
+            x: MLXArray, lhsIndices: MLXArray, indices: MLXArray, span: Int
+        ) -> MLXArray {
             kernel(
                 [weight, scales, biases, x, lhsIndices, indices],
-                template: [("T", DType.bfloat16)],
-                grid: (32, 88 * 2, 64), threadGroup: (32, 2, 1),
+                template: [("T", DType.bfloat16), ("SPAN", span)],
+                grid: (32, (352 / span) * 2, 64), threadGroup: (32, 2, 1),
                 outputShapes: [[64, 1, 2816]], outputDTypes: [.bfloat16]
             )[0]
         }
@@ -52,13 +82,13 @@ public enum Gemma4DownTightGridV1 {
         outputNames: ["y"],
         source: #"""
 uint3 tid = threadgroup_position_in_grid;
-const uint linear = tid.y + tid.z * 88;
-tid.y = (linear / 64) * 4;
+const uint linear = tid.y + tid.z * (352 / SPAN);
+tid.y = (linear / 64) * SPAN;
 tid.z = linear % 64;
-// Preserve assignment-fast enumeration with 88 surviving y groups.
-// Map compact y-group g to the old survivor 4*g. The helper, its pair
-// elections, four-tile walk, qdot chains, SIMD reductions and stores are verbatim.
-gather_qmv_gemma4_down_tile<T, 64, 4>(
+// Preserve assignment-fast enumeration with 352 / SPAN surviving y groups.
+// Map compact y-group g to the old survivor SPAN*g. The helper, its pair
+// elections, per-tile walk, qdot chains, SIMD reductions and stores are verbatim.
+gather_qmv_gemma4_down_tile<T, 64, 4, SPAN>(
     w, scales, biases, x, lhs_indices, rhs_indices, y,
     gemma4_tight_down_K, gemma4_tight_down_N, 1, 1,
     704, 2816 * 704 / 8, 2816 * 704 / 64, 2816 * 704 / 64,
@@ -782,7 +812,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   }
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, int span>
 METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device uint32_t* w,
     const device T* scales,
@@ -802,7 +832,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  constexpr int gemma4_down_tile_span = span; // dispatch-selected: 4 or 2
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }

@@ -1522,6 +1522,7 @@ template <
 // function constant magnitude (pipeline-key law).
 MLX_MTL_CONST bool kGatherRhsSegmentElide = true;
 MLX_MTL_CONST bool kGatherRhsSortedEndpointElide = true;
+MLX_MTL_CONST bool kGatherRhsSegmentFenceElide = true;
 
 // Loads one 16-row fragment row of an A tile from device memory. The
 // address arithmetic matches NAXTile::load exactly for that fragment row
@@ -1673,6 +1674,10 @@ template <
   const bool gemma4_gather_rhs_geglu =
       transpose && metal::is_same_v<T, bfloat> && group_size == 64 &&
       bits == 4 && M >= 512 && N == 1408 && K == 2816;
+  const bool segment_fence_elide = kGatherRhsSegmentFenceElide &&
+      transpose && metal::is_same_v<T, bfloat> && group_size == 64 &&
+      bits == 4 && M >= 512 && K_it > 0 &&
+      ((N == 1408 && K == 2816) || (N == 2816 && K == 704));
   const int y_row = tid.y * BM;
   const int y_col = tid.x * BN;
   const size_t y_row_long = size_t(y_row);
@@ -1760,7 +1765,10 @@ template <
         }
       }
     }
-    threadgroup_barrier(mem_flags::mem_none);
+    // The first retained K barrier already rendezvous all loaders.
+    if (!segment_fence_elide) {
+      threadgroup_barrier(mem_flags::mem_none);
+    }
 
     NAXTile<AccumType, TM, TN> Dtile;
     Dtile.clear();
@@ -1917,7 +1925,11 @@ template <
           }
         }
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Stores read private accumulators only. The next K-entry barrier
+        // protects Ws before the next segment can overwrite shared weights.
+        if (!segment_fence_elide) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
 
         // The exact production arm lays this 64-column tile out as adjacent
         // 16-column gate/up pairs. Round both GEMM closes to T, then reproduce

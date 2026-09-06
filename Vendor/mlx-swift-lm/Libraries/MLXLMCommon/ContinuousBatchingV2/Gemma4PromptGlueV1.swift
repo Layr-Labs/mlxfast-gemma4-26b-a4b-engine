@@ -157,7 +157,7 @@ public enum Gemma4PromptGlueV1 {
                 ("PITCH", pitch), ("UP_OFF", upOffset),
             ],
             grid: (threads, 1, 1),
-            threadGroup: (256, 1, 1),
+            threadGroup: (128, 1, 1),
             outputShapes: [outputShape],
             outputDTypes: [.bfloat16]
         )[0]

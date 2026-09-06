@@ -13,6 +13,30 @@ import Foundation
 import MLX
 import MLXFast
 
+// Per-call input assembly only: tensor identities and argument order are
+// unchanged, and no request-dependent values are retained between calls.
+fileprivate enum Q4InputAssemblyV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_Q4_INPUT_ASSEMBLY_V1"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    @inline(__always)
+    static func build(first: MLXArray, mirrors: [MLXArray], tail: [MLXArray])
+        -> [MLXArray]
+    {
+        guard enabled else { return [first] + mirrors + tail }
+        var result: [MLXArray] = []
+        result.reserveCapacity(1 + mirrors.count + tail.count)
+        result.append(first)
+        result.append(contentsOf: mirrors)
+        result.append(contentsOf: tail)
+        return result
+    }
+}
+
 public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
@@ -3834,8 +3858,11 @@ for (int element = 0; element < values_per_lane; ++element) {
         else { return nil }
 
         let startArray = getStartArray(starts: starts, batch: batch)
+        if Q4InputAssemblyV1.enabled { CBv2EngageMark.once("q4-input-assembly-v1") }
         func fallbackInputs() -> [MLXArray] {
-            [queries] + mirrors + [startArray, newKeys, newValues, previousWriteFence]
+            Q4InputAssemblyV1.build(
+                first: queries, mirrors: mirrors,
+                tail: [startArray, newKeys, newValues, previousWriteFence])
         }
         if q4ResidentMergeEnabled,
             blocks == 8,
@@ -3845,8 +3872,8 @@ for (int element = 0; element < values_per_lane; ++element) {
             if let normRope = takeResidentNormRope(
                 queries: queries, keys: newKeys, values: newValues)
             {
-                let residentInputs =
-                    [normRope.rawQueries] + mirrors + [
+                let residentInputs = Q4InputAssemblyV1.build(
+                    first: normRope.rawQueries, mirrors: mirrors, tail: [
                         startArray,
                         normRope.rawKeys,
                         normRope.rawValues,
@@ -3855,7 +3882,7 @@ for (int element = 0; element < values_per_lane; ++element) {
                         normRope.positionOffsets,
                         normRope.ropeInverseFrequencies ?? normRope.ropeLog2Base,
                         previousWriteFence,
-                    ]
+                    ])
                 let residentTemplate: [(String, any KernelTemplateArg)] = [
                     ("T", normRope.rawQueries.dtype),
                     ("D", headDim),

@@ -9,6 +9,44 @@ constant bool align_K [[function_constant(202)]];
 
 using namespace metal;
 
+#ifndef DARKBLOOM_GEMMA4_GATHER_SEGMENT_GALLOP_V1
+#define DARKBLOOM_GEMMA4_GATHER_SEGMENT_GALLOP_V1 1
+#endif
+
+#ifndef DARKBLOOM_GATHER_SEGMENT_GALLOP_HELPER_V1
+#define DARKBLOOM_GATHER_SEGMENT_GALLOP_HELPER_V1
+// RHS gather is admitted only for sorted expert indices. Once an index differs,
+// it cannot reappear within this tile. Bound every probe to the live row tile.
+inline int gemma4_gather_segment_end_v1(
+    const device uint32_t* indices,
+    int y_row,
+    int n,
+    int end,
+    uint32_t index) {
+  if (n >= end || indices[y_row + end - 1] == index) {
+    return end;
+  }
+  int lower = n;
+  int probe = n;
+  int span = 1;
+  while (probe < end && indices[y_row + probe] == index) {
+    lower = probe + 1;
+    span = min(span * 2, end);
+    probe = min(n + span - 1, end);
+  }
+  int upper = min(probe, end);
+  while (lower < upper) {
+    const int middle = lower + (upper - lower) / 2;
+    if (indices[y_row + middle] == index) {
+      lower = middle + 1;
+    } else {
+      upper = middle;
+    }
+  }
+  return lower;
+}
+#endif
+
 // Match the Compiled primitive's typed tape exactly. Swift converts every
 // scalar literal to the array dtype, and each primitive writes a bfloat16
 // temporary before the next primitive reads it.
@@ -4630,6 +4668,13 @@ template <
     offset = offset_next;
     index = index_next;
     offset_next = tgp_bm;
+    #if DARKBLOOM_GEMMA4_GATHER_SEGMENT_GALLOP_V1
+    n = gemma4_gather_segment_end_v1(indices, y_row, n, tgp_bm, index);
+    if (n < tgp_bm) {
+      offset_next = n;
+      index_next = indices[y_row + n];
+    }
+    #else
     for (; n < tgp_bm; n++) {
       if (indices[y_row + n] != index) {
         offset_next = n;
@@ -4637,6 +4682,7 @@ template <
         break;
       }
     }
+    #endif
     threadgroup_barrier(mem_flags::mem_none);
 
     // Prepare threadgroup mma operation

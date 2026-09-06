@@ -2,6 +2,15 @@ import Foundation
 import MLX
 import MLXNN
 
+// Match the process-wide JIT switch; this flag only arms call-site provenance.
+private enum GatherSegmentGallopV1 {
+    static let enabled: Bool = {
+        let value = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_GATHER_SEGMENT_GALLOP_V1"]?.lowercased() ?? ""
+        return !["0", "false", "no", "off"].contains(value)
+    }()
+}
+
 /// Identity gather table for the sorted 64-assignment decode geometry.
 nonisolated(unsafe) private let switchDownIdentity64 = MLXArray((0..<64).map { UInt32($0) })
 
@@ -1721,6 +1730,9 @@ public class SwitchGLU: Module {
                 let fused = fusedGateUpDispatch()
             {
                 CBv2EngageMark.once("prefill-gateup-fuse")
+                if GatherSegmentGallopV1.enabled {
+                    CBv2EngageMark.once("gather-segment-gallop")
+                }
                 let xGateUp = MLX.gatherQuantizedMM(
                     x,
                     fused.storage.weight,

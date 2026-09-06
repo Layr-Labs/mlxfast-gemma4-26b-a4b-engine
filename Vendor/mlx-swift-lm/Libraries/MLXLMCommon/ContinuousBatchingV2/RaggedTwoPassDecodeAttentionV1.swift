@@ -3834,8 +3834,9 @@ for (int element = 0; element < values_per_lane; ++element) {
         else { return nil }
 
         let startArray = getStartArray(starts: starts, batch: batch)
-        let inputs = [queries] + mirrors
-            + [startArray, newKeys, newValues, previousWriteFence]
+        func fallbackInputs() -> [MLXArray] {
+            [queries] + mirrors + [startArray, newKeys, newValues, previousWriteFence]
+        }
         if q4ResidentMergeEnabled,
             blocks == 8,
             combineColumns == 8,
@@ -3927,7 +3928,7 @@ for (int element = 0; element < values_per_lane; ++element) {
                 return (resident[0], resident[1])
             }
             let resident = portQuantFusedWriteResidentKernel(
-                inputs,
+                fallbackInputs(),
                 template: [
                     ("T", queries.dtype),
                     ("D", headDim),
@@ -3949,7 +3950,7 @@ for (int element = 0; element < values_per_lane; ++element) {
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = portQuantFusedWriteKernel(
-            inputs,
+            fallbackInputs(),
             template: [
                 ("T", queries.dtype),
                 ("D", headDim),
@@ -4227,6 +4228,16 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_D512_DECODE_SDPA"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Direct in-place full row cast kill switch:
+    /// `DARKBLOOM_GEMMA4_D512_DIRECT_FULL_ROW_CAST=0` restores the
+    /// `compactMap` heap allocation path. Default ON.
+    public static let directFullRowCastEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_DIRECT_FULL_ROW_CAST"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
@@ -6277,41 +6288,84 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         else { return nil }
         guard case .full = kind.attention else { return nil }
 
-        let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
-        guard fullRows.count == batch else { return nil }
-
-        let offset = fullRows[0].absoluteOffset
-        let keyLength = offset + 1
-        guard offset > 0,
-            keyLength >= minKeyLength,
-            keyLength <= maxKeyLength,
-            fullRows.allSatisfy({ $0.cohortPool == nil }),
-            fullRows.allSatisfy({ $0.absoluteOffset == offset }),
-            fullRows.allSatisfy({ keyLength <= $0.maxLength })
-        else { return nil }
-
+        let offset: Int
+        let keyLength: Int
         var keyBuffers: [MLXArray] = []
         var valueBuffers: [MLXArray] = []
         keyBuffers.reserveCapacity(batch)
         valueBuffers.reserveCapacity(batch)
-        var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
-        params.reserveCapacity(batch + 2)
-        for row in fullRows {
-            let state = row.cbv2InnerState()
-            guard state.count == 2,
-                state[0].dtype == .bfloat16,
-                state[1].dtype == .bfloat16,
-                state[0].ndim == 4,
-                state[0].dim(0) == 1,
-                state[0].dim(1) == kvHeads,
-                state[0].dim(3) == headDim,
-                state[1].shape == state[0].shape,
-                state[1].dtype == state[0].dtype,
-                state[0].dim(2) >= keyLength
+        var params: [UInt32]
+        let fallbackFullRows: [CBv2FullSequenceKV]?
+
+        if directFullRowCastEnabled {
+            CBv2EngageMark.once("d512-direct-full-row-cast")
+            guard let first = rows.first as? CBv2FullSequenceKV else { return nil }
+            offset = first.absoluteOffset
+            keyLength = offset + 1
+            guard offset > 0,
+                keyLength >= minKeyLength,
+                keyLength <= maxKeyLength
             else { return nil }
-            keyBuffers.append(state[0])
-            valueBuffers.append(state[1])
-            params.append(UInt32(state[0].dim(2)))
+
+            params = [UInt32(keyLength), UInt32(headDim)]
+            params.reserveCapacity(batch + 2)
+            for seq in rows {
+                guard let row = seq as? CBv2FullSequenceKV,
+                    row.cohortPool == nil,
+                    row.absoluteOffset == offset,
+                    keyLength <= row.maxLength
+                else { return nil }
+                let state = row.cbv2InnerState()
+                guard state.count == 2,
+                    state[0].dtype == .bfloat16,
+                    state[1].dtype == .bfloat16,
+                    state[0].ndim == 4,
+                    state[0].dim(0) == 1,
+                    state[0].dim(1) == kvHeads,
+                    state[0].dim(3) == headDim,
+                    state[1].shape == state[0].shape,
+                    state[1].dtype == state[0].dtype,
+                    state[0].dim(2) >= keyLength
+                else { return nil }
+                keyBuffers.append(state[0])
+                valueBuffers.append(state[1])
+                params.append(UInt32(state[0].dim(2)))
+            }
+            fallbackFullRows = nil
+        } else {
+            let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
+            guard fullRows.count == batch else { return nil }
+
+            offset = fullRows[0].absoluteOffset
+            keyLength = offset + 1
+            guard offset > 0,
+                keyLength >= minKeyLength,
+                keyLength <= maxKeyLength,
+                fullRows.allSatisfy({ $0.cohortPool == nil }),
+                fullRows.allSatisfy({ $0.absoluteOffset == offset }),
+                fullRows.allSatisfy({ keyLength <= $0.maxLength })
+            else { return nil }
+
+            params = [UInt32(keyLength), UInt32(headDim)]
+            params.reserveCapacity(batch + 2)
+            for row in fullRows {
+                let state = row.cbv2InnerState()
+                guard state.count == 2,
+                    state[0].dtype == .bfloat16,
+                    state[1].dtype == .bfloat16,
+                    state[0].ndim == 4,
+                    state[0].dim(0) == 1,
+                    state[0].dim(1) == kvHeads,
+                    state[0].dim(3) == headDim,
+                    state[1].shape == state[0].shape,
+                    state[1].dtype == state[0].dtype,
+                    state[0].dim(2) >= keyLength
+                else { return nil }
+                keyBuffers.append(state[0])
+                valueBuffers.append(state[1])
+                params.append(UInt32(state[0].dim(2)))
+            }
+            fallbackFullRows = fullRows
         }
         let paramsArray = getD512ParamsArray(params: params)
 
@@ -6434,8 +6488,14 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 for: output)
         }
 
-        for row in fullRows {
-            row.advanceAfterFusedAppend()
+        if let fallbackFullRows {
+            for row in fallbackFullRows {
+                row.advanceAfterFusedAppend()
+            }
+        } else {
+            for seq in rows {
+                (seq as! CBv2FullSequenceKV).advanceAfterFusedAppend()
+            }
         }
         return (output, storeFence)
     }
@@ -6476,45 +6536,84 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         else { return nil }
         guard case .full = kind.attention else { return nil }
 
-        let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
-        guard fullRows.count == batch else { return nil }
-
-        // Lockstep + storage gates, ALL before any write. The extra gate
-        // over the unfused path: the backing buffers must already have room
-        // for the new token (capacity >= kL), because the fused store cannot
-        // grow them — an ensureCapacity step falls back to the append path.
-        let offset = fullRows[0].absoluteOffset
-        let keyLength = offset + 1
-        guard offset > 0,
-            keyLength >= minKeyLength,
-            keyLength <= maxKeyLength,
-            fullRows.allSatisfy({ $0.cohortPool == nil }),
-            fullRows.allSatisfy({ $0.absoluteOffset == offset }),
-            fullRows.allSatisfy({ keyLength <= $0.maxLength })
-        else { return nil }
-
+        let offset: Int
+        let keyLength: Int
         var keyBuffers: [MLXArray] = []
         var valueBuffers: [MLXArray] = []
         keyBuffers.reserveCapacity(batch)
         valueBuffers.reserveCapacity(batch)
-        var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
-        params.reserveCapacity(batch + 2)
-        for row in fullRows {
-            let state = row.cbv2InnerState()
-            guard state.count == 2,
-                state[0].dtype == .bfloat16,
-                state[1].dtype == .bfloat16,
-                state[0].ndim == 4,
-                state[0].dim(0) == 1,
-                state[0].dim(1) == kvHeads,
-                state[0].dim(3) == headDim,
-                state[1].shape == state[0].shape,
-                state[1].dtype == state[0].dtype,
-                state[0].dim(2) >= keyLength
+        var params: [UInt32]
+        let fallbackFullRows: [CBv2FullSequenceKV]?
+
+        if directFullRowCastEnabled {
+            CBv2EngageMark.once("d512-direct-full-row-cast")
+            guard let first = rows.first as? CBv2FullSequenceKV else { return nil }
+            offset = first.absoluteOffset
+            keyLength = offset + 1
+            guard offset > 0,
+                keyLength >= minKeyLength,
+                keyLength <= maxKeyLength
             else { return nil }
-            keyBuffers.append(state[0])
-            valueBuffers.append(state[1])
-            params.append(UInt32(state[0].dim(2)))
+
+            params = [UInt32(keyLength), UInt32(headDim)]
+            params.reserveCapacity(batch + 2)
+            for seq in rows {
+                guard let row = seq as? CBv2FullSequenceKV,
+                    row.cohortPool == nil,
+                    row.absoluteOffset == offset,
+                    keyLength <= row.maxLength
+                else { return nil }
+                let state = row.cbv2InnerState()
+                guard state.count == 2,
+                    state[0].dtype == .bfloat16,
+                    state[1].dtype == .bfloat16,
+                    state[0].ndim == 4,
+                    state[0].dim(0) == 1,
+                    state[0].dim(1) == kvHeads,
+                    state[0].dim(3) == headDim,
+                    state[1].shape == state[0].shape,
+                    state[1].dtype == state[0].dtype,
+                    state[0].dim(2) >= keyLength
+                else { return nil }
+                keyBuffers.append(state[0])
+                valueBuffers.append(state[1])
+                params.append(UInt32(state[0].dim(2)))
+            }
+            fallbackFullRows = nil
+        } else {
+            let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
+            guard fullRows.count == batch else { return nil }
+
+            offset = fullRows[0].absoluteOffset
+            keyLength = offset + 1
+            guard offset > 0,
+                keyLength >= minKeyLength,
+                keyLength <= maxKeyLength,
+                fullRows.allSatisfy({ $0.cohortPool == nil }),
+                fullRows.allSatisfy({ $0.absoluteOffset == offset }),
+                fullRows.allSatisfy({ keyLength <= $0.maxLength })
+            else { return nil }
+
+            params = [UInt32(keyLength), UInt32(headDim)]
+            params.reserveCapacity(batch + 2)
+            for row in fullRows {
+                let state = row.cbv2InnerState()
+                guard state.count == 2,
+                    state[0].dtype == .bfloat16,
+                    state[1].dtype == .bfloat16,
+                    state[0].ndim == 4,
+                    state[0].dim(0) == 1,
+                    state[0].dim(1) == kvHeads,
+                    state[0].dim(3) == headDim,
+                    state[1].shape == state[0].shape,
+                    state[1].dtype == state[0].dtype,
+                    state[0].dim(2) >= keyLength
+                else { return nil }
+                keyBuffers.append(state[0])
+                valueBuffers.append(state[1])
+                params.append(UInt32(state[0].dim(2)))
+            }
+            fallbackFullRows = fullRows
         }
         let paramsArray = getD512ParamsArray(params: params)
 
@@ -6555,8 +6654,14 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             outputDTypes: [.bfloat16]
         )[0]
 
-        for row in fullRows {
-            row.advanceAfterFusedAppend()
+        if let fallbackFullRows {
+            for row in fallbackFullRows {
+                row.advanceAfterFusedAppend()
+            }
+        } else {
+            for seq in rows {
+                (seq as! CBv2FullSequenceKV).advanceAfterFusedAppend()
+            }
         }
         return (output, nextWriteFence)
     }
@@ -6586,54 +6691,93 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         else { return nil }
         guard case .full = kind.attention else { return nil }
 
-        let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
-        guard fullRows.count == batch else { return nil }
-
-        // Lockstep + storage gates, ALL before any append. Pooled (ATT-008)
-        // rows fail closed: their backing layout is the pool's batch axis,
-        // and the pooled route already has its own batched path.
-        let offset = fullRows[0].absoluteOffset
-        let keyLength = offset + 1
-        guard offset > 0,
-            keyLength >= minKeyLength,
-            keyLength <= maxKeyLength,
-            fullRows.allSatisfy({ $0.cohortPool == nil }),
-            fullRows.allSatisfy({ $0.absoluteOffset == offset }),
-            fullRows.allSatisfy({ keyLength <= $0.maxLength })
-        else { return nil }
-        for row in fullRows {
-            let state = row.cbv2InnerState()
-            guard state.count == 2,
-                state[0].dtype == .bfloat16,
-                state[1].dtype == .bfloat16,
-                state[0].ndim == 4,
-                state[0].dim(0) == 1,
-                state[0].dim(1) == kvHeads,
-                state[0].dim(3) == headDim,
-                state[1].shape == state[0].shape,
-                state[1].dtype == state[0].dtype
-            else { return nil }
-        }
-
-        // Byte-identical per-row appends — the same `update` calls, in the
-        // same row order, as the established per-row loop. Only the
-        // returned temporal views go unused; the kernels read the full
-        // backing buffers (contiguous, so no `ensureRowContiguous` copy)
-        // with kL/capacity as runtime scalars.
+        let offset: Int
+        let keyLength: Int
         var keyBuffers: [MLXArray] = []
         var valueBuffers: [MLXArray] = []
         keyBuffers.reserveCapacity(batch)
         valueBuffers.reserveCapacity(batch)
-        var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
-        params.reserveCapacity(batch + 2)
-        for (index, row) in fullRows.enumerated() {
-            _ = row.update(
-                keys: keys[index ..< (index + 1)],
-                values: values[index ..< (index + 1)])
-            let state = row.cbv2InnerState()
-            keyBuffers.append(state[0])
-            valueBuffers.append(state[1])
-            params.append(UInt32(state[0].dim(2)))
+        var params: [UInt32]
+
+        if directFullRowCastEnabled {
+            CBv2EngageMark.once("d512-direct-full-row-cast")
+            guard let first = rows.first as? CBv2FullSequenceKV else { return nil }
+            offset = first.absoluteOffset
+            keyLength = offset + 1
+            guard offset > 0,
+                keyLength >= minKeyLength,
+                keyLength <= maxKeyLength
+            else { return nil }
+
+            for seq in rows {
+                guard let row = seq as? CBv2FullSequenceKV,
+                    row.cohortPool == nil,
+                    row.absoluteOffset == offset,
+                    keyLength <= row.maxLength
+                else { return nil }
+                let state = row.cbv2InnerState()
+                guard state.count == 2,
+                    state[0].dtype == .bfloat16,
+                    state[1].dtype == .bfloat16,
+                    state[0].ndim == 4,
+                    state[0].dim(0) == 1,
+                    state[0].dim(1) == kvHeads,
+                    state[0].dim(3) == headDim,
+                    state[1].shape == state[0].shape,
+                    state[1].dtype == state[0].dtype
+                else { return nil }
+            }
+
+            params = [UInt32(keyLength), UInt32(headDim)]
+            params.reserveCapacity(batch + 2)
+            for (index, seq) in rows.enumerated() {
+                let row = seq as! CBv2FullSequenceKV
+                _ = row.update(
+                    keys: keys[index ..< (index + 1)],
+                    values: values[index ..< (index + 1)])
+                let state = row.cbv2InnerState()
+                keyBuffers.append(state[0])
+                valueBuffers.append(state[1])
+                params.append(UInt32(state[0].dim(2)))
+            }
+        } else {
+            let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
+            guard fullRows.count == batch else { return nil }
+
+            offset = fullRows[0].absoluteOffset
+            keyLength = offset + 1
+            guard offset > 0,
+                keyLength >= minKeyLength,
+                keyLength <= maxKeyLength,
+                fullRows.allSatisfy({ $0.cohortPool == nil }),
+                fullRows.allSatisfy({ $0.absoluteOffset == offset }),
+                fullRows.allSatisfy({ keyLength <= $0.maxLength })
+            else { return nil }
+            for row in fullRows {
+                let state = row.cbv2InnerState()
+                guard state.count == 2,
+                    state[0].dtype == .bfloat16,
+                    state[1].dtype == .bfloat16,
+                    state[0].ndim == 4,
+                    state[0].dim(0) == 1,
+                    state[0].dim(1) == kvHeads,
+                    state[0].dim(3) == headDim,
+                    state[1].shape == state[0].shape,
+                    state[1].dtype == state[0].dtype
+                else { return nil }
+            }
+
+            params = [UInt32(keyLength), UInt32(headDim)]
+            params.reserveCapacity(batch + 2)
+            for (index, row) in fullRows.enumerated() {
+                _ = row.update(
+                    keys: keys[index ..< (index + 1)],
+                    values: values[index ..< (index + 1)])
+                let state = row.cbv2InnerState()
+                keyBuffers.append(state[0])
+                valueBuffers.append(state[1])
+                params.append(UInt32(state[0].dim(2)))
+            }
         }
         return dispatchChain(
             queries: queries, keyBuffers: keyBuffers, valueBuffers: valueBuffers,
@@ -6684,41 +6828,74 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         else { return nil }
         guard case .full = kind.attention else { return nil }
 
-        let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
-        guard fullRows.count == batch else { return nil }
-
-        // Lockstep + storage gates, ALL before any dispatch. Pooled
-        // (ATT-008) rows fail closed exactly like the decode path: their
-        // backing layout is the pool's batch axis.
-        let keyLength = fullRows[0].absoluteOffset
-        guard keyLength >= minKeyLength,
-            keyLength <= maxKeyLength,
-            fullRows.allSatisfy({ $0.cohortPool == nil }),
-            fullRows.allSatisfy({ $0.absoluteOffset == keyLength })
-        else { return nil }
-
+        let keyLength: Int
         var keyBuffers: [MLXArray] = []
         var valueBuffers: [MLXArray] = []
         keyBuffers.reserveCapacity(batch)
         valueBuffers.reserveCapacity(batch)
-        var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
-        params.reserveCapacity(batch + 2)
-        for row in fullRows {
-            let state = row.cbv2InnerState()
-            guard state.count == 2,
-                state[0].dtype == .bfloat16,
-                state[1].dtype == .bfloat16,
-                state[0].ndim == 4,
-                state[0].dim(0) == 1,
-                state[0].dim(1) == kvHeads,
-                state[0].dim(3) == headDim,
-                state[1].shape == state[0].shape,
-                state[1].dtype == state[0].dtype,
-                state[0].dim(2) >= keyLength
+        var params: [UInt32]
+
+        if directFullRowCastEnabled {
+            CBv2EngageMark.once("d512-direct-full-row-cast")
+            guard let first = rows.first as? CBv2FullSequenceKV else { return nil }
+            keyLength = first.absoluteOffset
+            guard keyLength >= minKeyLength,
+                keyLength <= maxKeyLength
             else { return nil }
-            keyBuffers.append(state[0])
-            valueBuffers.append(state[1])
-            params.append(UInt32(state[0].dim(2)))
+
+            params = [UInt32(keyLength), UInt32(headDim)]
+            params.reserveCapacity(batch + 2)
+            for seq in rows {
+                guard let row = seq as? CBv2FullSequenceKV,
+                    row.cohortPool == nil,
+                    row.absoluteOffset == keyLength
+                else { return nil }
+                let state = row.cbv2InnerState()
+                guard state.count == 2,
+                    state[0].dtype == .bfloat16,
+                    state[1].dtype == .bfloat16,
+                    state[0].ndim == 4,
+                    state[0].dim(0) == 1,
+                    state[0].dim(1) == kvHeads,
+                    state[0].dim(3) == headDim,
+                    state[1].shape == state[0].shape,
+                    state[1].dtype == state[0].dtype,
+                    state[0].dim(2) >= keyLength
+                else { return nil }
+                keyBuffers.append(state[0])
+                valueBuffers.append(state[1])
+                params.append(UInt32(state[0].dim(2)))
+            }
+        } else {
+            let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
+            guard fullRows.count == batch else { return nil }
+
+            keyLength = fullRows[0].absoluteOffset
+            guard keyLength >= minKeyLength,
+                keyLength <= maxKeyLength,
+                fullRows.allSatisfy({ $0.cohortPool == nil }),
+                fullRows.allSatisfy({ $0.absoluteOffset == keyLength })
+            else { return nil }
+
+            params = [UInt32(keyLength), UInt32(headDim)]
+            params.reserveCapacity(batch + 2)
+            for row in fullRows {
+                let state = row.cbv2InnerState()
+                guard state.count == 2,
+                    state[0].dtype == .bfloat16,
+                    state[1].dtype == .bfloat16,
+                    state[0].ndim == 4,
+                    state[0].dim(0) == 1,
+                    state[0].dim(1) == kvHeads,
+                    state[0].dim(3) == headDim,
+                    state[1].shape == state[0].shape,
+                    state[1].dtype == state[0].dtype,
+                    state[0].dim(2) >= keyLength
+                else { return nil }
+                keyBuffers.append(state[0])
+                valueBuffers.append(state[1])
+                params.append(UInt32(state[0].dim(2)))
+            }
         }
         return dispatchChain(
             queries: queries, keyBuffers: keyBuffers, valueBuffers: valueBuffers,

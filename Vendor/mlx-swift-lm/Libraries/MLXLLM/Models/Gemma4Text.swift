@@ -4338,11 +4338,7 @@ private enum Gemma4FusedLayerGlue {
             ensureRowContiguous: true
         )
 
-    private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v2_nb1",
-        inputNames: ["x", "w1", "w2"],
-        outputNames: ["out1", "out2", "xSums"],
-        source: """
+    private static let dualPreNormSource = """
             const uint row = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
             const uint simd_lane_id = thread_index_in_simdgroup;
@@ -4364,9 +4360,48 @@ private enum Gemma4FusedLayerGlue {
             // `lid == k_block * 32 + lane`, exactly the standalone DMLP
             // xsum table's first two coordinates. Row remains unit stride.
             xSums[lid * 8 + row] = xsum;
-        """,
-        ensureRowContiguous: true
-    )
+        """
+
+    private static let dualPreNormKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v2_nb1",
+            inputNames: ["x", "w1", "w2"],
+            outputNames: ["out1", "out2", "xSums"],
+            source: dualPreNormSource,
+            ensureRowContiguous: true
+        )
+
+    /// DENSE-XSUM-OUTPUT-ELIDE: the decode ZIP path uses the QMV bodies that
+    /// rebuild their own affine sums, so the third output of dual pre-norm is
+    /// dead when the existing x-sum-elision arm is on. Keep the norm writes
+    /// and reduction identical while dropping that output allocation and its
+    /// per-lane accumulation. The source transform is guarded by exact anchors
+    /// so the no-sum kernel cannot silently drift from the incumbent body.
+    private static let dualPreNormNoSumsSource: String = {
+        var result = dualPreNormSource
+        func removeOnce(_ text: String) {
+            precondition(
+                result.components(separatedBy: text).count == 2,
+                "dualPreNormNoSumsSource: anchor drift")
+            result = result.replacingOccurrences(of: text, with: "")
+        }
+        removeOnce("    float xsum = 0.0f;\n")
+        removeOnce("        xsum += dense;\n")
+        removeOnce(
+            "    // `lid == k_block * 32 + lane`, exactly the standalone DMLP\n"
+                + "    // xsum table's first two coordinates. Row remains unit stride.\n")
+        removeOnce("    xSums[lid * 8 + row] = xsum;\n")
+        return result
+    }()
+
+    private static let dualPreNormNoSumsKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_dual_prenorm_nosums_2816_bf16_v1",
+            inputNames: ["x", "w1", "w2"],
+            outputNames: ["out1", "out2"],
+            source: dualPreNormNoSumsSource,
+            ensureRowContiguous: true
+        )
 
     private static let tailSource = """
             const uint row = threadgroup_position_in_grid.x;
@@ -4559,26 +4594,40 @@ private enum Gemma4FusedLayerGlue {
     }
 
     static func dualPreNorm(
-        x: MLXArray, w1: MLXArray, w2: MLXArray, eps: Float
+        x: MLXArray, w1: MLXArray, w2: MLXArray, eps: Float,
+        emitSums: Bool = true
     ) -> (MLXArray, MLXArray, CBv2DenseMLPQMVV1.ActivationSums?)? {
         guard admits(x, weight: w1, eps: eps),
             w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-dual-prenorm")
-        let outs = dualPreNormKernel(
+        if !emitSums {
+            CBv2EngageMark.once("dense-xsum-output-elide")
+        }
+        let kernel = emitSums ? dualPreNormKernel : dualPreNormNoSumsKernel
+        let outs = kernel(
             [x, w1, w2],
             template: [("T", x.dtype)],
             grid: (rows * tgThreads, 1, 1),
             threadGroup: (tgThreads, 1, 1),
-            outputShapes: [
-                [rows, 1, axis],
-                [rows, 1, axis],
-                [(axis / 128) * 32 * rows],
-            ],
-            outputDTypes: [.bfloat16, .bfloat16, .float32]
+            outputShapes: emitSums
+                ? [
+                    [rows, 1, axis],
+                    [rows, 1, axis],
+                    [(axis / 128) * 32 * rows],
+                ]
+                : [
+                    [rows, 1, axis],
+                    [rows, 1, axis],
+                ],
+            outputDTypes: emitSums
+                ? [.bfloat16, .bfloat16, .float32]
+                : [.bfloat16, .bfloat16]
         )
-        let sums = CBv2DenseMLPQMVV1.activationSums(
-            produced: outs[2], for: outs[0])
+        let sums: CBv2DenseMLPQMVV1.ActivationSums? = emitSums
+            ? CBv2DenseMLPQMVV1.activationSums(
+                produced: outs[2], for: outs[0])
+            : nil
         return (outs[0], outs[1], sums)
     }
 
@@ -5624,6 +5673,7 @@ private enum Gemma4ZipRouterV1 {
         eps: Float,
         prefix: Gemma4FusedLayerGlue.AttentionBranchPrefix? = nil
     ) -> Zipped? {
+
         // Pure shape predicate first: no graph node exists until every pin
         // below holds, so prefill, MTP rectangles and any other cohort walk
         // away from here without having built anything.
@@ -5631,7 +5681,6 @@ private enum Gemma4ZipRouterV1 {
             out.ndim == 3, out.dim(0) == 8, out.dim(1) == 1,
             out.dtype == .bfloat16
         else { return nil }
-
         // Stage 0, shared: the two pre-norms plus the exact dense activation
         // table. A nil here means this is not the fused-glue cell and no node
         // was built.
@@ -5646,7 +5695,10 @@ private enum Gemma4ZipRouterV1 {
                  prefix.denseSums,
                  prefix.routerNorm)
         } else if let (d1, d2, dSums) = Gemma4FusedLayerGlue.dualPreNorm(
-            x: out, w1: w1, w2: w2, eps: eps)
+            x: out, w1: w1, w2: w2, eps: eps,
+            emitSums: !(
+                Gemma4FusedLayerGlue.denseXSumElideEnabled
+                    && CBv2DenseMLPQMVV1.denseGeluEpilogueEnabled))
         {
             (n1, n2, producerSums, carriedRouterNorm) = (d1, d2, dSums, nil)
         } else {

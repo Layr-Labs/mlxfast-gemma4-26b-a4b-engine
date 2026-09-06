@@ -4,6 +4,12 @@ import MLX
 
 /// Keep the incumbent span-four down-QMV arithmetic and omit its empty y groups.
 public enum Gemma4DownTightGridV1 {
+    /// DOWN-RUN-CAP sweep, same trade as Gemma4DecodeFusedGUV1.runCap.
+    static let downRunCap: Int = {
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_RUN_CAP"] ?? "1"
+        return raw == "2" ? 2 : 1
+    }()
+
     static let enabled: Bool = {
         #if os(macOS)
         guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_TIGHT_GRID"]
@@ -94,7 +100,7 @@ gather_qmv_gemma4_down_tile<T, 64, 4, SPAN>(
     704, 2816 * 704 / 8, 2816 * 704 / 64, 2816 * 704 / 64,
     tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
 """#,
-        header: #"""
+        header: "#define DOWN_RUN_CAP \(downRunCap)\n" + #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helper bodies verified byte-identical to 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -853,15 +859,21 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
   }
   // Odd positions are produced by the immediately preceding pair leader.
+  // DOWN-RUN-CAP: at cap 1 every assignment is its own leader and the pair path
+  // below is compiled out, which is the same register-pressure trade that made
+  // the gate/up kernel 9.2% faster when its triple and quad paths were dropped.
+#if DOWN_RUN_CAP >= 2
   if ((run_offset & 1) != 0) {
     return;
   }
+#endif
   const device uint32_t* tile_w = w + expert * w_stride;
   const device T* tile_scales = scales + expert * s_stride;
   const device T* tile_biases = biases + expert * b_stride;
   const device T* tile_x0 =
       x + lhs_indices[assignment * lhs_stride] * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;
+#if DOWN_RUN_CAP >= 2
   const bool has_pair = expert_prefix_bounds
       ? (((route_word >> 14) & 0x3fu) + 1u) > 1u
       : assignment + 1 < 64 &&
@@ -888,6 +900,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     return;
   }
+#endif
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);

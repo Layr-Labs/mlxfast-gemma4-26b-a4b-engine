@@ -12,6 +12,15 @@ import Foundation
 import MLX
 import MLXFast
 
+public enum OProjHalfWeightMatricesV1 {
+    public static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_OPROJ_HALF_WEIGHT_V1"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+}
+
 public enum CBv2AttentionOQMVV1 {
     public static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
@@ -19,6 +28,8 @@ public enum CBv2AttentionOQMVV1 {
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+
+    private static let oprojHalfKeySuffix: String = OProjHalfWeightMatricesV1.enabled ? "_halfw" : ""
 
     /// MMA-O8: route the same o_proj shapes through a matrix-unit kernel that
     /// serves all eight cohort rows from one weight fetch, exactly like the
@@ -151,6 +162,14 @@ METAL_FUNC void attention_o_qmv_fast_crossrow_affine4_g64_tight(
     private static let mma8KernelHeader = """
 #include <metal_simdgroup_matrix>
 
+\(OProjHalfWeightMatricesV1.enabled ? "#define OPROJ_HALF_WEIGHT_MATRICES 1\n" : "")#if defined(OPROJ_HALF_WEIGHT_MATRICES) && OPROJ_HALF_WEIGHT_MATRICES
+#define MMA8_A_TYPE simdgroup_matrix<half, 8, 8>
+#define MMA8_A_ELEM half
+#else
+#define MMA8_A_TYPE simdgroup_float8x8
+#define MMA8_A_ELEM float
+#endif
+
 #ifndef METAL_FUNC
 #define METAL_FUNC inline
 #endif
@@ -210,7 +229,7 @@ inline float mma8_runsum4(uint4 r) {
 
 #define MMA8_SETB(BB, W, HI) BB.thread_elements()[0] = mma8_##HI<T>(r0.W); BB.thread_elements()[1] = mma8_##HI<T>(r1.W);
 
-#define MMA8_STEP(BB, J) A.thread_elements()[0] = float(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = float(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, BB, C);
+#define MMA8_STEP(BB, J) A.thread_elements()[0] = MMA8_A_ELEM(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = MMA8_A_ELEM(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, BB, C);
 
 template <typename T, int KS, int KFIX>
 METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
@@ -240,7 +259,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
 
   float acc0 = 0.0f;
   float acc1 = 0.0f;
-  simdgroup_float8x8 A;
+  MMA8_A_TYPE A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
 
   // Same register carry as the Q/K/V tier: one group's weight operands stay
@@ -346,7 +365,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
 
   float acc0 = 0.0f;
   float acc1 = 0.0f;
-  simdgroup_float8x8 A;
+  MMA8_A_TYPE A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
 
 #pragma unroll
@@ -519,9 +538,49 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         return unroll4Enabled ? applyOprojUr4(to: base, occurrences: 2) : base
     }()
 
+    /// Supplies the output row stride at kernel selection instead of reading
+    /// it from the bound shape inside the body. `outputWidth` is a
+    /// compile-time constant here and the admission guard already requires
+    /// `weight.shape[0] == outputWidth`, so no admitted dispatch can present
+    /// any other value; the two forms agree on every element by construction.
+    ///
+    /// Applied to the FINAL header, after the carry and unroll rewrites, so
+    /// the selected body keeps both. Set the environment switch to 0 and the
+    /// bound-shape form is selected instead, byte for byte.
+    public static let staticNEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_OPROJ_STATIC_N"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
+    private static func applyOprojStaticN(to header: String, occurrences: Int)
+        -> String
+    {
+        var result = header
+        func replace(_ old: String, with new: String) {
+            precondition(
+                result.components(separatedBy: old).count == occurrences + 1,
+                "static-N anchor drift")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replace("    const int N,\n", with: "")
+        replace(
+            "  constexpr int K = KFIX;",
+            with: "  constexpr int N = \(outputWidth);\n  constexpr int K = KFIX;")
+        return result
+    }
+
+    private static let mma8StaticNHeader =
+        applyOprojStaticN(to: mma8RspHeader, occurrences: 2)
+
+    private static let mma8Rsp2StaticNHeader =
+        applyOprojStaticN(to: mma8Rsp2Header, occurrences: 3)
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_bfill_v4",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_bfill_v4"
+            + oprojHalfKeySuffix,
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -538,7 +597,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         ensureRowContiguous: true)
 
     private static let mma8KernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_bfill_v4",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_bfill_v4"
+            + oprojHalfKeySuffix,
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -674,7 +734,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
 
     private static let mma8RspKernelK4096 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_rsp_v1"
-            + carry2KeySuffix + unroll4KeySuffix,
+            + carry2KeySuffix + unroll4KeySuffix + oprojHalfKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -692,7 +752,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
 
     private static let mma8RspKernelK8192 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp_v1"
-            + carry2KeySuffix + unroll4KeySuffix,
+            + carry2KeySuffix + unroll4KeySuffix + oprojHalfKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -748,7 +808,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
 
   float acc0 = 0.0f;
   float acc1 = 0.0f;
-  simdgroup_float8x8 A;
+  MMA8_A_TYPE A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
 
 #pragma unroll
@@ -807,7 +867,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
 
     private static let mma8Rsp2KernelK8192 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp2_v1"
-            + carry2KeySuffix + unroll4KeySuffix,
+            + carry2KeySuffix + unroll4KeySuffix + oprojHalfKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "rs_pairs"],
         outputNames: ["y"],
         source: """
@@ -821,6 +881,60 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
             return;
             """,
         header: mma8Rsp2Header,
+        ensureRowContiguous: true)
+
+    private static let mma8RspStaticNKernelK4096 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_rsp_staticn_v1"
+            + carry2KeySuffix + unroll4KeySuffix + oprojHalfKeySuffix,
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            attention_o_qmv_mma8_affine4_g64_rsp<T, 2, 4096>(
+                w, scales, biases, x, rs_table, y,
+                int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8StaticNHeader,
+        ensureRowContiguous: true)
+
+    private static let mma8RspStaticNKernelK8192 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp_staticn_v1"
+            + carry2KeySuffix + unroll4KeySuffix + oprojHalfKeySuffix,
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            attention_o_qmv_mma8_affine4_g64_rsp<T, 2, 8192>(
+                w, scales, biases, x, rs_table, y,
+                int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8StaticNHeader,
+        ensureRowContiguous: true)
+
+    private static let mma8Rsp2StaticNKernelK8192 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp2_staticn_v1"
+            + carry2KeySuffix + unroll4KeySuffix + oprojHalfKeySuffix,
+        inputNames: ["x", "w", "scales", "biases", "rs_pairs"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            attention_o_qmv_mma8_affine4_g64_rsp2<T, 2, 8192>(
+                w, scales, biases, x, rs_pairs, y,
+                int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8Rsp2StaticNHeader,
         ensureRowContiguous: true)
 
     @inline(__always)
@@ -879,6 +993,10 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
             // streamed once per round instead of four times. Grid is in
             // threads: (32, 2, 1) threads per group, N/8 groups along y.
             let yTiles = outputWidth / outputsPerGroup
+            if OProjHalfWeightMatricesV1.enabled {
+                CBv2EngageMark.once("oproj-half-weights")
+                CBv2EngageMark.once("oproj-half-weight-matrices")
+            }
             if pairsReady {
                 if oprojCarry2Enabled {
                     CBv2EngageMark.once("oproj-carry2")
@@ -887,6 +1005,17 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
                     CBv2EngageMark.once("oproj-ur4")
                 }
                 CBv2EngageMark.once("d512-ors-oproj-pairs")
+                if staticNEnabled {
+                    CBv2EngageMark.once("oproj-static-n")
+                    return mma8Rsp2StaticNKernelK8192(
+                        [x, weight, scales, biases, rsPairTable!],
+                        template: [("T", x.dtype)],
+                        grid: (simdWidth, yTiles * simdGroups, 1),
+                        threadGroup: (simdWidth, simdGroups, 1),
+                        outputShapes: [[batch, sequence, outputWidth]],
+                        outputDTypes: [x.dtype]
+                    )[0]
+                }
                 return mma8Rsp2KernelK8192(
                     [x, weight, scales, biases, rsPairTable!],
                     template: [("T", x.dtype)],
@@ -902,6 +1031,19 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
                 }
                 if unroll4Enabled {
                     CBv2EngageMark.once("oproj-ur4")
+                }
+                if staticNEnabled {
+                    CBv2EngageMark.once("oproj-static-n")
+                    let staticNKernel = inDim == 8192
+                        ? mma8RspStaticNKernelK8192 : mma8RspStaticNKernelK4096
+                    return staticNKernel(
+                        [x, weight, scales, biases, rsTable!],
+                        template: [("T", x.dtype)],
+                        grid: (simdWidth, yTiles * simdGroups, 1),
+                        threadGroup: (simdWidth, simdGroups, 1),
+                        outputShapes: [[batch, sequence, outputWidth]],
+                        outputDTypes: [x.dtype]
+                    )[0]
                 }
                 let kernel = inDim == 8192 ? mma8RspKernelK8192 : mma8RspKernelK4096
                 return kernel(

@@ -1453,9 +1453,11 @@ public class SwitchGLU: Module {
         tightDownContract = false
     }
 
-    private func tightDecodeDown(_ x: MLXArray, _ indices: MLXArray, sorted: Bool) -> MLXArray? {
+    private func resolveTightDownStorage(
+        xShape: [Int], xDType: DType, indices: MLXArray, sorted: Bool
+    ) -> Gemma4DownTightGridV1.Storage? {
         guard Gemma4DownTightGridV1.enabled, sorted, let storage = tightDownStorage,
-            Gemma4DownTightGridV1.Storage.admits(x: x, indices: indices)
+            Gemma4DownTightGridV1.Storage.admits(xShape: xShape, xDType: xDType, indices: indices)
         else { return nil }
         if !tightDownResolved {
             tightDownResolved = true
@@ -1469,6 +1471,13 @@ public class SwitchGLU: Module {
             }
         }
         guard tightDownContract else { return nil }
+        return storage
+    }
+
+    private func tightDecodeDown(_ x: MLXArray, _ indices: MLXArray, sorted: Bool) -> MLXArray? {
+        guard let storage = resolveTightDownStorage(
+            xShape: x.shape, xDType: x.dtype, indices: indices, sorted: sorted)
+        else { return nil }
         return storage.call(x: x, lhsIndices: switchDownIdentity64, indices: indices)
     }
 
@@ -1687,6 +1696,16 @@ public class SwitchGLU: Module {
             let lhsIndices, lhsIndices.dtype == .uint32,
             let fused = fusedGateUpDispatch()
         {
+            if Gemma4DownTightGridV1.compiledGateUpAvailable,
+                let down = resolveTightDownStorage(
+                    xShape: Gemma4DecodeFusedGUV1.outputShape,
+                    xDType: Gemma4DecodeFusedGUV1.outputDType, indices: idx, sorted: true),
+                let output = down.callCompiledGateUp(
+                    x: x, storage: fused.storage, lhs: lhsIndices,
+                    rhs: idx, downLHS: switchDownIdentity64)
+            {
+                return (output, inverseOrder, true)
+            }
             let activated = Gemma4DecodeFusedGUV1.call(
                 x: x, storage: fused.storage, lhs: lhsIndices, rhs: idx)
             let output = tightDecodeDown(activated, idx, sorted: true)

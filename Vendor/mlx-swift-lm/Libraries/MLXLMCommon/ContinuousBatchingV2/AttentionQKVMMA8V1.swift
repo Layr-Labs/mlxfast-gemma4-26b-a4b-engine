@@ -30,6 +30,33 @@ import Foundation
 import MLX
 import MLXFast
 
+// Temporary integer operands only; the checkpoint and float accumulation stay intact.
+private enum QKVHalfWeightMatricesV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_HALF_WEIGHT_MATRICES_V1"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    static func rewrite(_ original: String) -> (body: String, applied: Bool) {
+        guard enabled,
+            let start = original.range(of: "METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(")
+        else { return (original, false) }
+        let prefix = String(original[..<start.lowerBound])
+        var body = String(original[start.lowerBound...])
+        let declaration = "simdgroup_float8x8 A;"
+        guard body.components(separatedBy: declaration).count == 2,
+            body.components(separatedBy: "MMA8_STEP(").count == 9
+        else { return (original, false) }
+        body = body.replacingOccurrences(
+            of: declaration, with: "simdgroup_half8x8 A;")
+        body = body.replacingOccurrences(of: "MMA8_STEP(", with: "HALF_WEIGHT_STEP(")
+        let step = "#define HALF_WEIGHT_STEP(BB, J) A.thread_elements()[0] = half(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = half(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, BB, C);\n"
+        return (prefix + step + body, true)
+    }
+}
+
 public enum CBv2AttentionQKVMMA8V1 {
     public static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
@@ -648,6 +675,9 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     /// where the amortisation stops paying for the extra live registers.
     private static let tilesPerGroup = 2
 
+    private static let halfWeightHeader = QKVHalfWeightMatricesV1.rewrite(mma8KernelHeader)
+    private static let halfWeightKey = halfWeightHeader.applied ? "_half_codes_v1" : ""
+
     private static let multiTileKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_v4",
         inputNames: ["x", "w", "scales", "biases"],
@@ -714,7 +744,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     // entries the separate Q and K rsp dispatches would; the SPLIT store
     // keeps QKFUSE-001's two-buffer layout.
     private static let fusedSlidingRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_v1" + halfWeightKey,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y", "y2"],
         source: """
@@ -727,11 +757,11 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
                 thread_index_in_simdgroup, y2);
             return;
             """,
-        header: mma8KernelHeader,
+        header: halfWeightHeader.body,
         ensureRowContiguous: true)
 
     private static let fusedFullRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_v1" + halfWeightKey,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y", "y2"],
         source: """
@@ -744,7 +774,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
                 thread_index_in_simdgroup, y2);
             return;
             """,
-        header: mma8KernelHeader,
+        header: halfWeightHeader.body,
         ensureRowContiguous: true)
 
     private static let mma8Kernel = MLXFast.metalKernel(
@@ -805,7 +835,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let multiTileRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_v1" + halfWeightKey,
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -818,7 +848,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: mma8KernelHeader,
+        header: halfWeightHeader.body,
         ensureRowContiguous: true)
 
     private static let mma8RspKernel = MLXFast.metalKernel(
@@ -988,6 +1018,9 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         fusedLock.unlock()
         guard let (fw, fs, fb) = plane else { return nil }
 
+        if tableReady, halfWeightHeader.applied {
+            CBv2EngageMark.once("qkv-half-weight-matrices")
+        }
         let outputs = kernel(
             tableReady ? [x, fw, fs, fb, rsTable!] : [x, fw, fs, fb],
             template: [("T", x.dtype)],
@@ -1049,6 +1082,9 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         let yTiles = outputWidth / outputsPerGroup
         if multiTileEnabled, yTiles % tilesPerGroup == 0 {
             if tableReady {
+                if halfWeightHeader.applied {
+                    CBv2EngageMark.once("qkv-half-weight-matrices")
+                }
                 return multiTileRspKernel(
                     [x, weight, scales, biases, rsTable!],
                     template: [("T", x.dtype)],

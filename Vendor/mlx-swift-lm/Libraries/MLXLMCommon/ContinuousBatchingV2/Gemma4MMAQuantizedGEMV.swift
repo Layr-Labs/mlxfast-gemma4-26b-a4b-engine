@@ -76,6 +76,35 @@ import MLXFast
 /// here claims only 32 output columns, so narrow planes (q/k/v/o, the dense
 /// MLP) cannot fill the machine and measured SLOWER than ordinary pair/quad
 /// QMV in isolation. Only the tied vocab plane is meant to enter.
+// Only unpacked integer code operands are narrowed; no weight buffer is changed.
+private enum HeadHalfWeightMatricesV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_HALF_WEIGHT_MATRICES_V1"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    static func rewrite(_ original: String) -> (body: String, applied: Bool) {
+        guard enabled else { return (original, false) }
+        var body = original
+        for i in 0..<4 {
+            let declaration = "simdgroup_matrix<float, 8, 8> A\(i);"
+            guard body.components(separatedBy: declaration).count == 2
+            else { return (original, false) }
+            body = body.replacingOccurrences(
+                of: declaration, with: "simdgroup_matrix<half, 8, 8> A\(i);")
+            for shift in ["nibbleShift", "(nibbleShift + 4u)"] {
+                let value = "((packed\(i) >> \(shift)) & 0xFu)"
+                guard body.components(separatedBy: "float" + value).count == 2
+                else { return (original, false) }
+                body = body.replacingOccurrences(of: "float" + value, with: "half" + value)
+            }
+        }
+        return (body, true)
+    }
+}
+
 public enum Gemma4MMAQuantizedGEMV {
 
     /// Exact affine activation sums emitted by the final RMSNorm producer.
@@ -3122,6 +3151,7 @@ public enum Gemma4MMAQuantizedGEMV {
         let logits: MLXFast.MLXFastKernel
         let carry: MLXFast.MLXFastKernel
         let argmax: MLXFast.MLXFastKernel
+        let halfWeightArgmax: Bool
     }
 
     /// The three `_rl1` twins, or nil when the switch is off or a derivation
@@ -3139,6 +3169,8 @@ public enum Gemma4MMAQuantizedGEMV {
             return nil
         }
 
+        let halfArgmax = logitslessCarryEnabled
+            ? HeadHalfWeightMatricesV1.rewrite(argmax) : (body: argmax, applied: false)
         return RelayoutKernels(
             logits: MLXFast.metalKernel(
                 name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1_rl1",
@@ -3156,12 +3188,13 @@ public enum Gemma4MMAQuantizedGEMV {
                 ensureRowContiguous: true),
             argmax: MLXFast.metalKernel(
                 name: "gemma4_mma_affine4_qmv_m8_v27_argmax_rl1"
-                    + logitslessCarryKeySuffix,
+                    + logitslessCarryKeySuffix + (halfArgmax.applied ? "_half_codes_v1" : ""),
                 inputNames: ["x", "w", "scales", "biases", "xSums"],
                 outputNames: ["pv", "pi"],
-                source: argmax,
+                source: halfArgmax.body,
                 header: "#include <metal_simdgroup_matrix>\n",
-                ensureRowContiguous: true))
+                ensureRowContiguous: true),
+            halfWeightArgmax: halfArgmax.applied)
     }()
 
     private static let relayoutLock = NSLock()
@@ -3605,6 +3638,9 @@ public enum Gemma4MMAQuantizedGEMV {
         let plane: MLXArray
         if let relaid = relayoutKernels {
             CBv2EngageMark.once("head-relayout")
+            if relaid.halfWeightArgmax {
+                CBv2EngageMark.once("head-half-weight-matrices")
+            }
             headKernel = relaid.argmax
             plane = relayoutPlane(for: w, k: k, n: n)
         } else {

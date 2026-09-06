@@ -14,6 +14,18 @@ public enum Gemma4DownTightGridV1 {
         #endif
     }()
 
+    /// DOWN-RUN-QUAD kill switch. Off restores the incumbent kernel source and
+    /// registration name byte for byte.
+    public static let runQuadEnabled: Bool = {
+        #if os(macOS)
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_RUN_QUAD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+        #else
+        return false
+        #endif
+    }()
+
     /// Bound to the immutable sanitized checkpoint, like the fused gate/up storage.
     public final class Storage {
         private let weight: MLXArray
@@ -30,14 +42,17 @@ public enum Gemma4DownTightGridV1 {
             self.biases = biases
         }
 
-        static func admits(x: MLXArray, indices: MLXArray) -> Bool {
+        public static func admits(x: MLXArray, indices: MLXArray) -> Bool {
             x.dtype == .bfloat16 && x.shape == [64, 1, 704]
                 && indices.dtype == .uint32 && indices.shape == [64]
         }
 
         /// The caller supplies the incumbent identity LHS and sorted RHS keys.
-        func call(x: MLXArray, lhsIndices: MLXArray, indices: MLXArray) -> MLXArray {
-            kernel(
+        public func call(x: MLXArray, lhsIndices: MLXArray, indices: MLXArray) -> MLXArray {
+            if Gemma4DownTightGridV1.runQuadEnabled {
+                CBv2EngageMark.once("down-run-quad")
+            }
+            return kernel(
                 [weight, scales, biases, x, lhsIndices, indices],
                 template: [("T", DType.bfloat16)],
                 grid: (32, 88 * 2, 64), threadGroup: (32, 2, 1),
@@ -47,7 +62,7 @@ public enum Gemma4DownTightGridV1 {
     }
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_down_qmv_span4_tight_zorder_v1",
+        name: kernelName,
         inputNames: ["w", "scales", "biases", "x", "lhs_indices", "rhs_indices"],
         outputNames: ["y"],
         source: #"""
@@ -782,6 +797,19 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   }
 }
 
+
+"""# + downTileSource,
+        ensureRowContiguous: true)
+
+    private static let kernelName = runQuadEnabled
+        ? "gemma4_b8_down_qmv_span4_tight_zorder_v1_rq4"
+        : "gemma4_b8_down_qmv_span4_tight_zorder_v1"
+
+    /// The tile gather and its stream bodies. The incumbent variant is the
+    /// verbatim pre-DOWN-RUN-QUAD text.
+    private static let downTileSource = runQuadEnabled ? runQuadTileSource : incumbentTileSource
+
+    private static let incumbentTileSource = #"""
 template <typename T, int group_size, int bits>
 METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device uint32_t* w,
@@ -877,6 +905,330 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
 
 constant int gemma4_tight_down_K=704;
 constant int gemma4_tight_down_N=2816;
-"""#,
-        ensureRowContiguous: true)
+"""#
+
+    private static let runQuadTileSource = #"""
+template <typename U, int values_per_thread>
+inline U qdot_affine4_registered_word(
+    uint packed_word,
+    const thread U* x_thread,
+    U scale,
+    U bias,
+    U sum) {
+  static_assert(values_per_thread == 8, "Word load expects eight 4-bit values");
+  const uint packed0 = packed_word & 0xffffu;
+  const uint packed1 = packed_word >> 16;
+  U accum =
+      (x_thread[0] * (packed0 & 0x000f) +
+       x_thread[1] * (packed0 & 0x00f0) +
+       x_thread[2] * (packed0 & 0x0f00) +
+       x_thread[3] * (packed0 & 0xf000));
+  accum +=
+      (x_thread[4] * (packed1 & 0x000f) +
+       x_thread[5] * (packed1 & 0x00f0) +
+       x_thread[6] * (packed1 & 0x0f00) +
+       x_thread[7] * (packed1 & 0xf000));
+  return scale * accum + sum * bias;
+}
+
+// DOWN-RUN-QUAD: four assignment streams share one expert tile read.  Each
+// stream keeps the incumbent per-stream chain of
+// `qdot_affine4_pair_word` verbatim (the pair helper's accum0/accum1 bodies
+// and this single-stream body are the same expression), so an output element
+// sees exactly the products, order and roundings it sees today; only the
+// threadgroup that loads the weight word changes.
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine4_g64_quad_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    const device T* x2,
+    const device T* x3,
+    device T* y0,
+    device T* y1,
+    device T* y2,
+    device T* y3,
+    const constant int& in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 8;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x_thread[values_per_thread];
+  thread uint packed[results_per_simdgroup];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+  thread float result2[results_per_simdgroup] = {0};
+  thread float result3[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  x2 += simd_lid * values_per_thread;
+  x3 += simd_lid * values_per_thread;
+  y0 += out_row;
+  y1 += out_row;
+  y2 += out_row;
+  y3 += out_row;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result3[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+
+    ws += block_size / 2;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+    x2 += block_size;
+    x3 += block_size;
+  }
+
+  // Identical tail contract to the pair arm: K is 64-aligned, so the final
+  // block holds an integral number of complete eight-value lane packets.
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result3[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+    result2[row] = simd_sum(result2[row]);
+    result3[row] = simd_sum(result3[row]);
+    if (simd_lid == 0) {
+      y0[row] = static_cast<T>(result0[row]);
+      y1[row] = static_cast<T>(result1[row]);
+      y2[row] = static_cast<T>(result2[row]);
+      y3[row] = static_cast<T>(result3[row]);
+    }
+  }
+}
+
+template <typename T, int group_size, int bits>
+METAL_FUNC void gather_qmv_gemma4_down_tile(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    const device uint32_t* lhs_indices,
+    const device uint32_t* rhs_indices,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const uint lhs_stride,
+    const uint rhs_stride,
+    const int64_t x_stride,
+    const int64_t w_stride,
+    const int64_t s_stride,
+    const int64_t b_stride,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  if (tid.y % uint(gemma4_down_tile_span) != 0u) {
+    return;
+  }
+  const uint assignment = tid.z;
+  const uint32_t route_word = rhs_indices[assignment * rhs_stride];
+  const bool expert_prefix_bounds = (route_word & 0x80000000u) != 0u;
+  const uint32_t expert =
+      expert_prefix_bounds ? (route_word & 0xffu) : route_word;
+  uint run_offset = 0;
+  if (expert_prefix_bounds) {
+    run_offset = (route_word >> 8) & 0x3fu;
+  } else {
+    for (uint prior = assignment; prior > 0; --prior) {
+      if (rhs_indices[(prior - 1) * rhs_stride] != expert) {
+        break;
+      }
+      run_offset++;
+    }
+  }
+  // DOWN-RUN-QUAD: one leader every four run positions, matching the fused
+  // gate/up election.  Positions 1..3 of a quad are produced by the leader.
+  if ((run_offset & 3) != 0) {
+    return;
+  }
+  // The tagged word carries run_remaining - 1; the untagged fallback walks
+  // the sorted keys exactly as the fused gate/up election does.
+  uint run_count = 1;
+  if (expert_prefix_bounds) {
+    run_count = min(4u, ((route_word >> 14) & 0x3fu) + 1u);
+  } else {
+    while (run_count < 4u && assignment + run_count < 64u &&
+           rhs_indices[(assignment + run_count) * rhs_stride] == expert) {
+      run_count++;
+    }
+  }
+  const device uint32_t* tile_w = w + expert * w_stride;
+  const device T* tile_scales = scales + expert * s_stride;
+  const device T* tile_biases = biases + expert * b_stride;
+  const device T* tile_x0 =
+      x + lhs_indices[assignment * lhs_stride] * x_stride;
+  device T* tile_y0 = y + assignment * out_vec_size;
+  if (run_count == 4) {
+    const device T* tile_x1 =
+        x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
+    const device T* tile_x2 =
+        x + lhs_indices[(assignment + 2) * lhs_stride] * x_stride;
+    const device T* tile_x3 =
+        x + lhs_indices[(assignment + 3) * lhs_stride] * x_stride;
+    device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+    device T* tile_y2 = y + (assignment + 2) * out_vec_size;
+    device T* tile_y3 = y + (assignment + 3) * out_vec_size;
+    for (int t = 0; t < gemma4_down_tile_span; t++) {
+      uint3 tile_tid = tid;
+      tile_tid.y = tid.y + uint(t);
+      qmv_affine4_g64_quad_impl<T, group_size, bits>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_x1,
+          tile_x2,
+          tile_x3,
+          tile_y0,
+          tile_y1,
+          tile_y2,
+          tile_y3,
+          in_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    }
+    return;
+  }
+  // Tails of 1, 2 and 3 keep the incumbent pair and single arms verbatim.
+  if (run_count >= 2) {
+    const device T* tile_x1 =
+        x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
+    device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+    for (int t = 0; t < gemma4_down_tile_span; t++) {
+      uint3 tile_tid = tid;
+      tile_tid.y = tid.y + uint(t);
+      qmv_affine4_g64_pair_impl<T, group_size, bits>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_x1,
+          tile_y0,
+          tile_y1,
+          in_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    }
+    if (run_count == 2) {
+      return;
+    }
+    const device T* tile_x2 =
+        x + lhs_indices[(assignment + 2) * lhs_stride] * x_stride;
+    device T* tile_y2 = y + (assignment + 2) * out_vec_size;
+    for (int t = 0; t < gemma4_down_tile_span; t++) {
+      uint3 tile_tid = tid;
+      tile_tid.y = tid.y + uint(t);
+      qmv_impl<T, group_size, bits>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x2,
+          tile_y2,
+          in_vec_size,
+          out_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    }
+    return;
+  }
+  for (int t = 0; t < gemma4_down_tile_span; t++) {
+    uint3 tile_tid = tid;
+    tile_tid.y = tid.y + uint(t);
+    qmv_impl<T, group_size, bits>(
+        tile_w,
+        tile_scales,
+        tile_biases,
+        tile_x0,
+        tile_y0,
+        in_vec_size,
+        out_vec_size,
+        tile_tid,
+        simd_gid,
+        simd_lid);
+  }
+}
+
+constant int gemma4_tight_down_K=704;
+constant int gemma4_tight_down_N=2816;
+"""#
 }

@@ -1323,6 +1323,19 @@ public let switchGateUpFusePrefillEnabled: Bool = {
 /// never a parameter in its own right, never quantized again, never saved and
 /// never updated. Built once at load, retained for the life of the layer.
 public final class SwitchGateUpFusedStorage {
+    private let densePrefillLock = NSLock()
+    private var densePrefillOperand: Gemma4PrefillCachedExpertV1.Operand?
+
+    public func cachedPrefillOperand() -> Gemma4PrefillCachedExpertV1.Operand? {
+        densePrefillLock.lock()
+        defer { densePrefillLock.unlock() }
+        if let densePrefillOperand { return densePrefillOperand }
+        let operand = Gemma4PrefillCachedExpertV1.makeOperand(
+            weight: weight, scales: scales, biases: biases)
+        densePrefillOperand = operand
+        return operand
+    }
+
     public let weight: MLXArray
     public let scales: MLXArray
     public let biases: MLXArray
@@ -1424,6 +1437,23 @@ public class SwitchGLU: Module {
     /// when the layer is not the exact production geometry or the arm is
     /// off), and its once-resolved dispatch contract.
     private var fusedGateUpStorage: SwitchGateUpFusedStorage?
+    private var prefillDownStorage: Gemma4PrefillCachedExpertV1.Storage?
+
+    public func bindPrefillDownStorage(_ storage: Gemma4PrefillCachedExpertV1.Storage) {
+        prefillDownStorage = storage
+    }
+
+    private func cachedPrefillDown(_ x: MLXArray, _ indices: MLXArray) -> MLXArray? {
+        guard Gemma4PrefillCachedExpertV1.admits(x: x, indices: indices),
+            let down = downProj as? QuantizedSwitchLinear,
+            down.inputDims == 704, down.outputDims == 2816, down.numExperts == 128,
+            down.groupSize == 64, down.bits == 4, down.mode == .affine,
+            down.bias == nil, let storage = prefillDownStorage,
+            let operand = storage.operand()
+        else { return nil }
+        CBv2EngageMark.once("prefill-cached-down")
+        return Gemma4PrefillCachedExpertV1.call(x: x, operand: operand, sortedKeys: indices)
+    }
     private var fusedGateUpResolved = false
     private var fusedGateUpContract: (groupSize: Int, bits: Int, mode: QuantizationMode)?
 
@@ -1653,7 +1683,15 @@ public class SwitchGLU: Module {
                 let fused = fusedGateUpDispatch()
             {
                 CBv2EngageMark.once("prefill-gateup-fuse")
-                let xGateUp = MLX.gatherQuantizedMM(
+                let xGateUp: MLXArray
+                if Gemma4PrefillCachedExpertV1.admits(x: x, indices: idx),
+                    let operand = fused.storage.cachedPrefillOperand()
+                {
+                    xGateUp = Gemma4PrefillCachedExpertV1.call(
+                        x: x, operand: operand, sortedKeys: idx)
+                    CBv2EngageMark.once("prefill-cached-b")
+                } else {
+                    xGateUp = MLX.gatherQuantizedMM(
                     x,
                     fused.storage.weight,
                     scales: fused.storage.scales,
@@ -1666,6 +1704,7 @@ public class SwitchGLU: Module {
                     mode: fused.mode,
                     sortedIndices: true
                 )
+                }
                 // The specialized gathered-QMM epilogue stores the compact
                 // [rows, 704] GeGLU plane in the first physical half of the
                 // ordinary [rows, 1, 1408] output allocation.
@@ -1674,8 +1713,12 @@ public class SwitchGLU: Module {
                 CBv2EngageMark.once("prefill-gateup-gelu-epilogue")
                 let downLhs: MLXArray? =
                     (idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
-                x = downProj(
-                    activated, idx, lhsIndices: downLhs, sortedIndices: true)
+                if let cached = cachedPrefillDown(activated, idx) {
+                    x = cached
+                } else {
+                    x = downProj(
+                        activated, idx, lhsIndices: downLhs, sortedIndices: true)
+                }
                 return (x, inverseOrder, true)
             } else {
                 xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)

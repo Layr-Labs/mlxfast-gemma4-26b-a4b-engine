@@ -900,10 +900,68 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         return values
     }
 
+    /// Primary joined Q|K storage for one exact Gemma decode layer. The
+    /// projection parameters bind to zero-copy row views of these arrays, so
+    /// module reflection/update sees the same q/k leaves as before while the
+    /// fused decode dispatch consumes the joined planes directly.
+    public final class FusedQKStorage {
+        public let weight: MLXArray
+        public let scales: MLXArray
+        public let biases: MLXArray
+        public let qWeight: MLXArray
+        public let qScales: MLXArray
+        public let qBiases: MLXArray
+        public let kWeight: MLXArray
+        public let kScales: MLXArray
+        public let kBiases: MLXArray
+        public let qWidth: Int
+        public let kWidth: Int
+
+        public init?(
+            qWeight: MLXArray, qScales: MLXArray, qBiases: MLXArray,
+            kWeight: MLXArray, kScales: MLXArray, kBiases: MLXArray
+        ) {
+            guard qWeight.ndim == 2, kWeight.ndim == 2,
+                qWeight.dim(1) == inputWidth * bits / 32,
+                kWeight.dim(1) == qWeight.dim(1),
+                livePrimaryFusedPair(
+                    qWidth: qWeight.dim(0), kWidth: kWeight.dim(0)),
+                qScales.shape == [qWeight.dim(0), inputWidth / groupSize],
+                qBiases.shape == qScales.shape,
+                kScales.shape == [kWeight.dim(0), inputWidth / groupSize],
+                kBiases.shape == kScales.shape,
+                qWeight.dtype == .uint32, kWeight.dtype == .uint32,
+                qScales.dtype == .bfloat16, qBiases.dtype == .bfloat16,
+                kScales.dtype == .bfloat16, kBiases.dtype == .bfloat16
+            else { return nil }
+
+            qWidth = qWeight.dim(0)
+            kWidth = kWeight.dim(0)
+            weight = concatenated([qWeight, kWeight], axis: 0)
+            scales = concatenated([qScales, kScales], axis: 0)
+            biases = concatenated([qBiases, kBiases], axis: 0)
+            self.qWeight = weight[..<qWidth]
+            self.qScales = scales[..<qWidth]
+            self.qBiases = biases[..<qWidth]
+            self.kWeight = weight[qWidth...]
+            self.kScales = scales[qWidth...]
+            self.kBiases = biases[qWidth...]
+        }
+    }
+
     @inline(__always)
     private static let fusedLock = NSLock()
     nonisolated(unsafe) private static var fusedPlanes:
         [ObjectIdentifier: (MLXArray, MLXArray, MLXArray)] = [:]
+
+    /// Invalidate a legacy joined plane before its owning module parameters
+    /// are updated. Primary storage is rebound only after a successful update
+    /// supplies its exact six split-view objects.
+    public static func invalidateFusedQKPlane(cacheKey: ObjectIdentifier) {
+        fusedLock.lock()
+        fusedPlanes.removeValue(forKey: cacheKey)
+        fusedLock.unlock()
+    }
 
     /// QKFUSE-001. One dispatch for the layer's Q and K projections.
     ///
@@ -933,7 +991,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         groupSize: Int,
         bits: Int,
         mode: QuantizationMode,
-        cacheKey: ObjectIdentifier,
+        cacheKey: ObjectIdentifier?,
+        storage: FusedQKStorage? = nil,
         rsTable: MLXArray? = nil
     ) -> (MLXArray, MLXArray)? {
         guard enabled, fuseQKEnabled, multiTileEnabled,
@@ -975,17 +1034,27 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         let yTiles = total / outputsPerGroup
         guard yTiles % tilesPerGroup == 0 else { return nil }
 
-        fusedLock.lock()
-        var plane = fusedPlanes[cacheKey]
-        if plane == nil {
-            let w = concatenated([qWeight, kWeight], axis: 0)
-            let s = concatenated([qScales, kScales], axis: 0)
-            let b = concatenated([qBiases, kBiases], axis: 0)
-            eval(w, s, b)
-            plane = (w, s, b)
-            fusedPlanes[cacheKey] = plane
+        let plane: (MLXArray, MLXArray, MLXArray)?
+        if let storage,
+            storage.qWidth == qWidth, storage.kWidth == kWidth
+        {
+            plane = (storage.weight, storage.scales, storage.biases)
+        } else if let cacheKey {
+            fusedLock.lock()
+            var cached = fusedPlanes[cacheKey]
+            if cached == nil {
+                let w = concatenated([qWeight, kWeight], axis: 0)
+                let s = concatenated([qScales, kScales], axis: 0)
+                let b = concatenated([qBiases, kBiases], axis: 0)
+                eval(w, s, b)
+                cached = (w, s, b)
+                fusedPlanes[cacheKey] = cached
+            }
+            fusedLock.unlock()
+            plane = cached
+        } else {
+            plane = nil
         }
-        fusedLock.unlock()
         guard let (fw, fs, fb) = plane else { return nil }
 
         let outputs = kernel(
@@ -996,6 +1065,13 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             outputShapes: [[batch, sequence, qWidth], [batch, sequence, kWidth]],
             outputDTypes: [x.dtype, x.dtype])
         return (outputs[0], outputs[1])
+    }
+
+    /// Exact production pairs admitted for primary storage. The legacy cache
+    /// remains available to other kernel-supported widths.
+    private static func livePrimaryFusedPair(qWidth: Int, kWidth: Int) -> Bool {
+        (qWidth == 4096 && kWidth == 2048)
+            || (qWidth == 8192 && kWidth == 1024)
     }
 
     /// Q widths the fused kernels bake as a compile-time split point.

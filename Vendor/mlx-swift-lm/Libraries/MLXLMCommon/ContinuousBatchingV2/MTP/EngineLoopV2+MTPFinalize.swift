@@ -28,8 +28,22 @@ extension EngineLoopV2 {
         }
 
         guard let verify = round.verify else { return }
+        let finalizeStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        defer {
+            if CBv2StepProfiler.enabled {
+                CBv2StepProfiler.record(
+                    "v2.mtp.finalize.total",
+                    seconds: CFAbsoluteTimeGetCurrent() - finalizeStart)
+            }
+        }
         let k = verify.k
+        let acceptanceStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let host = verify.acceptancePacket.asArray(Int32.self)
+        if CBv2StepProfiler.enabled {
+            CBv2StepProfiler.record(
+                "v2.mtp.acceptance.wait",
+                seconds: CFAbsoluteTimeGetCurrent() - acceptanceStart)
+        }
         let draftCount = verify.rows.count * k
         let targetWidth = 1 + k
         var anyRejected = false
@@ -40,13 +54,15 @@ extension EngineLoopV2 {
             let rec: CBv2ScheduledRequest
             let targets: [Int]
             let accepted: Int
+            let emitted: Int
         }
 
-        // Resolve each row's natural target-authoritative prefix, then choose
-        // one committed width for the rectangular step. This keeps subsequent
-        // quantized MoE target batches shape-identical across all rows.
+        // Commit each row's target-authoritative prefix independently. The
+        // next target call keeps its physical batch shape and uses the row's
+        // own position. Keep the minimum only for controller statistics.
         var outcomes: [RowOutcome] = []
         outcomes.reserveCapacity(verify.rows.count)
+        var finalizedStorageRows: [CBv2SequenceKV] = []
         var commonEmitted = targetWidth
 
         for (batchIndex, metadata) in verify.rows.enumerated() {
@@ -81,7 +97,8 @@ extension EngineLoopV2 {
                     metadata: metadata,
                     rec: rec,
                     targets: targets,
-                    accepted: accepted))
+                    accepted: accepted,
+                    emitted: naturalEmitted))
         }
 
         round.finalizedVerifyIDs = Set(outcomes.map { $0.metadata.id })
@@ -101,13 +118,15 @@ extension EngineLoopV2 {
                 decodeRowBucket: mtp.planDecodeRowBucket)
         }
 
+        let commitStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         for outcome in outcomes {
             let batchIndex = outcome.batchIndex
             let metadata = outcome.metadata
             let id = metadata.id
             let rec = outcome.rec
             let accepted = outcome.accepted
-            let emitted = Array(outcome.targets.prefix(commonEmitted))
+            let emitted = Array(outcome.targets.prefix(outcome.emitted))
+            finalizedStorageRows.append(contentsOf: metadata.storageRows)
 
             // Confirm in order with the same stop and length semantics as the
             // ordinary finalize loop.
@@ -210,9 +229,19 @@ extension EngineLoopV2 {
             }
         }
 
+        // Host rollback and commit stayed in row order above. The opt-in Q4
+        // block path now restores rejected device suffixes once per layer and
+        // fences them before EngineLoop retires deferred state below.
+        _ = CBv2WindowedSequenceKV.finalizeSpeculativeRingWriteBlocks(
+            rows: finalizedStorageRows)
+
         // Rejected suffixes advanced eager device offsets past host truth.
         if anyRejected {
             eagerCompositionStale = true
+        }
+        if CBv2StepProfiler.enabled {
+            CBv2StepProfiler.record(
+                "v2.mtp.commit.host", seconds: CFAbsoluteTimeGetCurrent() - commitStart)
         }
     }
 }

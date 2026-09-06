@@ -717,6 +717,34 @@ enum CBv2AttentionV1 {
                 return output
             }
 
+            // WRITE-022-RAGGED-D512: store unequal private rows in place,
+            // then fence the store into the scalar ragged attention chain.
+            if let decodeRingWriteFence, allowFusedRingWrite,
+                let fused = CBv2RaggedComposedD512DecodeAttentionV1
+                    .updateAndAttendWriting22Ragged(
+                        rows: rows, kind: kind,
+                        queries: queries, keys: keys, values: values,
+                        previousWriteFence: decodeRingWriteFence.value,
+                        scale: scale, sinks: effectiveSinks, softcap: softcap,
+                        allowFusedRingWrite: allowFusedRingWrite)
+            {
+                decodeRingWriteFence.value = fused.nextWriteFence
+                CBv2EngageMark.once("write022d512-ragged")
+                return fused.output
+            }
+
+            // RAGGED-D512: opt-in scalar QK/softmax/AV for unequal private
+            // full-attention offsets. Admission preserves row-order updates.
+            if let output =
+                CBv2RaggedComposedD512DecodeAttentionV1.updateAndAttendRagged(
+                    rows: rows, kind: kind,
+                    queries: queries, keys: keys, values: values,
+                    scale: scale, sinks: effectiveSinks, softcap: softcap)
+            {
+                CBv2EngageMark.once("d512ragged")
+                return output
+            }
+
             // ATT-008: batch-wide FULL-attention decode. One pooled append +
             // one batched call replaces 8 per-row appends + 8 row-local
             // composed SDPA graphs, with bit-identical per-row numerics (see

@@ -434,6 +434,7 @@ public final class Gemma4A4BRuntimeWeightCache {
                         ("[warmCohortShapes] step profile over "
                             + "\(warmCompletionTokens) warm tokens\n"
                             + CBv2StepProfiler.summaryTable() + "\n").utf8))
+                CBv2StepProfiler.reset()
             }
         } catch {
             // Best-effort: a cohort-warm refusal must never fail model load;

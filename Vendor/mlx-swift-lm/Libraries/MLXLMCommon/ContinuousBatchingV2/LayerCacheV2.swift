@@ -93,6 +93,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     private var usesUnifiedPositionOffsets = false
     private var advancesPositionOffsets = true
     private let decodeRingWriteFence = CBv2DecodeRingWriteFence()
+    private static let mtpUndoBlockEnabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_MTP_UNDO_BLOCK"] == "1"
 
     /// Whether a KV-shared sibling may still be attending views of this
     /// layer's storage. `CBv2LayerCacheBank` clears it for every layer nothing
@@ -181,6 +183,15 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
 
     // MARK: - CBv2AttendingLayerCache
 
+    /// Optional MTP-only Q4 undo preparation. The admission checks are kept
+    /// in the owning sequence so unsupported rows fall back unchanged.
+    @discardableResult
+    public func prepareSpeculativeRingWriteBlock(columnCount: Int) -> Bool {
+        guard Self.mtpUndoBlockEnabled else { return false }
+        return CBv2WindowedSequenceKV.prepareSpeculativeRingWriteBlock(
+            rows: rows, columnCount: columnCount, fence: decodeRingWriteFence)
+    }
+
     public func updateAndAttend(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?
@@ -188,6 +199,14 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         precondition(
             kind.sharesKVWithLayer == nil,
             "CBv2LayerCache: KV-shared layer \(layerIndex) must use attendBorrowing")
+        if queries.dim(2) == 1 && !CBv2WindowedSequenceKV.prepareSpeculativeRingWrites(
+            rows: rows, fence: decodeRingWriteFence)
+        {
+            for row in rows {
+                (row as? CBv2WindowedSequenceKV)?.prepareSpeculativeRingWrite(
+                    fence: decodeRingWriteFence)
+            }
+        }
         let output = CBv2AttentionV1.updateAndAttend(
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,

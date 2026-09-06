@@ -71,6 +71,49 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     let kvHeads: Int
     let headDim: Int
 
+    private final class SpeculativeRingWriteBlock {
+        let parent: MLXArray
+        let rings: [MLXArray]
+        let origins: MLXArray
+        let columns: Int
+        let size: Int
+        let width: Int
+        let window: Int
+        let fence: CBv2DecodeRingWriteFence
+        var rejectedCounts = Array(repeating: 0, count: 8)
+
+        init(
+            parent: MLXArray, rings: [MLXArray], origins: MLXArray,
+            columns: Int, size: Int, width: Int, window: Int,
+            fence: CBv2DecodeRingWriteFence
+        ) {
+            self.parent = parent
+            self.rings = rings
+            self.origins = origins
+            self.columns = columns
+            self.size = size
+            self.width = width
+            self.window = window
+            self.fence = fence
+        }
+
+        var byteShare: Int { parent.nbytes / 8 }
+
+        func recordRejected(rowIndex: Int, count: Int) {
+            precondition((0 ..< 8).contains(rowIndex))
+            precondition(count >= 0)
+            precondition(
+                rejectedCounts[rowIndex] + count <= columns,
+                "CBv2WindowedSequenceKV: block rollback exceeds saved columns")
+            rejectedCounts[rowIndex] += count
+        }
+    }
+
+    private struct SpeculativeRingWriteBlockRow {
+        let block: SpeculativeRingWriteBlock
+        let rowIndex: Int
+    }
+
     private var keys: MLXArray?
     private var values: MLXArray?
 
@@ -111,6 +154,9 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+
+    private static let mtpUndoBatchRestoreEnabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_MTP_UNDO_BATCH_RESTORE"] == "1"
 
     /// `MLX_KV_QUANT_SIM=1` (default OFF, local only): after every ring
     /// write, overwrite the bf16 slot with its quantize→dequantize round
@@ -165,6 +211,13 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// at `commitSpeculativeWrite()`. At most one transaction per row.
     private var staged: (keys: MLXArray, values: MLXArray, basePosition: Int)?
 
+    // Fused decode writes bypass `staged`. Save only their overwritten slots,
+    // with graph edges on both sides of each in-place write.
+    private var speculativeOrigin: (offset: Int, oldest: Int)?
+    private var decodeWriteFence: CBv2DecodeRingWriteFence?
+    private var ringUndo: [(position: Int, keys: MLXArray?, values: MLXArray?, mirror: MLXArray?)] = []
+    private var blockUndo: SpeculativeRingWriteBlockRow?
+
     /// - Parameters:
     ///   - window: sliding window in tokens (> 0).
     ///   - initialOffset: absolute position this sequence starts at. Non-zero
@@ -190,6 +243,10 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         (keys?.nbytes ?? 0) + (values?.nbytes ?? 0)
             + (staged.map { $0.keys.nbytes + $0.values.nbytes } ?? 0)
             + (quantMirror?.nbytes ?? 0)
+            + (blockUndo?.block.byteShare ?? 0)
+            + ringUndo.reduce(0) {
+                $0 + ($1.keys?.nbytes ?? 0) + ($1.values?.nbytes ?? 0) + ($1.mirror?.nbytes ?? 0)
+            }
     }
 
     public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
@@ -372,7 +429,284 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             staged == nil,
             "CBv2WindowedSequenceKV: beginSpeculativeWrite with a staged update pending — commit first"
         )
+        precondition(
+            blockUndo == nil,
+            "CBv2WindowedSequenceKV: beginSpeculativeWrite with a pending block restore")
         speculativeWriteArmed = true
+        speculativeOrigin = (absoluteOffset, oldestValidPosition)
+    }
+
+    /// Called before decode dispatch, including the fused paths that never
+    /// call `update`. A staged fallback does not use these saved slots.
+    func prepareSpeculativeRingWrite(fence: CBv2DecodeRingWriteFence) {
+        decodeWriteFence = fence
+        guard speculativeWriteArmed, staged == nil, retainedCount == window,
+            blockUndo == nil,
+            !ringUndo.contains(where: { $0.position == absoluteOffset }) else { return }
+        func save(_ ring: MLXArray?) -> MLXArray? {
+            guard let ring else { return nil }
+            let count = ring.dim(0) * ring.dim(1) * ring.dim(3)
+            let output = Self.saveRingSlot(
+                [ring, MLXArray([Int32(absoluteOffset % window)]), fence.value],
+                template: [("T", ring.dtype), ("WIDTH", ring.dim(3)),
+                    ("WINDOW", window)],
+                grid: (count, 1, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[ring.dim(0), ring.dim(1), 1, ring.dim(3)], [1]],
+                outputDTypes: [ring.dtype, .int32])
+            fence.value = output[1]
+            return output[0]
+        }
+        ringUndo.append((absoluteOffset,
+            bf16RingStale ? nil : save(keys),
+            bf16RingStale ? nil : save(values), save(quantMirror)))
+    }
+
+    /// One saved allocation and one fence for a full Q4 cohort. Each row
+    /// retains its own slot view and can still roll back independently.
+    static func prepareSpeculativeRingWrites(
+        rows source: [CBv2SequenceKV], fence: CBv2DecodeRingWriteFence
+    ) -> Bool {
+        guard source.count == 8,
+            let first = source[0] as? CBv2WindowedSequenceKV,
+            first.speculativeWriteArmed && first.staged == nil && first.bf16RingStale,
+            first.blockUndo == nil
+        else { return false }
+        let rows = source.compactMap { $0 as? CBv2WindowedSequenceKV }
+        guard rows.count == 8,
+            rows.allSatisfy({ row in
+                row.speculativeWriteArmed && row.staged == nil && row.bf16RingStale
+                    && row.blockUndo == nil
+                    && row.retainedCount == row.window && row.window == first.window
+                    && row.kvHeads == first.kvHeads && row.quantMirror?.dtype == .uint32
+                    && row.quantMirror?.dim(3) == first.quantMirror?.dim(3)
+                    && !row.ringUndo.contains(where: { entry in
+                        entry.position == row.absoluteOffset
+                    })
+            }) else { return false }
+        let width = first.quantMirror!.dim(3)
+        let size = 2 * first.kvHeads * width
+        let slots = MLXArray(rows.map { Int32($0.absoluteOffset % $0.window) })
+        let output = saveRingSlots8(
+            rows.map { $0.quantMirror! } + [slots, fence.value],
+            template: [("WIDTH", width), ("WINDOW", first.window), ("SIZE", size)],
+            grid: (8 * size, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[8, 2, first.kvHeads, 1, width], [1]],
+            outputDTypes: [.uint32, .int32])
+        fence.value = output[1]
+        for (index, row) in rows.enumerated() {
+            row.decodeWriteFence = fence
+            row.ringUndo.append((row.absoluteOffset, nil, nil, output[0][index]))
+        }
+        CBv2EngageMark.once("mtp-undo-save-batch8")
+        return true
+    }
+
+    /// One Q4 mirror allocation and one fence for all speculative MTP columns.
+    /// The descriptor owns the contiguous parent and all ring inputs; each row
+    /// keeps only the descriptor and its row index.
+    static func prepareSpeculativeRingWriteBlock(
+        rows source: [CBv2SequenceKV], columnCount: Int,
+        fence: CBv2DecodeRingWriteFence
+    ) -> Bool {
+        guard (2...4).contains(columnCount), source.count == 8,
+            let first = source[0] as? CBv2WindowedSequenceKV,
+            let firstMirror = first.quantMirror,
+            first.speculativeWriteArmed, first.staged == nil,
+            first.bf16RingStale, first.retainedCount == first.window,
+            first.window >= columnCount,
+            first.ringUndo.isEmpty, first.blockUndo == nil,
+            first.speculativeOrigin?.offset == first.absoluteOffset,
+            first.quantEligible, firstMirror.dtype == .uint32,
+            firstMirror.ndim == 4, firstMirror.dim(0) == 2,
+            firstMirror.dim(1) == first.kvHeads,
+            firstMirror.dim(2) == first.window,
+            firstMirror.dim(3) == first.headDim / 8 + first.headDim / 64
+        else { return false }
+
+        let rows = source.compactMap { $0 as? CBv2WindowedSequenceKV }
+        let width = firstMirror.dim(3)
+        guard rows.count == 8,
+            rows.allSatisfy({ row in
+                guard let mirror = row.quantMirror else { return false }
+                return row.speculativeWriteArmed && row.staged == nil
+                    && row.bf16RingStale && row.retainedCount == row.window
+                    && row.window == first.window && row.kvHeads == first.kvHeads
+                    && row.headDim == first.headDim && row.quantEligible
+                    && row.ringUndo.isEmpty && row.blockUndo == nil
+                    && row.speculativeOrigin?.offset == row.absoluteOffset
+                    && mirror.dtype == .uint32 && mirror.ndim == 4
+                    && mirror.dim(0) == 2 && mirror.dim(1) == first.kvHeads
+                    && mirror.dim(2) == first.window && mirror.dim(3) == width
+            })
+        else { return false }
+
+        var slotValues: [Int32] = []
+        slotValues.reserveCapacity(8 * columnCount)
+        for row in rows {
+            for column in 0 ..< columnCount {
+                slotValues.append(Int32((row.absoluteOffset + column) % row.window))
+            }
+        }
+        let slots = MLXArray(slotValues, [8, columnCount])
+        let size = 2 * first.kvHeads * width
+        let output = saveRingSlots8Columns(
+            rows.map { $0.quantMirror! } + [slots, fence.value],
+            template: [
+                ("WIDTH", width), ("WINDOW", first.window),
+                ("SIZE", size), ("COLUMNS", columnCount)
+            ],
+            grid: (8 * columnCount * size, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[8, columnCount, 2, first.kvHeads, 1, width], [1]],
+            outputDTypes: [.uint32, .int32])
+        fence.value = output[1]
+        if Self.mtpUndoBatchRestoreEnabled {
+            let block = SpeculativeRingWriteBlock(
+                parent: output[0], rings: rows.map { $0.quantMirror! }, origins: slots,
+                columns: columnCount, size: size, width: width,
+                window: first.window, fence: fence)
+            for (rowIndex, row) in rows.enumerated() {
+                row.decodeWriteFence = fence
+                row.blockUndo = SpeculativeRingWriteBlockRow(
+                    block: block, rowIndex: rowIndex)
+            }
+        } else {
+            // Keep BLOCK=1/BATCH_RESTORE=0 on the legacy block saver and
+            // per-row restore path. The shared parent is retained by these
+            // row-local views until rollback clears ringUndo.
+            for (rowIndex, row) in rows.enumerated() {
+                row.decodeWriteFence = fence
+                for column in 0 ..< columnCount {
+                    row.ringUndo.append((
+                        row.absoluteOffset + column, nil, nil,
+                        output[0][rowIndex, column]))
+                }
+            }
+        }
+        CBv2EngageMark.once("mtp-undo-save-block8")
+        return true
+    }
+
+    private static let saveRingSlots8 = MLXFast.metalKernel(
+        name: "cbv2_mtp_save_ring_slots8_v1",
+        inputNames: (0..<8).map { "ring\($0)" } + ["slots", "write_fence"],
+        outputNames: ["saved", "fence"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            const uint row = i / SIZE;
+            const uint j = i % SIZE;
+            const device uint* rings[8] = {ring0, ring1, ring2, ring3, ring4, ring5, ring6, ring7};
+            saved[i] = rings[row][(j / WIDTH * WINDOW + slots[row]) * WIDTH + j % WIDTH];
+            if (i == 0) fence[0] = write_fence[0] + 1;
+            """)
+
+    private static let saveRingSlots8Columns = MLXFast.metalKernel(
+        name: "cbv2_mtp_save_ring_slots8_columns_v1",
+        inputNames: (0..<8).map { "ring\($0)" } + ["slots", "write_fence"],
+        outputNames: ["saved", "fence"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            const uint row = i / (COLUMNS * SIZE);
+            const uint rem = i % (COLUMNS * SIZE);
+            const uint column = rem / SIZE;
+            const uint j = rem % SIZE;
+            const device uint* rings[8] = {ring0, ring1, ring2, ring3, ring4, ring5, ring6, ring7};
+            saved[i] = rings[row][
+                (j / WIDTH * WINDOW + slots[row * COLUMNS + column]) * WIDTH
+                    + j % WIDTH];
+            if (i == 0) fence[0] = write_fence[0] + 1;
+            """)
+
+    private static let saveRingSlot = MLXFast.metalKernel(
+        name: "cbv2_mtp_save_ring_slot_v2",
+        inputNames: ["ring", "slot", "write_fence"], outputNames: ["saved", "fence"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            saved[i] = ring[(i / WIDTH * WINDOW + slot[0]) * WIDTH + i % WIDTH];
+            if (i == 0) fence[0] = write_fence[0] + 1;
+            """)
+
+    private static let restoreRingSlot = MLXFast.metalKernel(
+        name: "cbv2_mtp_restore_ring_slot_v2",
+        inputNames: ["ring", "saved", "slot", "write_fence"], outputNames: ["fence"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            device T* destination = const_cast<device T*>(ring);
+            destination[(i / WIDTH * WINDOW + slot[0]) * WIDTH + i % WIDTH] = saved[i];
+            if (i == 0) fence[0] = write_fence[0] + 1;
+            """, ensureRowContiguous: false)
+
+    private static let restoreRingSlots8Columns = MLXFast.metalKernel(
+        name: "cbv2_mtp_restore_ring_slots8_columns_v1",
+        inputNames: (0..<8).map { "ring\($0)" }
+            + ["saved", "origins", "rejected", "write_fence"],
+        outputNames: ["fence"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            const uint row = i / (COLUMNS * SIZE);
+            const uint rem = i % (COLUMNS * SIZE);
+            const uint column = rem / SIZE;
+            const uint slotWord = rem % SIZE;
+            const device uint* rings[8] = {ring0, ring1, ring2, ring3,
+                                            ring4, ring5, ring6, ring7};
+            if (column >= COLUMNS - uint(rejected[row])) {
+                device uint* destination = const_cast<device uint*>(rings[row]);
+                const uint slot = uint(origins[row * COLUMNS + column]);
+                destination[(slotWord / WIDTH * WINDOW + slot) * WIDTH
+                            + slotWord % WIDTH] =
+                    saved[(row * COLUMNS + column) * SIZE + slotWord];
+            }
+            if (i == 0) fence[0] = write_fence[0] + 1;
+            """, ensureRowContiguous: false)
+
+    /// Finalize saved Q4 block writes after all row outcomes are known. The
+    /// caller has already committed host state; this method only submits the
+    /// device restore and fences it before releasing the saved parent.
+    @discardableResult
+    public static func finalizeSpeculativeRingWriteBlocks(
+        rows source: [CBv2SequenceKV]
+    ) -> Bool {
+        var blocks: [ObjectIdentifier: SpeculativeRingWriteBlock] = [:]
+        var ordered: [SpeculativeRingWriteBlock] = []
+        var blockRows: [(CBv2WindowedSequenceKV, SpeculativeRingWriteBlock)] = []
+        for sourceRow in source {
+            guard let row = sourceRow as? CBv2WindowedSequenceKV,
+                let undo = row.blockUndo
+            else { continue }
+            let identity = ObjectIdentifier(undo.block)
+            if blocks[identity] == nil {
+                blocks[identity] = undo.block
+                ordered.append(undo.block)
+            }
+            blockRows.append((row, undo.block))
+        }
+        guard !ordered.isEmpty else { return false }
+
+        var fences: [MLXArray] = []
+        for block in ordered {
+            guard block.rejectedCounts.contains(where: { $0 > 0 }) else { continue }
+            let rejected = MLXArray(block.rejectedCounts.map { Int32($0) }, [8])
+            let output = restoreRingSlots8Columns(
+                block.rings + [block.parent, block.origins, rejected, block.fence.value],
+                template: [
+                    ("COLUMNS", block.columns), ("SIZE", block.size),
+                    ("WIDTH", block.width), ("WINDOW", block.window),
+                ],
+                grid: (8 * block.columns * block.size, 1, 1),
+                threadGroup: (256, 1, 1),
+                outputShapes: [[1]], outputDTypes: [.int32])[0]
+            block.fence.value = output
+            fences.append(output)
+        }
+        if !fences.isEmpty {
+            CBv2EngageMark.once("mtp-undo-restore-block8")
+            asyncEval(fences)
+        }
+        for (row, block) in blockRows {
+            if let current = row.blockUndo, current.block === block {
+                row.blockUndo = nil
+            }
+        }
+        return true
     }
 
     /// One update in the active transaction: return EXACTLY the views the
@@ -392,7 +726,16 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     private func stageSpeculativeUpdate(
         newKeys: MLXArray, newValues: MLXArray, count n: Int
     ) -> (MLXArray, MLXArray) {
-        let logical = snapshot()
+        // The preceding staged update already assembled the visible suffix.
+        // Reuse it instead of reconstructing the ring plus all staged tokens.
+        // Rollback clears this view, so that case still takes snapshot().
+        let logical: (keys: MLXArray, values: MLXArray)
+        if staged != nil, let previous = borrowableChunkViews {
+            logical = previous
+        } else {
+            let current = snapshot()
+            logical = (current.keys, current.values)
+        }
         let historyCount = min(logical.keys.dim(2), window - 1)
         let historyFrom = logical.keys.dim(2) - historyCount
         var kParts: [MLXArray] = []
@@ -427,6 +770,8 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
 
     public func commitSpeculativeWrite() {
         speculativeWriteArmed = false
+        speculativeOrigin = nil
+        ringUndo.removeAll(keepingCapacity: true)
         guard let staged else { return }
         self.staged = nil
         // Confirmed range after finalize-time rollback: [basePosition,
@@ -507,6 +852,39 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         )
     }
 
+    /// The assistant may borrow the authoritative Q4 history after decode
+    /// stopped maintaining BF16. Target attention still reads Q4 directly.
+    public func mtpSnapshot() -> (keys: MLXArray, values: MLXArray, offset: Int) {
+        guard bf16RingStale else { return snapshot() }
+        precondition(staged == nil && quantMirror != nil && decodeWriteFence != nil)
+        let fence = decodeWriteFence!
+        let decoded = Self.unpackMTPRing(
+            [quantMirror!, fence.value],
+            template: [("D", headDim)],
+            grid: (2 * kvHeads * window * headDim, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[2, kvHeads, window, headDim]], outputDTypes: [.bfloat16])[0]
+        // Materialize the pre-round history before any subsequent live write.
+        fence.value = fence.value + decoded[0, 0, 0, 0].asType(.int32) * 0
+        return (
+            temporalOrder(decoded[0..<1], from: oldestValidPosition, to: absoluteOffset),
+            temporalOrder(decoded[1..<2], from: oldestValidPosition, to: absoluteOffset),
+            absoluteOffset)
+    }
+
+    private static let unpackMTPRing = MLXFast.metalKernel(
+        name: "cbv2_mtp_unpack_q4g64_ring_v1",
+        inputNames: ["ring", "write_fence"], outputNames: ["decoded"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            const uint element = i % D;
+            const uint row = i / D * (D / 8 + D / 64);
+            const uint pair = ring[row + D / 8 + element / 64];
+            const float scale = float(as_type<half>(ushort(pair & 0xffffu)));
+            const float bias = float(as_type<half>(ushort(pair >> 16)));
+            const uint q = (ring[row + element / 8] >> (4 * (element % 8))) & 15u;
+            decoded[i] = bfloat16_t(float(q) * scale + bias);
+            """)
+
     /// Value-exact snapshot while a speculative update is staged: the ring
     /// holds `[oldestValidPosition, basePosition)` and the staged tensors
     /// hold the confirmed tail `[basePosition, absoluteOffset)` (rollback
@@ -573,6 +951,45 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
                 "CBv2WindowedSequenceKV.rollback(\(n)) exceeds staged range "
                     + "\(absoluteOffset - staged.basePosition)")
             absoluteOffset -= n
+            borrowableChunkViews = nil
+            return
+        }
+        if let blockUndo {
+            let basePosition = speculativeOrigin?.offset ?? absoluteOffset
+            precondition(
+                n <= absoluteOffset - basePosition,
+                "CBv2WindowedSequenceKV.rollback exceeds speculative block writes")
+            let restoredOffset = absoluteOffset - n
+            blockUndo.block.recordRejected(rowIndex: blockUndo.rowIndex, count: n)
+            absoluteOffset = restoredOffset
+            oldestValidPosition = max(
+                speculativeOrigin?.oldest ?? oldestValidPosition,
+                restoredOffset - window)
+            borrowableChunkViews = nil
+            return
+        }
+        if let origin = speculativeOrigin, !ringUndo.isEmpty {
+            precondition(n <= absoluteOffset - origin.offset,
+                "CBv2WindowedSequenceKV.rollback exceeds speculative ring writes")
+            let restoredOffset = absoluteOffset - n
+            let fence = decodeWriteFence!
+            func restore(_ ring: MLXArray?, _ saved: MLXArray?, at position: Int) {
+                guard let ring, let saved else { return }
+                fence.value = Self.restoreRingSlot(
+                    [ring, saved, MLXArray([Int32(position % window)]), fence.value],
+                    template: [("T", ring.dtype), ("WIDTH", ring.dim(3)),
+                        ("WINDOW", window)],
+                    grid: (saved.size, 1, 1), threadGroup: (256, 1, 1),
+                    outputShapes: [[1]], outputDTypes: [.int32])[0]
+            }
+            while let undo = ringUndo.last, undo.position >= restoredOffset {
+                restore(keys, undo.keys, at: undo.position)
+                restore(values, undo.values, at: undo.position)
+                restore(quantMirror, undo.mirror, at: undo.position)
+                ringUndo.removeLast()
+            }
+            absoluteOffset = restoredOffset
+            oldestValidPosition = max(origin.oldest, restoredOffset - window)
             borrowableChunkViews = nil
             return
         }

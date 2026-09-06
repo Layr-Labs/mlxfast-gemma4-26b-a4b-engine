@@ -9,6 +9,29 @@ import MLXLMCommon
 import MLXNN
 import MLXRandom
 
+private let gemma4MTPDraftArgmaxEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_MTP_DRAFT_ARGMAX"]
+    else { return true }
+    switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+    case "0", "false", "no", "off": return false
+    default: return true
+    }
+}()
+
+private let gemma4MTPDraftArgmaxVerify: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_MTP_DRAFT_ARGMAX_VERIFY"]
+    else { return false }
+    switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+    case "0", "false", "no", "off": return false
+    default: return true
+    }
+}()
+
+@_silgen_name("mlxfast_gemma4_mtp_nax_header_v1")
+private func mlxfastGemma4MTPNAXHeaderV1() -> UnsafePointer<CChar>
+
 // MARK: - Errors
 
 /// Errors thrown by the Gemma 4 MTP drafter pipeline.
@@ -1065,6 +1088,28 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
             masks: masks)
     }
 
+    /// Greedy drafter step that returns the post-projection hidden and the
+    /// next token without materializing the tied head's full logits plane.
+    /// Returns nil before running the assistant trunk when the bounded
+    /// quantized-tied-head geometry is not admitted.
+    public func greedyArgmax(
+        inputsEmbeds: MLXArray,
+        sharedKV: Gemma4SharedKV,
+        positionOffset: Gemma4.PositionOffset
+    ) -> (lastHidden: MLXArray, tokens: MLXArray)? {
+        guard admitsGreedyArgmax(inputsEmbeds: inputsEmbeds) else { return nil }
+        let masks = makeMasks(
+            queryLen: inputsEmbeds.dim(1),
+            sharedKV: sharedKV,
+            positionOffset: positionOffset,
+            dtype: inputsEmbeds.dtype)
+        return greedyArgmax(
+            inputsEmbeds: inputsEmbeds,
+            sharedKV: sharedKV,
+            positionOffset: positionOffset,
+            masks: masks)
+    }
+
     internal func callAsFunction(
         inputsEmbeds: MLXArray,
         sharedKV: Gemma4SharedKV,
@@ -1074,6 +1119,21 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         let h = preProjection(inputsEmbeds)
         return forwardProjected(
             h,
+            sharedKV: sharedKV,
+            positionOffset: positionOffset,
+            masks: masks)
+    }
+
+    internal func greedyArgmax(
+        inputsEmbeds: MLXArray,
+        sharedKV: Gemma4SharedKV,
+        positionOffset: Gemma4.PositionOffset,
+        masks: Gemma4DrafterMasks
+    ) -> (lastHidden: MLXArray, tokens: MLXArray)? {
+        guard admitsGreedyArgmax(inputsEmbeds: inputsEmbeds) else { return nil }
+        let projected = preProjection(inputsEmbeds)
+        return greedyArgmaxProjected(
+            projected,
             sharedKV: sharedKV,
             positionOffset: positionOffset,
             masks: masks)
@@ -1110,6 +1170,20 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         positionOffset: Gemma4.PositionOffset,
         masks: Gemma4DrafterMasks
     ) -> (lastHidden: MLXArray, logits: MLXArray) {
+        let (hidden, lastHidden) = forwardProjectedHidden(
+            projected,
+            sharedKV: sharedKV,
+            positionOffset: positionOffset,
+            masks: masks)
+        return (lastHidden, applyLMHead(hidden))
+    }
+
+    private func forwardProjectedHidden(
+        _ projected: MLXArray,
+        sharedKV: Gemma4SharedKV,
+        positionOffset: Gemma4.PositionOffset,
+        masks: Gemma4DrafterMasks
+    ) -> (hidden: MLXArray, lastHidden: MLXArray) {
         let textCfg = config.textConfig
         var h = projected
         // Run each drafter layer with the appropriate shared-KV + mask.
@@ -1143,8 +1217,73 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
 
         h = model.norm(h)
         let lastHidden = postProjection(h)
-        let logits = applyLMHead(h)
-        return (lastHidden, logits)
+        return (h, lastHidden)
+    }
+
+    private func admitsGreedyArgmax(inputsEmbeds: MLXArray) -> Bool {
+        guard gemma4MTPDraftArgmaxEnabled,
+            !config.useOrderedEmbeddings,
+            config.backboneHiddenSize == 2816,
+            config.textConfig.tieWordEmbeddings,
+            config.textConfig.hiddenSize == 1024,
+            config.textConfig.vocabSize == 262144,
+            lmHead == nil,
+            maskedEmbedder == nil,
+            inputsEmbeds.shape == [8, 1, 2 * config.backboneHiddenSize],
+            inputsEmbeds.dtype == .bfloat16,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine
+        else { return false }
+
+        return Gemma4MMAQuantizedGEMV.admitsArgmax(
+            x: [8, 1, config.textConfig.hiddenSize],
+            xDType: .bfloat16,
+            w: quantized.weight,
+            scales: quantized.scales,
+            biases: quantized.biases,
+            groupSize: quantized.groupSize,
+            bits: quantized.bits)
+    }
+
+    private func greedyArgmaxProjected(
+        _ projected: MLXArray,
+        sharedKV: Gemma4SharedKV,
+        positionOffset: Gemma4.PositionOffset,
+        masks: Gemma4DrafterMasks
+    ) -> (lastHidden: MLXArray, tokens: MLXArray) {
+        let (hidden, lastHidden) = forwardProjectedHidden(
+            projected,
+            sharedKV: sharedKV,
+            positionOffset: positionOffset,
+            masks: masks)
+        let stockArgmax = {
+            self.applyLMHead(hidden)
+                .squeezed(axis: 1)
+                .argMax(axis: -1)
+                .asType(.int32)
+        }
+        guard let quantized = model.embedTokens as? QuantizedEmbedding else {
+            return (lastHidden, stockArgmax())
+        }
+        guard let tokens = Gemma4MMAQuantizedGEMV.applyArgmax(
+                x: hidden,
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits)
+        else {
+            return (lastHidden, stockArgmax())
+        }
+
+        if gemma4MTPDraftArgmaxVerify {
+            let stock = stockArgmax()
+            precondition(
+                sum(notEqual(tokens, stock)).item(Int.self) == 0,
+                "MTP draft fused head differs from full-logit argmax")
+        }
+        CBv2EngageMark.once("mtp-draft-logitsless-head")
+        return (lastHidden, tokens)
     }
 
     /// Dispatch the LM head: masked-centroid if `useOrderedEmbeddings`,
@@ -1282,6 +1421,7 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         let params = ModuleParameters.unflattened(sanitized)
         try drafter.update(parameters: params, verify: [.all])
         eval(drafter)
+        Gemma4AssistantNAXV1.installIfEligible(in: drafter)
 
         return drafter
     }
@@ -1314,6 +1454,192 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
             progressHandler: progressHandler
         )
         return try await load(from: directory)
+    }
+}
+
+// MARK: - Assistant gate/up NAX experiment
+
+/// Assistant-only NAX experiment. The switch is exact and default-off. The
+/// hardware check runs before the first MLXFast kernel is constructed.
+private enum Gemma4AssistantNAXV1 {
+    private static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MTP_NAX_GATE_UP"]
+        else { return false }
+        return raw == "1"
+    }()
+
+    fileprivate static let batch = 8
+    fileprivate static let inputK = 1024
+    fileprivate static let outputN = 8192
+    fileprivate static let groupSize = 64
+    fileprivate static let bits = 4
+    fileprivate static let packedK = inputK * bits / 32
+    fileprivate static let groups = inputK / groupSize
+
+    private static let kernelSource = """
+        const uint3 tid = threadgroup_position_in_grid;
+        threadgroup T Ws[1280];
+        qmm_t_nax_tgp_impl<T, 64, 4, true, 16, 32, 32, 1, 1>(
+            w, scales, biases, x, y, Ws, K, N, M, tid, 0,
+            simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+        """
+
+    private static func isHardwareEligible() -> Bool {
+        let architecture = MLX.GPU.deviceInfo().architecture.lowercased()
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        let supportedArchitecture = architecture == "g17s"
+            || architecture == "applegpu_g17s"
+        let supportedOS = os.majorVersion > 26
+            || (os.majorVersion == 26 && os.minorVersion >= 2)
+        return supportedArchitecture && supportedOS
+    }
+
+    fileprivate static func makeKernel() -> MLXFast.MLXFastKernel {
+        let header = String(cString: mlxfastGemma4MTPNAXHeaderV1())
+        return MLXFast.metalKernel(
+            name: "gemma4_mtp_assistant_nax_gate_up_b8_v1",
+            inputNames: ["x", "w", "scales", "biases", "K", "N", "M"],
+            outputNames: ["y"],
+            source: kernelSource,
+            header: header,
+            ensureRowContiguous: true)
+    }
+
+    private static func gateUpModules(
+        in model: Gemma4TextModelInner
+    ) -> [(path: String, module: QuantizedLinear)] {
+        model.namedModules().compactMap { path, module in
+            let components = path.split(separator: ".")
+            guard components.count == 4,
+                components[0] == "layers",
+                let layerIndex = Int(components[1]),
+                layerIndex >= 0,
+                layerIndex < 4,
+                components[2] == "mlp",
+                components[3] == "gate_proj" || components[3] == "up_proj",
+                let quantized = module as? QuantizedLinear
+            else { return nil }
+            return (path: path, module: quantized)
+        }.sorted { $0.path < $1.path }
+    }
+
+    private static func supportsNAX(_ module: QuantizedLinear) -> Bool {
+        guard module.mode == .affine,
+            module.groupSize == groupSize,
+            module.bits == bits,
+            module.shape.0 == outputN,
+            module.shape.1 == inputK,
+            module.weight.dtype == .uint32,
+            module.weight.shape == [outputN, packedK],
+            module.scales.dtype == .bfloat16,
+            module.scales.shape == [outputN, groups],
+            let biases = module.biases,
+            biases.dtype == .bfloat16,
+            biases.shape == [outputN, groups]
+        else { return false }
+        return true
+    }
+
+    static func installIfEligible(in drafter: Gemma4AssistantDraftModel) {
+        guard enabled else {
+            CBv2EngageMark.once("mtp-nax-gate-up-disabled")
+            return
+        }
+        guard isHardwareEligible() else {
+            CBv2EngageMark.once("mtp-nax-gate-up-hardware-skip")
+            return
+        }
+        guard drafter.config.textConfig.numHiddenLayers == 4 else {
+            CBv2EngageMark.once("mtp-nax-gate-up-geometry-skip")
+            return
+        }
+
+        let modules = gateUpModules(in: drafter.model)
+        guard modules.count == 8, modules.allSatisfy({ supportsNAX($0.module) }) else {
+            CBv2EngageMark.once("mtp-nax-gate-up-geometry-skip")
+            return
+        }
+
+        let kernel = Gemma4AssistantNAXV1Kernel()
+        let updates = modules.map { path, module in
+            (path, Gemma4AssistantNAXQuantizedLinear(base: module, kernel: kernel))
+        }
+        drafter.model.update(modules: ModuleChildren.unflattened(updates))
+        CBv2EngageMark.once("mtp-nax-gate-up-install")
+    }
+}
+
+private final class Gemma4AssistantNAXV1Kernel {
+    private let kernel: MLXFast.MLXFastKernel
+    private let k = MLXArray(Gemma4AssistantNAXV1.inputK)
+    private let n = MLXArray(Gemma4AssistantNAXV1.outputN)
+    private let m = MLXArray(Gemma4AssistantNAXV1.batch)
+
+    init() {
+        kernel = Gemma4AssistantNAXV1.makeKernel()
+    }
+
+    func apply(
+        x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray
+    ) -> MLXArray {
+        let rank3 = x.shape == [Gemma4AssistantNAXV1.batch, 1, Gemma4AssistantNAXV1.inputK]
+        let flat = rank3
+            ? x.reshaped([Gemma4AssistantNAXV1.batch, Gemma4AssistantNAXV1.inputK])
+            : x
+        let output = kernel(
+            [flat, weight, scales, biases, k, n, m],
+            template: [("T", flat.dtype)],
+            grid: (Gemma4AssistantNAXV1.outputN, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[Gemma4AssistantNAXV1.batch, Gemma4AssistantNAXV1.outputN]],
+            outputDTypes: [flat.dtype])[0]
+        return rank3
+            ? output.reshaped([
+                Gemma4AssistantNAXV1.batch, 1, Gemma4AssistantNAXV1.outputN])
+            : output
+    }
+}
+
+private enum Gemma4AssistantNAXInvocationMarkV1 {
+    private static let emitted: Void = {
+        FileHandle.standardError.write(Data("[engage] mtp-nax-gate-up-kernel-v1\n".utf8))
+    }()
+
+    static func emit() {
+        _ = emitted
+    }
+}
+
+private final class Gemma4AssistantNAXQuantizedLinear: QuantizedLinear {
+    private let kernel: Gemma4AssistantNAXV1Kernel
+
+    init(base: QuantizedLinear, kernel: Gemma4AssistantNAXV1Kernel) {
+        self.kernel = kernel
+        super.init(
+            weight: base.weight,
+            bias: base.bias,
+            scales: base.scales,
+            biases: base.biases,
+            groupSize: base.groupSize,
+            bits: base.bits,
+            mode: base.mode)
+    }
+
+    override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        guard x.dtype == .bfloat16,
+            x.shape == [Gemma4AssistantNAXV1.batch, Gemma4AssistantNAXV1.inputK]
+                || x.shape == [Gemma4AssistantNAXV1.batch, 1, Gemma4AssistantNAXV1.inputK]
+        else { return super.callAsFunction(x) }
+
+        Gemma4AssistantNAXInvocationMarkV1.emit()
+        CBv2EngageMark.once("mtp-nax-gate-up-dispatch")
+        var output = kernel.apply(
+            x: x, weight: weight, scales: scales, biases: biases!)
+        if let bias {
+            output = output + bias
+        }
+        return output
     }
 }
 

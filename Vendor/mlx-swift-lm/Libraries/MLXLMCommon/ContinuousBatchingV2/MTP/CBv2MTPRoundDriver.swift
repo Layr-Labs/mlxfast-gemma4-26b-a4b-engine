@@ -217,14 +217,13 @@ final class CBv2MTPRoundDriver {
         self.drafter = drafter
         self.model = model
         self.captureLayers = captureLayers
-        // The adaptive controller's CEILING: the trusted envelope cap
-        // (`config.maxDraftTokens`), further bounded by the participant's
-        // `submissionDraftDepth`. `fixedDepth` stays `config.fixedDraftTokens`
-        // (adaptive) — submissionDraftDepth is a ceiling, NEVER a fixed pin, so
-        // the controller keeps choosing 0…this per round.
+        // When `config.fixedDraftTokens` is absent, use the effective draft
+        // ceiling as a fixed depth. An explicit value selects its fixed depth;
+        // `submissionDraftDepth` bounds the ceiling passed to the controller.
         self.depthController = CBv2MTPDepthController(
             maxDepth: Self.effectiveDraftCeiling(envelopeMax: config.maxDraftTokens),
-            fixedDepth: config.fixedDraftTokens)
+            fixedDepth: config.fixedDraftTokens
+                ?? Self.effectiveDraftCeiling(envelopeMax: config.maxDraftTokens))
         self.metrics.verificationMode = config.verificationMode
         self.metrics.maxAutomaticRectangularTokens = config.maxAutomaticRectangularTokens
     }

@@ -1,3 +1,5 @@
+#include <string>
+
 namespace mlx::core::metal {
 
 const char* quantized_nax() {
@@ -1996,6 +1998,16 @@ template <
 
 ///////////////////////////////////////////////////////////////////////////////
 )preamble";
+}
+
+// Keep this bridge beside the generated source so the host receives the same
+// definitions as the generated kernel. Preserve it when the source is
+// regenerated; the Swift and external probe clients use this versioned ABI.
+const char* gemm_nax();
+
+extern "C" const char* mlxfast_gemma4_mtp_nax_header_v1() {
+  static const std::string s = std::string(gemm_nax()) + quantized_nax();
+  return s.c_str();
 }
 
 } // namespace mlx::core::metal

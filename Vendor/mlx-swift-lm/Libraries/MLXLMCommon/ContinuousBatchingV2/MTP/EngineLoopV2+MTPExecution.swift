@@ -241,7 +241,8 @@ extension EngineLoopV2 {
                 "CBv2 MTP: verify row anchor \(fullRow.absoluteOffset) != carry \(carry.kvOffset)"
             )
             let fullSnapshot = fullRow.snapshot()
-            let slidingSnapshot = slidingRow.snapshot()
+            let slidingSnapshot = (slidingRow as? CBv2WindowedSequenceKV)?.mtpSnapshot()
+                ?? slidingRow.snapshot()
             captures.append(
                 CBv2MTPRowCapture(
                     fullKeys: fullSnapshot.keys,

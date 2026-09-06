@@ -3525,6 +3525,382 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
+    /// Explicit opt-in for the shared MTP verification head. The default stays
+    /// off until the whole-worker checks promote it.
+    private static let sharedHeadEnabled: Bool = {
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_MTP_SHARED_HEAD"]?.trimmingCharacters(
+            in: .whitespaces) == "1"
+    }()
+
+    /// Shared verification-head body. C2 owns two output tiles per SIMD group;
+    /// C3 and C4 own one. The source is the checked external probe body and
+    /// keeps the carry, FMA, bias, BF16 conversion, and first-index tie order.
+    private static func sharedArgmaxSource(_ columns: Int) -> String {
+        precondition((2...4).contains(columns))
+        let tiles = 4 / columns
+        var source = """
+            constexpr uint M_ROWS = 8;
+            constexpr uint GROUP = 64;
+            constexpr uint N_SG = 4;
+            constexpr uint N_PSG = 8;
+            constexpr uint N_GROUPS = K / GROUP;
+            constexpr uint G_ROW = N_GROUPS;
+            constexpr uint TILES = \(tiles);
+            constexpr uint NT = N / (N_SG * N_PSG * TILES);
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint lane = thread_index_in_simdgroup;
+            const uint tg = threadgroup_position_in_grid.x;
+            const uint sgN0 = (tg * N_SG + sg) * (TILES * N_PSG);
+            const uint fragmentRow =
+                ((lane & 6u) >> 1u) + ((lane & 16u) >> 2u);
+            const uint fragmentCol =
+                ((lane & 1u) << 1u) + ((lane & 8u) >> 1u);
+
+            """
+
+        for tile in 0..<tiles {
+            source += """
+                const uint n\(tile) = sgN0 + \(tile * 8) + fragmentRow;
+                const uint wbase\(tile) =
+                    (sgN0 / 32u) * (N_GROUPS * 256u) + lane * 8u
+                    + (((sgN0 % 32u) / 8u) + \(tile)) * 2u;
+                const device T* srow\(tile) = scales + n\(tile) * G_ROW;
+                const device T* brow\(tile) = biases + n\(tile) * G_ROW;
+                uint2 carryQ\(tile) = *((const device uint2*)(w + wbase\(tile)));
+                T carryS\(tile) = srow\(tile)[0];
+
+                """
+            for column in 0..<columns {
+                source += "            simdgroup_matrix<float, 8, 8> acc\(column)_\(tile) = simdgroup_matrix<float, 8, 8>(0.0f);\n"
+            }
+        }
+
+        source += """
+            #pragma unroll
+            for (uint biasBlock = 0; biasBlock < N_GROUPS; biasBlock += 8) {
+                #pragma unroll
+                for (uint gg = 0; gg < 8; ++gg) {
+                    const uint g = biasBlock + gg;
+                    if (g >= N_GROUPS) continue;
+                    const uint gNext = min(g + 1u, N_GROUPS - 1u);
+
+            """
+        for tile in 0..<tiles {
+            source += """
+                    const uint2 packedQ\(tile) = carryQ\(tile);
+                    const float rowScale\(tile) = float(carryS\(tile));
+                    carryQ\(tile) = *((const device uint2*)(w + wbase\(tile) + gNext * 256u));
+                    carryS\(tile) = srow\(tile)[gNext];
+
+                    """
+            for column in 0..<columns {
+                source += "                simdgroup_matrix<float, 8, 8> ag\(column)_\(tile) = simdgroup_matrix<float, 8, 8>(0.0f);\n"
+            }
+        }
+
+        source += """
+                    #pragma clang loop unroll(full)
+                    for (uint t = 0; t < 8; ++t) {
+                        const uint shift = 8u * (t & 3u);
+            """
+        for tile in 0..<tiles {
+            source += """
+                        const uint packed\(tile) =
+                            t < 4 ? packedQ\(tile).x : packedQ\(tile).y;
+                        simdgroup_matrix<float, 8, 8> A\(tile);
+                        A\(tile).thread_elements()[0] =
+                            float((packed\(tile) >> shift) & 0xFu);
+                        A\(tile).thread_elements()[1] =
+                            float((packed\(tile) >> (shift + 4u)) & 0xFu);
+
+                        """
+        }
+        source += "                    const uint activationK = g * GROUP + t * 8 + fragmentRow;\n"
+        for column in 0..<columns {
+            source += """
+                        simdgroup_matrix<float, 8, 8> B\(column);
+                        B\(column).thread_elements()[0] =
+                            float(x\(column)[fragmentCol * K + activationK]);
+                        B\(column).thread_elements()[1] =
+                            float(x\(column)[(fragmentCol + 1) * K + activationK]);
+
+                        """
+            for tile in 0..<tiles {
+                source += "                        simdgroup_multiply_accumulate(ag\(column)_\(tile), A\(tile), B\(column), ag\(column)_\(tile));\n"
+            }
+        }
+        source += "                    }\n"
+        for tile in 0..<tiles {
+            for column in 0..<columns {
+                source += """
+                    acc\(column)_\(tile).thread_elements()[0] = metal::fma(
+                        rowScale\(tile), ag\(column)_\(tile).thread_elements()[0],
+                        acc\(column)_\(tile).thread_elements()[0]);
+                    acc\(column)_\(tile).thread_elements()[1] = metal::fma(
+                        rowScale\(tile), ag\(column)_\(tile).thread_elements()[1],
+                        acc\(column)_\(tile).thread_elements()[1]);
+                    """
+            }
+        }
+        source += """
+                }
+                const uint biasCol0 = biasBlock + fragmentCol;
+                const uint biasCol1 = biasCol0 + 1;
+                const uint biasRow = biasBlock + fragmentRow;
+            """
+        for tile in 0..<tiles {
+            source += """
+                const device T* fragmentBRow\(tile) = brow\(tile);
+                simdgroup_matrix<float, 8, 8> BB\(tile);
+                """
+        }
+        for column in 0..<columns {
+            source += """
+                simdgroup_matrix<float, 8, 8> XB\(column);
+                XB\(column).thread_elements()[0] = biasRow < N_GROUPS
+                    ? sums\(column)[fragmentCol * N_GROUPS + biasRow] : 0.0f;
+                XB\(column).thread_elements()[1] = biasRow < N_GROUPS
+                    ? sums\(column)[(fragmentCol + 1) * N_GROUPS + biasRow] : 0.0f;
+
+                """
+        }
+        for tile in 0..<tiles {
+            source += """
+                BB\(tile).thread_elements()[0] = biasCol0 < N_GROUPS
+                    ? float(fragmentBRow\(tile)[biasCol0]) : 0.0f;
+                BB\(tile).thread_elements()[1] = biasCol1 < N_GROUPS
+                    ? float(fragmentBRow\(tile)[biasCol1]) : 0.0f;
+                """
+        }
+        for column in 0..<columns {
+            for tile in 0..<tiles {
+                source += "                simdgroup_multiply_accumulate(acc\(column)_\(tile), BB\(tile), XB\(column), acc\(column)_\(tile));\n"
+            }
+        }
+        source += "            }\n"
+
+        for column in 0..<columns {
+            source += "        threadgroup float bestVal\(column)[N_SG * M_ROWS];\n"
+            source += "        threadgroup uint bestIdx\(column)[N_SG * M_ROWS];\n"
+        }
+        for column in 0..<columns {
+            source += """
+        float va\(column) = float(T(acc\(column)_0.thread_elements()[0]));
+        float vb\(column) = float(T(acc\(column)_0.thread_elements()[1]));
+        uint ia\(column) = sgN0 + fragmentRow;
+        uint ib\(column) = sgN0 + fragmentRow;
+        """
+            for tile in 1..<tiles {
+                source += """
+        const float oa\(column)_\(tile) =
+            float(T(acc\(column)_\(tile).thread_elements()[0]));
+        const float ob\(column)_\(tile) =
+            float(T(acc\(column)_\(tile).thread_elements()[1]));
+        const uint oi\(column)_\(tile) = sgN0 + \(tile * 8) + fragmentRow;
+        if (oa\(column)_\(tile) > va\(column)
+            || (oa\(column)_\(tile) == va\(column) && oi\(column)_\(tile) < ia\(column))) {
+            va\(column) = oa\(column)_\(tile);
+            ia\(column) = oi\(column)_\(tile);
+        }
+        if (ob\(column)_\(tile) > vb\(column)
+            || (ob\(column)_\(tile) == vb\(column) && oi\(column)_\(tile) < ib\(column))) {
+            vb\(column) = ob\(column)_\(tile);
+            ib\(column) = oi\(column)_\(tile);
+        }
+        """
+            }
+            source += """
+        for (uint s = 0; s < 3; ++s) {
+            const ushort xm = s == 0 ? 2 : (s == 1 ? 4 : 16);
+            const float oa = simd_shuffle_xor(va\(column), xm);
+            const uint oia = simd_shuffle_xor(ia\(column), xm);
+            if (oa > va\(column) || (oa == va\(column) && oia < ia\(column))) {
+                va\(column) = oa;
+                ia\(column) = oia;
+            }
+            const float ob = simd_shuffle_xor(vb\(column), xm);
+            const uint oib = simd_shuffle_xor(ib\(column), xm);
+            if (ob > vb\(column) || (ob == vb\(column) && oib < ib\(column))) {
+                vb\(column) = ob;
+                ib\(column) = oib;
+            }
+        }
+        if ((lane & 22u) == 0u) {
+            bestVal\(column)[sg * M_ROWS + fragmentCol] = va\(column);
+            bestIdx\(column)[sg * M_ROWS + fragmentCol] = ia\(column);
+            bestVal\(column)[sg * M_ROWS + fragmentCol + 1] = vb\(column);
+            bestIdx\(column)[sg * M_ROWS + fragmentCol + 1] = ib\(column);
+        }
+        """
+        }
+        source += "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        for column in 0..<columns {
+            source += """
+        if (lid < M_ROWS) {
+            float rv\(column) = bestVal\(column)[lid];
+            uint ri\(column) = bestIdx\(column)[lid];
+            for (uint s = 1; s < N_SG; ++s) {
+                const float ov = bestVal\(column)[s * M_ROWS + lid];
+                const uint oi = bestIdx\(column)[s * M_ROWS + lid];
+                if (ov > rv\(column)
+                    || (ov == rv\(column) && oi < ri\(column))) {
+                    rv\(column) = ov;
+                    ri\(column) = oi;
+                }
+            }
+            pv\(column)[lid * NT + tg] = rv\(column);
+            pi\(column)[lid * NT + tg] = ri\(column);
+        }
+        """
+        }
+        return source
+    }
+
+    private static func makeSharedArgmaxKernel(_ columns: Int) -> MLXFast.MLXFastKernel {
+        let inputNames = (0..<columns).map { "x\($0)" }
+            + (0..<columns).map { "sums\($0)" }
+            + ["w", "scales", "biases"]
+        let outputNames = (0..<columns).flatMap { ["pv\($0)", "pi\($0)"] }
+        return MLXFast.metalKernel(
+            name: "gemma4_mma_shared_head_argmax_c\(columns)_v1",
+            inputNames: inputNames,
+            outputNames: outputNames,
+            source: sharedArgmaxSource(columns),
+            header: "#include <metal_simdgroup_matrix>\n",
+            ensureRowContiguous: true)
+    }
+
+    private static let sharedArgmaxKernels: [Int: MLXFast.MLXFastKernel] =
+        Dictionary(uniqueKeysWithValues: (2...4).map {
+            ($0, makeSharedArgmaxKernel($0))
+        })
+
+    private static let sharedArgmaxReduceKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_shared_head_argmax_reduce_v1",
+        inputNames: ["pv", "pi"],
+        outputNames: ["tokens"],
+        source: """
+            const uint m = threadgroup_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const device float* values = pv + m * uint(NT);
+            const device uint* indices = pi + m * uint(NT);
+            float bestValue = -INFINITY;
+            uint bestIndex = 0xFFFFFFFFu;
+            for (uint i = lane; i < uint(NT); i += 32) {
+                const float value = values[i];
+                const uint index = indices[i];
+                if (value > bestValue
+                    || (value == bestValue && index < bestIndex)) {
+                    bestValue = value;
+                    bestIndex = index;
+                }
+            }
+            for (ushort xm = 1; xm < 32; xm <<= 1) {
+                const float otherValue = simd_shuffle_xor(bestValue, xm);
+                const uint otherIndex = simd_shuffle_xor(bestIndex, xm);
+                if (otherValue > bestValue
+                    || (otherValue == bestValue && otherIndex < bestIndex)) {
+                    bestValue = otherValue;
+                    bestIndex = otherIndex;
+                }
+            }
+            if (lane == 0) tokens[m] = int32_t(bestIndex);
+            """,
+        ensureRowContiguous: true)
+
+    /// Shared tied-head top-1 for C2/C3/C4 MTP verification columns.
+    /// Returns `[8, C]` int32 ids or nil when any required production control
+    /// or input invariant is not active.
+    public static func applyArgmaxColumns(
+        x: [MLXArray],
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        activationSums: [ActivationSums?]
+    ) -> MLXArray? {
+        guard sharedHeadEnabled,
+            (2...4).contains(x.count),
+            activationSums.count == x.count,
+            carryEnabled,
+            logitslessCarryEnabled,
+            relayoutKernels != nil,
+            !relayoutXCheck,
+            let biases,
+            w.shape == [262_144, 352],
+            scales.shape == [262_144, 44],
+            biases.shape == [262_144, 44]
+        else { return nil }
+        guard x.allSatisfy({ column in
+            (column.shape == [mRows, 1, 2816] || column.shape == [mRows, 2816])
+                && admitsArgmax(
+                    x: column.shape, xDType: column.dtype, w: w,
+                    scales: scales, biases: biases,
+                    groupSize: groupSize, bits: bits)
+        }) else { return nil }
+
+        let count = x.count
+        let k = 2816
+        let n = 262_144
+        let tiles = 4 / count
+        let threadgroups = n / (32 * tiles)
+        let sumCells = mRows * (k / groupSize)
+        let xSumsAndProducer = x.enumerated().map { column, value -> (MLXArray, Bool) in
+            if let supplied = activationSums[column],
+                supplied.values.dtype == .float32,
+                supplied.values.ndim == 1,
+                supplied.values.size == sumCells
+            {
+                return (supplied.values, true)
+            }
+            let flat = value.reshaped([mRows, k])
+            let sumThreads = 128
+            let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
+            let sums = xSumKernel(
+                [flat],
+                template: [("T", value.dtype), ("K", k)],
+                grid: (sumThreadgroups * sumThreads, 1, 1),
+                threadGroup: (sumThreads, 1, 1),
+                outputShapes: [[sumCells]],
+                outputDTypes: [.float32])[0]
+            return (sums, false)
+        }
+        let xSums = xSumsAndProducer.map { $0.0 }
+        if xSumsAndProducer.contains(where: { $0.1 }) {
+            CBv2EngageMark.once("head-norm-xsum-fold")
+        }
+
+        CBv2EngageMark.once("head-relayout")
+        let plane = relayoutPlane(for: w, k: k, n: n)
+        let kernel = sharedArgmaxKernels[count]!
+        let inputs = x.map { $0.reshaped([mRows, k]) }
+            + xSums + [plane, scales, biases]
+        CBv2EngageMark.once("mtp-shared-head-C\(count)")
+        let partials = kernel(
+            inputs,
+            template: [("T", x[0].dtype), ("K", k), ("N", n)],
+            grid: (threadgroups * threadsPerThreadgroup, 1, 1),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: (0..<count).flatMap {
+                _ in [[mRows * threadgroups], [mRows * threadgroups]]
+            },
+            outputDTypes: (0..<count).flatMap {
+                _ in [DType.float32, DType.uint32]
+            })
+        let ids = (0..<count).map { column in
+            sharedArgmaxReduceKernel(
+                [partials[column * 2], partials[column * 2 + 1]],
+                template: [("NT", threadgroups)],
+                grid: (mRows * 32, 1, 1),
+                threadGroup: (32, 1, 1),
+                outputShapes: [[mRows]],
+                outputDTypes: [.int32])[0].reshaped([mRows, 1])
+        }
+        return concatenated(ids, axis: 1)
+    }
+
     /// True when `applyArgmax` would take the fused path for this geometry.
     /// Pure host predicate over shapes, dtypes and the kill switches, so the
     /// engine can choose the seam BEFORE it builds the forward graph.

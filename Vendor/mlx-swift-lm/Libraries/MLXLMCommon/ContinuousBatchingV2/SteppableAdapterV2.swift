@@ -209,6 +209,20 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPSteppableModel {
         }
         return forwardable.cbv2ForwardWithHidden(tokens, caches: asKVCaches(caches))
     }
+
+    public func forwardColumnsWithHidden(
+        columns: [MLXArray], caches: [CBv2AttendingLayerCache]
+    ) -> (logits: MLXArray, lastHidden: MLXArray)? {
+        (model as? CBv2MTPForwardable)?.cbv2ForwardColumnsWithHidden(
+            columns, caches: asKVCaches(caches))
+    }
+
+    public func forwardColumnsArgmaxWithHidden(
+        columns: [MLXArray], caches: [CBv2AttendingLayerCache]
+    ) -> (argmax: MLXArray, lastHidden: MLXArray)? {
+        (model as? CBv2MTPForwardable)?.cbv2ForwardColumnsArgmaxWithHidden(
+            columns, caches: asKVCaches(caches))
+    }
 }
 
 // MARK: - Logitsless greedy head (LGH-001)

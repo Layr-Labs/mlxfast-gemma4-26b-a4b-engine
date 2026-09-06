@@ -3834,9 +3834,8 @@ for (int element = 0; element < values_per_lane; ++element) {
         else { return nil }
 
         let startArray = getStartArray(starts: starts, batch: batch)
-        func fallbackInputs() -> [MLXArray] {
-            [queries] + mirrors + [startArray, newKeys, newValues, previousWriteFence]
-        }
+        let inputs = [queries] + mirrors
+            + [startArray, newKeys, newValues, previousWriteFence]
         if q4ResidentMergeEnabled,
             blocks == 8,
             combineColumns == 8,
@@ -3928,7 +3927,7 @@ for (int element = 0; element < values_per_lane; ++element) {
                 return (resident[0], resident[1])
             }
             let resident = portQuantFusedWriteResidentKernel(
-                fallbackInputs(),
+                inputs,
                 template: [
                     ("T", queries.dtype),
                     ("D", headDim),
@@ -3950,7 +3949,7 @@ for (int element = 0; element < values_per_lane; ++element) {
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = portQuantFusedWriteKernel(
-            fallbackInputs(),
+            inputs,
             template: [
                 ("T", queries.dtype),
                 ("D", headDim),

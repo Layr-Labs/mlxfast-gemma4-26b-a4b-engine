@@ -5,6 +5,24 @@ import MLX
 public enum Gemma4DecodeFusedGUV1 {
     static let enabled = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DECODE_FUSED_GEGLU"] != "0"
 
+    /// RUN-CAP SWEEP. The pair/triple/quad impls all inline into one kernel, so
+    /// register allocation is worst-case across every path -- proven by RUN-OCT,
+    /// where merely compiling an eight-stream path cost 9.1% even when unused.
+    /// Runs of three or more are only 14% of runs at real top-8-of-128 routing,
+    /// so the rarely-taken wide paths may be taxing the 86% that never run them.
+    /// This compiles OUT every impl above the cap.
+    /// DEFAULT 2. Measured single-worker under realistic top-8-of-128 routing:
+    ///   cap4 (incumbent) 0.002927 s/token, cap2 0.002660 = **+9.12%**, zero
+    ///   overlap across five alternating passes, tokens bit-identical.
+    /// Runs of three or more are only 14% of runs, but the triple and quad
+    /// impls inline into the same kernel, so their registers were charged to
+    /// the 86% of threadgroups that never execute them.
+    /// `DARKBLOOM_GEMMA4_GU_RUN_CAP=4` restores the incumbent.
+    static let runCap: Int = {
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_RUN_CAP"] ?? "2"
+        return Int(raw).map { min(max($0, 1), 4) } ?? 2
+    }()
+
     static func call(x: MLXArray, storage: SwitchGateUpFusedStorage,
         lhs: MLXArray, rhs: MLXArray) -> MLXArray {
         kernel([storage.weight, storage.scales, storage.biases, x, lhs, rhs],
@@ -44,7 +62,7 @@ uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
     }
 
 """#,
-        header: #"""
+        header: "#define GU_RUN_CAP \(runCap)\n" + #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helpers from 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -802,6 +820,7 @@ METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
   }
 }
 
+#if GU_RUN_CAP >= 3
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void tg_qmv_affine4_g64_triple_stream_impl(
     const device uint32_t* w,
@@ -925,6 +944,9 @@ METAL_FUNC void tg_qmv_affine4_g64_triple_stream_impl(
   }
 }
 
+#endif
+
+#if GU_RUN_CAP >= 4
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void tg_qmv_affine4_g64_quad_stream_impl(
     const device uint32_t* w,
@@ -1067,6 +1089,8 @@ METAL_FUNC void tg_qmv_affine4_g64_quad_stream_impl(
   }
 }
 
+#endif
+
 template <typename T>
 inline T gemma4_geglu_compiled_tape(T gate, T up) {
   const T cubic_0 = static_cast<T>(static_cast<T>(0.044715f) * gate);
@@ -1086,6 +1110,10 @@ inline T gemma4_geglu_compiled_tape(T gate, T up) {
 #define GU_PAIRS 1
 #endif
 constant int guPairs=GU_PAIRS;
+#ifndef GU_RUN_CAP
+#define GU_RUN_CAP 4
+#endif
+constant uint guRunCap=GU_RUN_CAP;
 constant int guK=2816,guN=704,guSliceN=8;
 struct ExpertRun { uint expert; uint count; bool leader; };
 METAL_FUNC ExpertRun expert_run(const device uint* rhs,uint assignment) {
@@ -1094,10 +1122,10 @@ METAL_FUNC ExpertRun expert_run(const device uint* rhs,uint assignment) {
     uint offset=0;
     if(tagged)offset=(word>>8)&0x3fu;
     else for(uint p=assignment;p>0;--p){if(rhs[p-1]!=expert)break;++offset;}
-    if((offset&3u)!=0u)return {expert,0,false};
+    if(guRunCap>1u && (offset&(guRunCap-1u))!=0u)return {expert,0,false};
     uint count=1;
-    if(tagged)count=min(4u,((word>>14)&0x3fu)+1u);
-    else while(count<4 && assignment+count<64 && rhs[assignment+count]==expert)++count;
+    if(tagged)count=min(guRunCap,((word>>14)&0x3fu)+1u);
+    else while(count<guRunCap && assignment+count<64 && rhs[assignment+count]==expert)++count;
     return {expert,count,true};
 }
 template<typename T>
@@ -1108,10 +1136,14 @@ METAL_FUNC void tg_execute_projection(const device uint* w,const device T* scale
     if(count==1){tg_qmv_impl<T,64,4>(w,scales,biases,x0,y0,guK,outputN,tid,sg,lane);return;}
     const device T* x1=x+lhs[assignment+1]*2816;threadgroup T* y1=y0+rowStride;
     if(count==2){tg_qmv_affine4_g64_pair_impl<T,64,4>(w,scales,biases,x0,x1,y0,y1,guK,tid,sg,lane);return;}
+#if GU_RUN_CAP >= 3
     const device T* x2=x+lhs[assignment+2]*2816;threadgroup T* y2=y1+rowStride;
     if(count==3){tg_qmv_affine4_g64_triple_stream_impl<T,64,4>(w,scales,biases,x0,x1,x2,y0,y1,y2,guK,tid,sg,lane);return;}
+#endif
+#if GU_RUN_CAP >= 4
     const device T* x3=x+lhs[assignment+3]*2816;threadgroup T* y3=y2+rowStride;
     tg_qmv_affine4_g64_quad_stream_impl<T,64,4>(w,scales,biases,x0,x1,x2,x3,y0,y1,y2,y3,guK,tid,sg,lane);
+#endif
 }
 
 """#,

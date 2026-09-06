@@ -19,8 +19,8 @@ public enum Gemma4DecodeFusedGUV1 {
     /// the 86% of threadgroups that never execute them.
     /// `DARKBLOOM_GEMMA4_GU_RUN_CAP=4` restores the incumbent.
     static let runCap: Int = {
-        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_RUN_CAP"] ?? "2"
-        return Int(raw).map { min(max($0, 1), 4) } ?? 2
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_RUN_CAP"] ?? "1"
+        return Int(raw).map { min(max($0, 1), 4) } ?? 1
     }()
 
     static func call(x: MLXArray, storage: SwitchGateUpFusedStorage,
@@ -714,6 +714,7 @@ METAL_FUNC void tg_qmv_impl(
   }
 }
 
+#if GU_RUN_CAP >= 2
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
     const device uint32_t* w,
@@ -819,6 +820,7 @@ METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
     }
   }
 }
+#endif
 
 #if GU_RUN_CAP >= 3
 template <typename T, const int group_size, const int bits>
@@ -1134,8 +1136,10 @@ METAL_FUNC void tg_execute_projection(const device uint* w,const device T* scale
     const constant int& outputN,uint assignment,uint count,uint3 tid,uint sg,uint lane) {
     const device T* x0=x+lhs[assignment]*2816;
     if(count==1){tg_qmv_impl<T,64,4>(w,scales,biases,x0,y0,guK,outputN,tid,sg,lane);return;}
+#if GU_RUN_CAP >= 2
     const device T* x1=x+lhs[assignment+1]*2816;threadgroup T* y1=y0+rowStride;
     if(count==2){tg_qmv_affine4_g64_pair_impl<T,64,4>(w,scales,biases,x0,x1,y0,y1,guK,tid,sg,lane);return;}
+#endif
 #if GU_RUN_CAP >= 3
     const device T* x2=x+lhs[assignment+2]*2816;threadgroup T* y2=y1+rowStride;
     if(count==3){tg_qmv_affine4_g64_triple_stream_impl<T,64,4>(w,scales,biases,x0,x1,x2,y0,y1,y2,guK,tid,sg,lane);return;}

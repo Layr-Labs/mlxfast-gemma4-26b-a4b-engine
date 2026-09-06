@@ -539,6 +539,18 @@ public enum Gemma4PrefillGlueV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Share the target checkpoint's eight scatter positions across the whole
+    /// row threadgroup. The existing first barrier in `glue_inv_rms` publishes
+    /// the cache, so this adds no synchronization to the promoted kernel.
+    /// Setting `DARKBLOOM_GEMMA4_PREFILL_SCATTER_TG_INDEX_CACHE=0` restores
+    /// `preNormScatterHoistKernel` byte for byte.
+    static let scatterThreadgroupIndexCacheEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_SCATTER_TG_INDEX_CACHE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// `preNormScatterKernel` with the `K` index reads lifted above the stores.
     private static let preNormScatterHoistKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
@@ -590,6 +602,67 @@ public enum Gemma4PrefillGlueV1 {
                 #pragma clang loop unroll(full)
                 for (int k = 0; k < K; k++) {
                     const size_t pos = size_t(sorted_pos[k]);
+                    const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
+                    #pragma clang loop unroll(full)
+                    for (int i = 0; i < GLUE_NREADS; i++) {
+                        out[obase + i] = normed[i];
+                    }
+                }
+                """,
+            header: kernelHeader,
+            ensureRowContiguous: true
+        )
+
+    /// The promoted index-hoist kernel with one eight-word device read per
+    /// token row instead of one per worker thread. Only the source address of
+    /// each integer changes; the normalized values and store order do not.
+    private static let preNormScatterThreadgroupIndexKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_prefill_glue_prenorm_scatter_2816_idx_tgcache_v4",
+            inputNames: ["x", "w", "inverse"],
+            outputNames: ["out"],
+            source: """
+                threadgroup float local_sums[32];
+                threadgroup float local_inv[1];
+                threadgroup uint cached_positions[8];
+
+                const uint row = threadgroup_position_in_grid.y;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+                const size_t assignment_base = size_t(row) * 8;
+
+                // The first eight threads issue the row's complete metadata
+                // load while every thread begins its independent RMS work.
+                // `glue_inv_rms` reaches a threadgroup-memory barrier before
+                // returning, which makes these words visible without another
+                // barrier in this kernel.
+                if (lid < 8) {
+                    cached_positions[lid] = inverse[assignment_base + lid];
+                }
+
+                const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+                float xv[GLUE_NREADS];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    xv[i] = static_cast<float>(x[base + i]);
+                }
+
+                const float inv = glue_inv_rms(
+                    xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+                T normed[GLUE_NREADS];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    const uint j = lid * GLUE_NREADS + i;
+                    const T scaled = static_cast<T>(xv[i] * inv);
+                    normed[i] = w[j] * scaled;
+                }
+
+                #pragma clang loop unroll(full)
+                for (uint k = 0; k < 8; ++k) {
+                    const size_t pos = size_t(cached_positions[k]);
                     const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
                     #pragma clang loop unroll(full)
                     for (int i = 0; i < GLUE_NREADS; i++) {
@@ -695,7 +768,13 @@ public enum Gemma4PrefillGlueV1 {
 
         CBv2EngageMark.once("prefill-prenorm-gather")
         let scatter: MLXFast.MLXFastKernel
-        if scatterIndexHoistEnabled {
+        if scatterIndexHoistEnabled,
+            scatterThreadgroupIndexCacheEnabled,
+            topK == 8
+        {
+            CBv2EngageMark.once("prefill-scatter-tg-index-cache")
+            scatter = preNormScatterThreadgroupIndexKernel
+        } else if scatterIndexHoistEnabled {
             CBv2EngageMark.once("prefill-scatter-idx-hoist")
             scatter = preNormScatterHoistKernel
         } else {

@@ -5487,6 +5487,29 @@ private class Gemma4MLP: Module {
         )
     }
 
+    /// DENSE-GELU-EPILOGUE-DECODE: gate/up and their GeGLU in one dispatch.
+    /// Returns the activated [batch, 1, 2112] plane, so the separate
+    /// elementwise pass -- 9.7% of the decode step by `kprof` -- never runs.
+    fileprivate func zipGateUpGelu(_ x: MLXArray) -> MLXArray? {
+        guard gemma4DenseGateUpJoinEnabled,
+            let storage = fusedGateUpStorage,
+            let gate = gateProj as? QuantizedLinear,
+            let up = upProj as? QuantizedLinear,
+            gate.bias == nil, up.bias == nil,
+            gate.groupSize == 64, up.groupSize == gate.groupSize,
+            gate.bits == 8, up.bits == gate.bits,
+            gate.mode == .affine, up.mode == gate.mode
+        else { return nil }
+        return CBv2DenseMLPQMVV1.gateUpGelu(
+            x: x,
+            weight: storage.weight,
+            scales: storage.scales,
+            biases: storage.biases,
+            groupSize: gate.groupSize,
+            bits: gate.bits,
+            mode: gate.mode)
+    }
+
     fileprivate func zipDown(_ activated: MLXArray) -> MLXArray {
         denseProjection(downProj, activated)
     }
@@ -5638,10 +5661,31 @@ private enum Gemma4ZipRouterV1 {
         let normed = carriedRouterNorm ?? router.zipNorm(out)
 
         // Stage 2: router QMV | dense gate + up.
+        //
+        // DENSE-GELU-EPILOGUE-DECODE: when the fused kernel claims this cell it
+        // returns the ACTIVATED plane, so stage 3's elementwise product is
+        // skipped entirely and `activated` stands in as the dependency edge the
+        // later stages took on gate/up.
+        var fusedActivated: MLXArray? = nil
         let expertScores: MLXArray
         let gate: MLXArray
         let up: MLXArray
-        if Gemma4FusedLayerGlue.denseXSumElideEnabled {
+        if CBv2DenseMLPQMVV1.denseGeluEpilogueEnabled,
+            Gemma4FusedLayerGlue.denseXSumElideEnabled
+        {
+            expertScores = router.zipScores(normed)
+            let denseIn = MLX.depends(input: n1, dependencies: [normed])
+            if let act = mlp.zipGateUpGelu(denseIn) {
+                fusedActivated = act
+                gate = act
+                up = act
+            } else if let joined = mlp.zipGateUp(denseIn, nil) {
+                (gate, up) = joined
+            } else {
+                gate = mlp.zipGate(denseIn, nil)
+                up = mlp.zipUp(denseIn, nil)
+            }
+        } else if Gemma4FusedLayerGlue.denseXSumElideEnabled {
             expertScores = router.zipScores(normed)
             let denseIn = MLX.depends(input: n1, dependencies: [normed])
             if let joined = mlp.zipGateUp(denseIn, nil) {
@@ -5665,8 +5709,15 @@ private enum Gemma4ZipRouterV1 {
 
         // Stage 3: the dense GeLU product, which the router has no partner
         // for -- the argPartition is deliberately NOT paired with it.
-        let held = MLX.depends(inputs: [gate, up], dependencies: [expertScores])
-        let activated = gemma4GeluProduct(held[0], held[1])
+        let activated: MLXArray
+        if let fused = fusedActivated {
+            activated = MLX.depends(
+                inputs: [fused], dependencies: [expertScores])[0]
+        } else {
+            let held = MLX.depends(
+                inputs: [gate, up], dependencies: [expertScores])
+            activated = gemma4GeluProduct(held[0], held[1])
+        }
 
         // Stage 4: router argPartition | dense down projection. The sort is
         // 8 us and the down projection 25 us, so this is the pairing that

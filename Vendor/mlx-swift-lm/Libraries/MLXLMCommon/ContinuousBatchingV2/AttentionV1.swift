@@ -34,6 +34,18 @@ enum CBv2AttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Defer the BF16 full-ring view array until the quantized mirror road
+    /// declines. On the scored B=8/L=1 path, starts come directly from the
+    /// already-admitted rows, so the tuple array is dead on quant success.
+    /// `0`/`false`/`no`/`off` restores eager view formation.
+    private static let deferFullRingViewsEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_RING_VIEW_ARRAY_DEFER"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+
     /// Query-block width for multi-token prompt attention (see
     /// `attendQueryBlocks`). Smaller blocks execute strictly less attention
     /// work and hold a smaller score tensor, but cost one dispatch set each;
@@ -608,13 +620,26 @@ enum CBv2AttentionV1 {
                             keys: keys[index ..< (index + 1)],
                             values: values[index ..< (index + 1)])
                     }
-                    let views = ringRows.compactMap { $0.decodeRingView }
                     // KVQ-PORT: the ring write above is the promoted stock
                     // mechanism's; only the READ moves to the 8-bit mirror,
                     // and its pass A is consumed by pass B exactly as the
                     // bf16 road consumes it. All-or-nothing: unless every
                     // row exposes a mirror the established road runs.
                     let portMirrors = ringRows.compactMap { $0.decodeRingQuantView }
+                    if deferFullRingViewsEnabled, portMirrors.count == B {
+                        let starts = ringRows.compactMap { $0.decodeRingView?.start }
+                        if starts.count == B,
+                            let quantOutput = CBv2RaggedTwoPassDecodeAttentionV1
+                                .attendRingQuant(
+                                    queries: queries, mirrors: portMirrors,
+                                    starts: starts, scale: scale,
+                                    slidingWindowLength: ringRows[0].window)
+                        {
+                            CBv2EngageMark.once("kvq8-view-defer")
+                            return quantOutput
+                        }
+                    }
+                    let views = ringRows.compactMap { $0.decodeRingView }
                     if views.count == B, portMirrors.count == B,
                         let quantOutput = CBv2RaggedTwoPassDecodeAttentionV1
                             .attendRingQuant(

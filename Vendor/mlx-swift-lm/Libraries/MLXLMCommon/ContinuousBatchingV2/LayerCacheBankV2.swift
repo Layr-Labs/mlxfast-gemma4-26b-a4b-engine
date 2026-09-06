@@ -100,6 +100,17 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
     private let caches: [any CBv2AttendingLayerCache]
     private var boundRowIdentity: [ObjectIdentifier] = []
     private var hasBound = false
+    /// The stable chained-decode path normally asks for the same row
+    /// composition repeatedly. Keep the existing allocation-producing path
+    /// available as the fail-closed fallback, but let callers disable the
+    /// no-allocation membership proof for diagnostics.
+    private static let directMembershipFastHitEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_BANK_DIRECT_MEMBERSHIP"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Canonical owning layer for an all-contiguous bank's shared position
     /// chain. nil keeps mixed and paged banks on their established behavior.
     private var unifiedPositionLayerIndex: Int?
@@ -196,6 +207,10 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
     }
 
     public func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
+        if directMembershipFastHit(rowStates) {
+            CBv2EngageMark.once("cbv2-bank-direct-membership-hit")
+            return caches
+        }
         let identity = rowStates.map { row -> ObjectIdentifier in
             guard let anchor = row.compactMap({ $0 }).first else {
                 preconditionFailure("CBv2LayerCacheBank: row owns no storage at any layer")
@@ -220,6 +235,27 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
             hasBound = true
         }
         return caches
+    }
+
+    /// Prove the same membership predicate as `identity` without building a
+    /// temporary array. The first non-nil storage object in each row is the
+    /// bank's canonical identity; all malformed rows still fall through to the
+    /// original precondition-bearing path.
+    private func directMembershipFastHit(
+        _ rowStates: [[CBv2SequenceKV?]]
+    ) -> Bool {
+        guard Self.directMembershipFastHitEnabled,
+            hasBound,
+            rowStates.count == boundRowIdentity.count
+        else { return false }
+
+        for (rowIndex, states) in rowStates.enumerated() {
+            guard let firstIndex = states.firstIndex(where: { $0 != nil }),
+                let anchor = states[firstIndex],
+                ObjectIdentifier(anchor) == boundRowIdentity[rowIndex]
+            else { return false }
+        }
+        return true
     }
 
     /// Sharing is valid only while every owning layer for a row has consumed

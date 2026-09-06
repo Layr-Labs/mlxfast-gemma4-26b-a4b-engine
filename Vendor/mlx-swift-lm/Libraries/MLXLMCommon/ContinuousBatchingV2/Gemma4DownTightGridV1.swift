@@ -24,17 +24,18 @@ public enum Gemma4DownTightGridV1 {
     /// `704 x 8` affine-4 accumulation per row group, so the election is a
     /// small fixed preamble either way.
     ///
-    /// Span eight was measured on the ranked box and lost, which says this
-    /// dispatch is short enough that occupancy, not preamble, is what binds
-    /// it. Span two is the other direction: 176 threadgroups per layer instead
-    /// of 88, same arithmetic, same order.
+    /// Three positions on this knob have now been measured on the ranked box.
+    /// Span eight lost, span four was the incumbent, and span two won, so the
+    /// occupancy side of the trade dominates the preamble side over the whole
+    /// measured range. Span one is the last position: one row group per
+    /// threadgroup, 352 y slots, no surviving bundling.
     static let tileSpan: Int = {
         #if os(macOS)
-        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_TILE_SPAN2"]
-        else { return 2 }
-        return ["0", "false", "no", "off"].contains(raw.lowercased()) ? 4 : 2
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_TILE_SPAN1"]
+        else { return 1 }
+        return ["0", "false", "no", "off"].contains(raw.lowercased()) ? 2 : 1
         #else
-        return 4
+        return 2
         #endif
     }()
 
@@ -832,7 +833,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = span; // dispatch-selected: 4 or 2
+  constexpr int gemma4_down_tile_span = span; // dispatch-selected: 4, 2 or 1
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }

@@ -195,13 +195,27 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
         caches.allSatisfy { $0 is CBv2PackedSpanMaskBinding }
     }
 
+    /// The first storage-owning row anchors the existing identity contract.
+    /// Stop at that anchor rather than allocating all non-nil layer entries.
+    private static func rowIdentity(_ row: [CBv2SequenceKV?]) -> ObjectIdentifier {
+        for case let anchor? in row { return ObjectIdentifier(anchor) }
+        preconditionFailure("CBv2LayerCacheBank: row owns no storage at any layer")
+    }
+
     public func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
-        let identity = rowStates.map { row -> ObjectIdentifier in
-            guard let anchor = row.compactMap({ $0 }).first else {
-                preconditionFailure("CBv2LayerCacheBank: row owns no storage at any layer")
+        // Stable membership needs no temporary identity array. Invalidation
+        // and row release still force the complete binding path below.
+        if hasBound && rowStates.count == boundRowIdentity.count {
+            var same = true
+            for row in rowStates.indices {
+                if Self.rowIdentity(rowStates[row]) != boundRowIdentity[row] {
+                    same = false
+                    break
+                }
             }
-            return ObjectIdentifier(anchor)
+            if same { return caches }
         }
+        let identity = rowStates.map(Self.rowIdentity)
         if !hasBound || identity != boundRowIdentity {
             validateUnifiedPositionInvariant(rowStates)
             for (layer, cache) in caches.enumerated() {

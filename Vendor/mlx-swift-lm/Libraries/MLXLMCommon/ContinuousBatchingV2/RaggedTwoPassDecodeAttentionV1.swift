@@ -1785,7 +1785,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp3_ey51_yrp1_ey130_ey186_ey214",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp3_ey51_yrp1_ey130_ey186",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -3834,8 +3834,6 @@ for (int element = 0; element < values_per_lane; ++element) {
         else { return nil }
 
         let startArray = getStartArray(starts: starts, batch: batch)
-        let inputs = [queries] + mirrors
-            + [startArray, newKeys, newValues, previousWriteFence]
         if q4ResidentMergeEnabled,
             blocks == 8,
             combineColumns == 8,
@@ -3926,6 +3924,8 @@ for (int element = 0; element < values_per_lane; ++element) {
                 }
                 return (resident[0], resident[1])
             }
+            let inputs = [queries] + mirrors
+                + [startArray, newKeys, newValues, previousWriteFence]
             let resident = portQuantFusedWriteResidentKernel(
                 inputs,
                 template: [
@@ -3946,6 +3946,8 @@ for (int element = 0; element < values_per_lane; ++element) {
             return (resident[0], resident[1])
         }
 
+        let inputs = [queries] + mirrors
+            + [startArray, newKeys, newValues, previousWriteFence]
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = portQuantFusedWriteKernel(

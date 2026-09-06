@@ -76,7 +76,19 @@ import MLXFast
 /// here claims only 32 output columns, so narrow planes (q/k/v/o, the dense
 /// MLP) cannot fill the machine and measured SLOWER than ordinary pair/quad
 /// QMV in isolation. Only the tied vocab plane is meant to enter.
+public enum HeadHalfWeightMatricesV1 {
+    public static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_HEAD_HALF_WEIGHT_MATRICES"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+}
+
 public enum Gemma4MMAQuantizedGEMV {
+
+    private static let headHalfKeySuffix: String = HeadHalfWeightMatricesV1.enabled ? "_halfw" : ""
+    private static let headAMatCast: String = HeadHalfWeightMatricesV1.enabled ? "half" : "float"
 
     /// Exact affine activation sums emitted by the final RMSNorm producer.
     /// The initializer stays private so callers cannot fabricate a table that
@@ -2239,31 +2251,31 @@ public enum Gemma4MMAQuantizedGEMV {
                     simdgroup_multiply_accumulate(accg1, A1, B, accg1);
             """,
             with: """
-                    simdgroup_matrix<float, 8, 8> A0;
-                    simdgroup_matrix<float, 8, 8> A1;
-                    simdgroup_matrix<float, 8, 8> A2;
-                    simdgroup_matrix<float, 8, 8> A3;
+                    simdgroup_matrix<\(headAMatCast), 8, 8> A0;
+                    simdgroup_matrix<\(headAMatCast), 8, 8> A1;
+                    simdgroup_matrix<\(headAMatCast), 8, 8> A2;
+                    simdgroup_matrix<\(headAMatCast), 8, 8> A3;
                     simdgroup_matrix<float, 8, 8> B;
                     const uint packed0 = t < 4 ? packedLo0[t] : packedHi0[t - 4];
                     const uint packed1 = t < 4 ? packedLo1[t] : packedHi1[t - 4];
                     const uint packed2 = t < 4 ? packedLo2[t] : packedHi2[t - 4];
                     const uint packed3 = t < 4 ? packedLo3[t] : packedHi3[t - 4];
                     A0.thread_elements()[0] =
-                        float((packed0 >> (4 * fragmentCol)) & 0xFu);
+                        \(headAMatCast)((packed0 >> (4 * fragmentCol)) & 0xFu);
                     A0.thread_elements()[1] =
-                        float((packed0 >> (4 * (fragmentCol + 1))) & 0xFu);
+                        \(headAMatCast)((packed0 >> (4 * (fragmentCol + 1))) & 0xFu);
                     A1.thread_elements()[0] =
-                        float((packed1 >> (4 * fragmentCol)) & 0xFu);
+                        \(headAMatCast)((packed1 >> (4 * fragmentCol)) & 0xFu);
                     A1.thread_elements()[1] =
-                        float((packed1 >> (4 * (fragmentCol + 1))) & 0xFu);
+                        \(headAMatCast)((packed1 >> (4 * (fragmentCol + 1))) & 0xFu);
                     A2.thread_elements()[0] =
-                        float((packed2 >> (4 * fragmentCol)) & 0xFu);
+                        \(headAMatCast)((packed2 >> (4 * fragmentCol)) & 0xFu);
                     A2.thread_elements()[1] =
-                        float((packed2 >> (4 * (fragmentCol + 1))) & 0xFu);
+                        \(headAMatCast)((packed2 >> (4 * (fragmentCol + 1))) & 0xFu);
                     A3.thread_elements()[0] =
-                        float((packed3 >> (4 * fragmentCol)) & 0xFu);
+                        \(headAMatCast)((packed3 >> (4 * fragmentCol)) & 0xFu);
                     A3.thread_elements()[1] =
-                        float((packed3 >> (4 * (fragmentCol + 1))) & 0xFu);
+                        \(headAMatCast)((packed3 >> (4 * (fragmentCol + 1))) & 0xFu);
                     const uint activationK = g * GROUP + t * 8 + fragmentRow;
                     B.thread_elements()[0] =
                         float(x[fragmentCol * K + activationK]);
@@ -2566,7 +2578,7 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1",
+        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1" + headHalfKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["out"],
         source: sourceV27,
@@ -2750,7 +2762,7 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27Carry: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2",
+        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2" + headHalfKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["out"],
         source: sourceV27Carry,
@@ -2858,21 +2870,21 @@ public enum Gemma4MMAQuantizedGEMV {
                     const uint packed2 = t < 4 ? packedLo2[t] : packedHi2[t - 4];
                     const uint packed3 = t < 4 ? packedLo3[t] : packedHi3[t - 4];
                     A0.thread_elements()[0] =
-                        float((packed0 >> (4 * fragmentCol)) & 0xFu);
+                        \(headAMatCast)((packed0 >> (4 * fragmentCol)) & 0xFu);
                     A0.thread_elements()[1] =
-                        float((packed0 >> (4 * (fragmentCol + 1))) & 0xFu);
+                        \(headAMatCast)((packed0 >> (4 * (fragmentCol + 1))) & 0xFu);
                     A1.thread_elements()[0] =
-                        float((packed1 >> (4 * fragmentCol)) & 0xFu);
+                        \(headAMatCast)((packed1 >> (4 * fragmentCol)) & 0xFu);
                     A1.thread_elements()[1] =
-                        float((packed1 >> (4 * (fragmentCol + 1))) & 0xFu);
+                        \(headAMatCast)((packed1 >> (4 * (fragmentCol + 1))) & 0xFu);
                     A2.thread_elements()[0] =
-                        float((packed2 >> (4 * fragmentCol)) & 0xFu);
+                        \(headAMatCast)((packed2 >> (4 * fragmentCol)) & 0xFu);
                     A2.thread_elements()[1] =
-                        float((packed2 >> (4 * (fragmentCol + 1))) & 0xFu);
+                        \(headAMatCast)((packed2 >> (4 * (fragmentCol + 1))) & 0xFu);
                     A3.thread_elements()[0] =
-                        float((packed3 >> (4 * fragmentCol)) & 0xFu);
+                        \(headAMatCast)((packed3 >> (4 * fragmentCol)) & 0xFu);
                     A3.thread_elements()[1] =
-                        float((packed3 >> (4 * (fragmentCol + 1))) & 0xFu);
+                        \(headAMatCast)((packed3 >> (4 * (fragmentCol + 1))) & 0xFu);
             """,
             """
                     // Byte t of the lane's quarter holds nibbles fragmentCol and
@@ -2883,21 +2895,21 @@ public enum Gemma4MMAQuantizedGEMV {
                     const uint packed3 = t < 4 ? packedQ3.x : packedQ3.y;
                     const uint nibbleShift = 8u * (t & 3u);
                     A0.thread_elements()[0] =
-                        float((packed0 >> nibbleShift) & 0xFu);
+                        \(headAMatCast)((packed0 >> nibbleShift) & 0xFu);
                     A0.thread_elements()[1] =
-                        float((packed0 >> (nibbleShift + 4u)) & 0xFu);
+                        \(headAMatCast)((packed0 >> (nibbleShift + 4u)) & 0xFu);
                     A1.thread_elements()[0] =
-                        float((packed1 >> nibbleShift) & 0xFu);
+                        \(headAMatCast)((packed1 >> nibbleShift) & 0xFu);
                     A1.thread_elements()[1] =
-                        float((packed1 >> (nibbleShift + 4u)) & 0xFu);
+                        \(headAMatCast)((packed1 >> (nibbleShift + 4u)) & 0xFu);
                     A2.thread_elements()[0] =
-                        float((packed2 >> nibbleShift) & 0xFu);
+                        \(headAMatCast)((packed2 >> nibbleShift) & 0xFu);
                     A2.thread_elements()[1] =
-                        float((packed2 >> (nibbleShift + 4u)) & 0xFu);
+                        \(headAMatCast)((packed2 >> (nibbleShift + 4u)) & 0xFu);
                     A3.thread_elements()[0] =
-                        float((packed3 >> nibbleShift) & 0xFu);
+                        \(headAMatCast)((packed3 >> nibbleShift) & 0xFu);
                     A3.thread_elements()[1] =
-                        float((packed3 >> (nibbleShift + 4u)) & 0xFu);
+                        \(headAMatCast)((packed3 >> (nibbleShift + 4u)) & 0xFu);
             """
         ),
     ]
@@ -3013,21 +3025,21 @@ public enum Gemma4MMAQuantizedGEMV {
                     const uint packed2 = t < 4 ? packedLo2[t] : packedHi2[t - 4];
                     const uint packed3 = t < 4 ? packedLo3[t] : packedHi3[t - 4];
                     A0.thread_elements()[0] =
-                        float((packed0 >> (4 * fragmentCol)) & 0xFu);
+                        \(headAMatCast)((packed0 >> (4 * fragmentCol)) & 0xFu);
                     A0.thread_elements()[1] =
-                        float((packed0 >> (4 * (fragmentCol + 1))) & 0xFu);
+                        \(headAMatCast)((packed0 >> (4 * (fragmentCol + 1))) & 0xFu);
                     A1.thread_elements()[0] =
-                        float((packed1 >> (4 * fragmentCol)) & 0xFu);
+                        \(headAMatCast)((packed1 >> (4 * fragmentCol)) & 0xFu);
                     A1.thread_elements()[1] =
-                        float((packed1 >> (4 * (fragmentCol + 1))) & 0xFu);
+                        \(headAMatCast)((packed1 >> (4 * (fragmentCol + 1))) & 0xFu);
                     A2.thread_elements()[0] =
-                        float((packed2 >> (4 * fragmentCol)) & 0xFu);
+                        \(headAMatCast)((packed2 >> (4 * fragmentCol)) & 0xFu);
                     A2.thread_elements()[1] =
-                        float((packed2 >> (4 * (fragmentCol + 1))) & 0xFu);
+                        \(headAMatCast)((packed2 >> (4 * (fragmentCol + 1))) & 0xFu);
                     A3.thread_elements()[0] =
-                        float((packed3 >> (4 * fragmentCol)) & 0xFu);
+                        \(headAMatCast)((packed3 >> (4 * fragmentCol)) & 0xFu);
                     A3.thread_elements()[1] =
-                        float((packed3 >> (4 * (fragmentCol + 1))) & 0xFu);
+                        \(headAMatCast)((packed3 >> (4 * (fragmentCol + 1))) & 0xFu);
             """,
             """
                     // Byte t of the lane's quarter holds nibbles fragmentCol and
@@ -3038,21 +3050,21 @@ public enum Gemma4MMAQuantizedGEMV {
                     const uint packed3 = t < 4 ? packedQ3.x : packedQ3.y;
                     const uint nibbleShift = 8u * (t & 3u);
                     A0.thread_elements()[0] =
-                        float((packed0 >> nibbleShift) & 0xFu);
+                        \(headAMatCast)((packed0 >> nibbleShift) & 0xFu);
                     A0.thread_elements()[1] =
-                        float((packed0 >> (nibbleShift + 4u)) & 0xFu);
+                        \(headAMatCast)((packed0 >> (nibbleShift + 4u)) & 0xFu);
                     A1.thread_elements()[0] =
-                        float((packed1 >> nibbleShift) & 0xFu);
+                        \(headAMatCast)((packed1 >> nibbleShift) & 0xFu);
                     A1.thread_elements()[1] =
-                        float((packed1 >> (nibbleShift + 4u)) & 0xFu);
+                        \(headAMatCast)((packed1 >> (nibbleShift + 4u)) & 0xFu);
                     A2.thread_elements()[0] =
-                        float((packed2 >> nibbleShift) & 0xFu);
+                        \(headAMatCast)((packed2 >> nibbleShift) & 0xFu);
                     A2.thread_elements()[1] =
-                        float((packed2 >> (nibbleShift + 4u)) & 0xFu);
+                        \(headAMatCast)((packed2 >> (nibbleShift + 4u)) & 0xFu);
                     A3.thread_elements()[0] =
-                        float((packed3 >> nibbleShift) & 0xFu);
+                        \(headAMatCast)((packed3 >> nibbleShift) & 0xFu);
                     A3.thread_elements()[1] =
-                        float((packed3 >> (nibbleShift + 4u)) & 0xFu);
+                        \(headAMatCast)((packed3 >> (nibbleShift + 4u)) & 0xFu);
             """
         ),
     ]
@@ -3141,14 +3153,14 @@ public enum Gemma4MMAQuantizedGEMV {
 
         return RelayoutKernels(
             logits: MLXFast.metalKernel(
-                name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1_rl1",
+                name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1_rl1" + headHalfKeySuffix,
                 inputNames: ["x", "w", "scales", "biases", "xSums"],
                 outputNames: ["out"],
                 source: logits,
                 header: "#include <metal_simdgroup_matrix>\n",
                 ensureRowContiguous: true),
             carry: MLXFast.metalKernel(
-                name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2_rl1",
+                name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2_rl1" + headHalfKeySuffix,
                 inputNames: ["x", "w", "scales", "biases", "xSums"],
                 outputNames: ["out"],
                 source: carry,
@@ -3156,7 +3168,8 @@ public enum Gemma4MMAQuantizedGEMV {
                 ensureRowContiguous: true),
             argmax: MLXFast.metalKernel(
                 name: "gemma4_mma_affine4_qmv_m8_v27_argmax_rl1"
-                    + logitslessCarryKeySuffix,
+                    + logitslessCarryKeySuffix
+                    + headHalfKeySuffix,
                 inputNames: ["x", "w", "scales", "biases", "xSums"],
                 outputNames: ["pv", "pi"],
                 source: argmax,
@@ -3282,6 +3295,9 @@ public enum Gemma4MMAQuantizedGEMV {
             }
             switch version {
             case 27:
+                if HeadHalfWeightMatricesV1.enabled {
+                    CBv2EngageMark.once("head-half-weights")
+                }
                 if carryEnabled {
                     CBv2EngageMark.once("mma-head-carry")
                     selected = relayoutKernels?.carry ?? kernelV27Carry
@@ -3481,7 +3497,9 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27Argmax: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_argmax" + logitslessCarryKeySuffix,
+        name: "gemma4_mma_affine4_qmv_m8_v27_argmax"
+            + logitslessCarryKeySuffix
+            + headHalfKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["pv", "pi"],
         source: sourceV27Argmax,
@@ -3603,6 +3621,9 @@ public enum Gemma4MMAQuantizedGEMV {
 
         let headKernel: MLXFast.MLXFastKernel
         let plane: MLXArray
+        if HeadHalfWeightMatricesV1.enabled {
+            CBv2EngageMark.once("head-half-weights")
+        }
         if let relaid = relayoutKernels {
             CBv2EngageMark.once("head-relayout")
             headKernel = relaid.argmax

@@ -6718,8 +6718,49 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
     private static let threadgroupSize = axis / valuesPerThread
     private static let eps: Float = 1e-6
 
+    /// Selects the form of the final-norm cross-simdgroup combine. The
+    /// incumbent elects simdgroup 0 to reduce the twenty-two per-simdgroup
+    /// sums, publishes the inverse norm through threadgroup memory, and
+    /// barriers so the other simdgroups can read it. Every simdgroup already
+    /// holds the same thirty-two slots, so the selected form has each of them
+    /// run the identical `simd_sum` and keep the inverse in a thread-private
+    /// slot: the election, the threadgroup publication, and the barrier that
+    /// ordered it are no longer emitted. The reduction's operand order and
+    /// the rsqrt are unchanged, so every thread derives the same bits the
+    /// elected lane would have broadcast. The kernel name carries a suffix
+    /// for the selected form.
+    ///
+    /// `DARKBLOOM_GEMMA4_FINAL_NORM_TB=0` selects the incumbent combine text
+    /// and the incumbent kernel name.
+    static let finalNormTbEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_FINAL_NORM_TB"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let tbSuffix: String = finalNormTbEnabled ? "_tb1" : ""
+
+    private static let invDecl: String = finalNormTbEnabled
+        ? "float local_inv[1];" : "threadgroup float local_inv[1];"
+
+    private static let combine: String = finalNormTbEnabled ? """
+            acc = simd_sum(local_sums[simd_lane_id]);
+            local_inv[0] = metal::precise::rsqrt(acc / 2816.0f + 1e-06f);
+            """ : """
+            if (simd_group_id == 0) {
+                acc = simd_sum(local_sums[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_inv[0] =
+                        metal::precise::rsqrt(acc / 2816.0f + 1e-06f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            """
+
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v1",
+        name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v1"
+            + tbSuffix,
         inputNames: ["x", "w"],
         outputNames: ["out", "xSums"],
         source: """
@@ -6727,7 +6768,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             const uint lid = thread_position_in_threadgroup.x;
             const uint simd_lane_id = thread_index_in_simdgroup;
             const uint simd_group_id = simdgroup_index_in_threadgroup;
-            threadgroup float local_inv[1];
+            \(invDecl)
             threadgroup float local_sums[32];
             threadgroup float quad_sums[704];
 
@@ -6749,14 +6790,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
                 local_sums[simd_group_id] = acc;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group_id == 0) {
-                acc = simd_sum(local_sums[simd_lane_id]);
-                if (simd_lane_id == 0) {
-                    local_inv[0] =
-                        metal::precise::rsqrt(acc / 2816.0f + 1e-06f);
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            \(combine)
 
             T outv[4];
             for (int i = 0; i < 4; ++i) {
@@ -6815,6 +6849,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             produced: outputs[1], for: outputs[0])
         else { return nil }
         CBv2EngageMark.once("final-norm-mma-xsum")
+        if finalNormTbEnabled { CBv2EngageMark.once("final-norm-tb") }
         return (outputs[0], sums)
     }
 }

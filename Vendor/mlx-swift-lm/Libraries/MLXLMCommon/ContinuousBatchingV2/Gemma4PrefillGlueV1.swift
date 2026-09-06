@@ -71,6 +71,16 @@ public enum Gemma4PrefillGlueV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// ROUTE-STRIPE kill switch:
+    /// `DARKBLOOM_GEMMA4_PREFILL_EXPERT_ROUTE_STRIPE=0` restores the per-thread
+    /// route arrays and the feature-outer walk. Default ON.
+    private static let routeStripeEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_EXPERT_ROUTE_STRIPE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// PREFILL-PREFIX kill switch: `DARKBLOOM_GEMMA4_PREFILL_BRANCH_PREFIX=0`
     /// restores the three-kernel chain (`normResidual`, the router's
     /// `MLXFast.rmsNorm`, the dense `preNorm`). Default ON.
@@ -908,57 +918,99 @@ public enum Gemma4PrefillGlueV1 {
     /// The sorted expert reducer and chained prefill tail both traverse the
     /// same `[tokens, hidden]` expert result. Produce each reduced expert value
     /// in the tail thread that consumes it, removing the intermediate tensor.
-    private static let expertTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_expert_unsort_tail_chain_2816_meta_vec4_v7",
-        inputNames: [
-            "sorted", "inverse_order", "route_weights", "h1",
-            "w1", "w2", "w3", "res2", "s", "wn",
-        ],
-        outputNames: ["out", "normed"],
-        source: """
-            threadgroup float local_sums_a[32];
-            threadgroup float local_sums_b[32];
-            threadgroup float local_inv2[2];
+    private static let expertTailChainHead = """
+        threadgroup float local_sums_a[32];
+        threadgroup float local_sums_b[32];
+        threadgroup float local_inv2[2];
 
-            const uint row = threadgroup_position_in_grid.y;
-            const uint lid = thread_position_in_threadgroup.x;
-            const uint simd_lane_id = thread_index_in_simdgroup;
-            const uint simd_group_id = simdgroup_index_in_threadgroup;
-            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
-            const uint assignment_base = row * 8;
+        const uint row = threadgroup_position_in_grid.y;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint simd_lane_id = thread_index_in_simdgroup;
+        const uint simd_group_id = simdgroup_index_in_threadgroup;
+        const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+        const uint assignment_base = row * 8;
+        """
 
-            // The route metadata is invariant across this thread's four
-            // features. Keep one copy per thread instead of reloading both
-            // arrays in every feature/slot iteration.
-            uint inv_orders[8];
-            float route_weight_values[8];
+    /// Frontier arm: every thread holds all eight route records.
+    private static let expertTailChainArrayReduce = """
+        // The route metadata is invariant across this thread's four
+        // features. Keep one copy per thread instead of reloading both
+        // arrays in every feature/slot iteration.
+        uint inv_orders[8];
+        float route_weight_values[8];
+        #pragma clang loop unroll(full)
+        for (uint slot = 0; slot < 8; ++slot) {
+            const uint assignment = assignment_base + slot;
+            inv_orders[slot] = uint(inverse_order[assignment]);
+            route_weight_values[slot] = float(route_weights[assignment]);
+        }
+
+        float av[GLUE_NREADS];
+        float bv[GLUE_NREADS];
+        const vec<T, 4> h1_values =
+            *((const device vec<T, 4>*)(h1 + base));
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < GLUE_NREADS; i++) {
+            const uint feature = lid * GLUE_NREADS + i;
+            av[i] = static_cast<float>(h1_values[i]);
+            T accumulator = (T)0;
             #pragma clang loop unroll(full)
             for (uint slot = 0; slot < 8; ++slot) {
-                const uint assignment = assignment_base + slot;
-                inv_orders[slot] = uint(inverse_order[assignment]);
-                route_weight_values[slot] = float(route_weights[assignment]);
+                const uint sorted_row = inv_orders[slot];
+                const T weighted = (T)(
+                    (float)sorted[size_t(sorted_row) * GLUE_AXIS + feature]
+                    * route_weight_values[slot]);
+                accumulator = accumulator + weighted;
             }
+            bv[i] = static_cast<float>(accumulator);
+        }
+        """
 
-            float av[GLUE_NREADS];
-            float bv[GLUE_NREADS];
-            const vec<T, 4> h1_values =
-                *((const device vec<T, 4>*)(h1 + base));
+    /// ROUTE-STRIPE arm: lanes zero through seven own one route record each
+    /// and broadcast it, so a thread carries two registers instead of sixteen.
+    /// The walk turns slot-outer purely so each record is broadcast once per
+    /// slot rather than once per slot per feature; the four accumulators stay
+    /// independent and each still visits slots zero through seven in order,
+    /// against the same scalar addresses the frontier reads.
+    private static let expertTailChainStripeReduce = """
+        uint lane_inv_order = 0;
+        float lane_route_weight = 0.0f;
+        if (simd_lane_id < 8) {
+            const uint assignment = assignment_base + simd_lane_id;
+            lane_inv_order = uint(inverse_order[assignment]);
+            lane_route_weight = float(route_weights[assignment]);
+        }
+
+        float av[GLUE_NREADS];
+        float bv[GLUE_NREADS];
+        const vec<T, 4> h1_values =
+            *((const device vec<T, 4>*)(h1 + base));
+        T accumulators[GLUE_NREADS];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < GLUE_NREADS; i++) {
+            av[i] = static_cast<float>(h1_values[i]);
+            accumulators[i] = (T)0;
+        }
+        #pragma clang loop unroll(full)
+        for (uint slot = 0; slot < 8; ++slot) {
+            const uint sorted_row = simd_shuffle(lane_inv_order, slot);
+            const float route_weight = simd_shuffle(lane_route_weight, slot);
+            const size_t sorted_base =
+                size_t(sorted_row) * GLUE_AXIS + lid * GLUE_NREADS;
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint feature = lid * GLUE_NREADS + i;
-                av[i] = static_cast<float>(h1_values[i]);
-                T accumulator = (T)0;
-                #pragma clang loop unroll(full)
-                for (uint slot = 0; slot < 8; ++slot) {
-                    const uint sorted_row = inv_orders[slot];
-                    const T weighted = (T)(
-                        (float)sorted[size_t(sorted_row) * GLUE_AXIS + feature]
-                        * route_weight_values[slot]);
-                    accumulator = accumulator + weighted;
-                }
-                bv[i] = static_cast<float>(accumulator);
+                const T weighted = (T)(
+                    (float)sorted[sorted_base + i] * route_weight);
+                accumulators[i] = accumulators[i] + weighted;
             }
+        }
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < GLUE_NREADS; i++) {
+            bv[i] = static_cast<float>(accumulators[i]);
+        }
+        """
 
+    private static let expertTailChainTail = """
             float inv_a = 0;
             float inv_b = 0;
             glue_inv_rms2(
@@ -1009,10 +1061,34 @@ public enum Gemma4PrefillGlueV1 {
                     wn[j] * static_cast<T>(ov[i] * inv_n);
             }
             *((device vec<T, 4>*)(normed + base)) = normed_values;
-        """,
-        header: kernelHeader,
-        ensureRowContiguous: true
-    )
+        """
+
+    private static func makeExpertTailChainKernel(
+        name: String, reduce: String
+    ) -> MLXFast.MLXFastKernel {
+        MLXFast.metalKernel(
+            name: name,
+            inputNames: [
+                "sorted", "inverse_order", "route_weights", "h1",
+                "w1", "w2", "w3", "res2", "s", "wn",
+            ],
+            outputNames: ["out", "normed"],
+            source: expertTailChainHead + "\n" + reduce + "\n"
+                + expertTailChainTail,
+            header: kernelHeader,
+            ensureRowContiguous: true
+        )
+    }
+
+    private static let expertTailChainKernel: MLXFast.MLXFastKernel =
+        makeExpertTailChainKernel(
+            name: "gemma4_prefill_expert_unsort_tail_chain_2816_meta_vec4_v7",
+            reduce: expertTailChainArrayReduce)
+
+    private static let expertTailChainStripeKernel: MLXFast.MLXFastKernel =
+        makeExpertTailChainKernel(
+            name: "gemma4_prefill_expert_unsort_tail_chain_2816_route_stripe_v8",
+            reduce: expertTailChainStripeReduce)
 
     public static func branchTailChainedUnsort(
         h1: MLXArray,
@@ -1049,7 +1125,9 @@ public enum Gemma4PrefillGlueV1 {
         else { return nil }
 
         CBv2EngageMark.once("prefill-expert-tail-fuse")
-        let outputs = expertTailChainKernel(
+        let chain =
+            routeStripeEnabled ? expertTailChainStripeKernel : expertTailChainKernel
+        let outputs = chain(
             [
                 expert.sortedOutputs, expert.inverseOrder, expert.weights, h1,
                 w1, w2, w3, residual2, layerScalar, nextInputNormWeight,

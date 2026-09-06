@@ -1,6 +1,36 @@
 import Foundation
 import MLX
 
+// Stream immutable pair weight/affine operands one output row at a time.
+private enum Gemma4GUPairRowStreamV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_PAIR_ROWSTREAM_V1"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    static func applied(runCap: Int) -> Bool { enabled && runCap == 2 }
+
+    static func prepare(_ header: String, runCap: Int) -> String {
+        guard applied(runCap: runCap) else { return header }
+        let start = "template <typename T, const int group_size, const int bits>\nMETAL_FUNC void tg_qmv_affine4_g64_pair_impl("
+        precondition(header.components(separatedBy: start).count == 2, "pair row-stream start drift")
+        let begin = header.range(of: start)!.lowerBound
+        let end = header.range(of: "#if GU_RUN_CAP >= 3\n", range: begin..<header.endIndex)!.lowerBound
+        let range = begin..<end
+        var part = String(header[range])
+        func replace(_ old: String, _ new: String, count: Int) {
+            precondition(part.components(separatedBy: old).count == count + 1, "pair row-stream anchor drift")
+            part = part.replacingOccurrences(of: old, with: new)
+        }
+        replace("  thread uint packed[results_per_simdgroup];\n  thread float scale_local[results_per_simdgroup];\n  thread float bias_local[results_per_simdgroup];\n", "", count: 1)
+        replace("    for (int row = 0; row < results_per_simdgroup; row++) {\n      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));\n      scale_local[row] = scales[row * in_vec_size_g];\n      bias_local[row] = biases[row * in_vec_size_g];\n    }\n\n", "", count: 2)
+        replace("      float dot0;\n      float dot1;", "      const uint packed_word = *((const device uint*)(ws + row * in_vec_size_w));\n      const float scale_value = scales[row * in_vec_size_g];\n      const float bias_value = biases[row * in_vec_size_g];\n      float dot0;\n      float dot1;", count: 2)
+        replace("packed[row], x0_thread, x1_thread, scale_local[row], bias_local[row], sum0, sum1, dot0, dot1", "packed_word, x0_thread, x1_thread, scale_value, bias_value, sum0, sum1, dot0, dot1", count: 2)
+        return header.replacingCharacters(in: range, with: part)
+    }
+}
+
 /// B8 affine-4/group-64 expert gate/up with explicit BF16 closes before GeGLU.
 public enum Gemma4DecodeFusedGUV1 {
     static let enabled = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DECODE_FUSED_GEGLU"] != "0"
@@ -25,13 +55,17 @@ public enum Gemma4DecodeFusedGUV1 {
 
     static func call(x: MLXArray, storage: SwitchGateUpFusedStorage,
         lhs: MLXArray, rhs: MLXArray) -> MLXArray {
-        kernel([storage.weight, storage.scales, storage.biases, x, lhs, rhs],
+        if Gemma4GUPairRowStreamV1.applied(runCap: runCap) {
+            CBv2EngageMark.once("expert-gu-pair-rowstream")
+        }
+        return kernel([storage.weight, storage.scales, storage.biases, x, lhs, rhs],
             grid: (32, 176 * 2, 64), threadGroup: (32, 2, 1),
             outputShapes: [[64, 1, 704]], outputDTypes: [.bfloat16])[0]
     }
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_decode_gateup_geglu_threadgroup_v1",
+        name: "gemma4_b8_decode_gateup_geglu_threadgroup_v1"
+            + (Gemma4GUPairRowStreamV1.applied(runCap: runCap) ? "_pair_rowstream_v1" : ""),
         inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"],
         outputNames: ["y"],
         source: #"""
@@ -62,7 +96,7 @@ uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
     }
 
 """#,
-        header: "#define GU_RUN_CAP \(runCap)\n" + #"""
+        header: Gemma4GUPairRowStreamV1.prepare("#define GU_RUN_CAP \(runCap)\n" + #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helpers from 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -1147,5 +1181,5 @@ METAL_FUNC void tg_execute_projection(const device uint* w,const device T* scale
 }
 
 """#,
-        ensureRowContiguous: true)
+        runCap: runCap), ensureRowContiguous: true)
 }

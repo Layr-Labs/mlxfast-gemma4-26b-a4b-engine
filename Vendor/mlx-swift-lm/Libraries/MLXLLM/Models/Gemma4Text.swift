@@ -7525,14 +7525,6 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             sanitized["\(base).experts.switch_glu.up_proj.scales"] = storage.upScales
             sanitized["\(base).experts.switch_glu.up_proj.biases"] = storage.upBiases
             experts.switchGLU.bindFusedGateUpStorage(storage)
-            if let downWeight = sanitized["\(base).experts.switch_glu.down_proj.weight"],
-                let downScales = sanitized["\(base).experts.switch_glu.down_proj.scales"],
-                let downBiases = sanitized["\(base).experts.switch_glu.down_proj.biases"],
-                let downStorage = Gemma4DownTightGridV1.Storage(
-                    weight: downWeight, scales: downScales, biases: downBiases)
-            {
-                experts.switchGLU.bindTightDownStorage(downStorage)
-            }
         }
     }
 

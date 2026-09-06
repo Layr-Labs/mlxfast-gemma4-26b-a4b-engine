@@ -5,24 +5,6 @@ import MLX
 public enum Gemma4DecodeFusedGUV1 {
     static let enabled = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DECODE_FUSED_GEGLU"] != "0"
 
-    /// RUN-CAP SWEEP. The pair/triple/quad impls all inline into one kernel, so
-    /// register allocation is worst-case across every path -- proven by RUN-OCT,
-    /// where merely compiling an eight-stream path cost 9.1% even when unused.
-    /// Runs of three or more are only 14% of runs at real top-8-of-128 routing,
-    /// so the rarely-taken wide paths may be taxing the 86% that never run them.
-    /// This compiles OUT every impl above the cap.
-    /// DEFAULT 2. Measured single-worker under realistic top-8-of-128 routing:
-    ///   cap4 (incumbent) 0.002927 s/token, cap2 0.002660 = **+9.12%**, zero
-    ///   overlap across five alternating passes, tokens bit-identical.
-    /// Runs of three or more are only 14% of runs, but the triple and quad
-    /// impls inline into the same kernel, so their registers were charged to
-    /// the 86% of threadgroups that never execute them.
-    /// `DARKBLOOM_GEMMA4_GU_RUN_CAP=4` restores the incumbent.
-    static let runCap: Int = {
-        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_RUN_CAP"] ?? "2"
-        return Int(raw).map { min(max($0, 1), 4) } ?? 2
-    }()
-
     static func call(x: MLXArray, storage: SwitchGateUpFusedStorage,
         lhs: MLXArray, rhs: MLXArray) -> MLXArray {
         kernel([storage.weight, storage.scales, storage.biases, x, lhs, rhs],
@@ -31,7 +13,7 @@ public enum Gemma4DecodeFusedGUV1 {
     }
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_decode_gateup_geglu_threadgroup_v1",
+        name: "gemma4_b8_decode_gateup_geglu_cap2_limit64_v1",
         inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"],
         outputNames: ["y"],
         source: #"""
@@ -62,7 +44,8 @@ uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
     }
 
 """#,
-        header: "#define GU_RUN_CAP \(runCap)\n" + #"""
+        header: #"""
+#define GU_RUN_CAP 2
 // Copyright © 2023-2024 Apple Inc. Canonical helpers from 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -1145,6 +1128,8 @@ METAL_FUNC void tg_execute_projection(const device uint* w,const device T* scale
     tg_qmv_affine4_g64_quad_stream_impl<T,64,4>(w,scales,biases,x0,x1,x2,x3,y0,y1,y2,y3,guK,tid,sg,lane);
 #endif
 }
+
+[[max_total_threads_per_threadgroup(64)]]
 
 """#,
         ensureRowContiguous: true)

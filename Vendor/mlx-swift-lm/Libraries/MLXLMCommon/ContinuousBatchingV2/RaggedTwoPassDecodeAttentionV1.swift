@@ -4272,6 +4272,18 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         d512ParamsLock.unlock()
         return arr
     }
+    /// D512-INPUT-LIST-REUSE: each decode layer binds the same small set of
+    /// kernel argument vectors in sequence. Recycle one reserved Swift array
+    /// across those calls instead of allocating a fresh concatenation for
+    /// every dispatch. `DARKBLOOM_GEMMA4_D512_INPUT_LIST_REUSE=0` restores the
+    /// original per-dispatch concatenations. Default ON.
+    private static let inputListReuseEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_INPUT_LIST_REUSE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
 
     // MARK: NORMROPE-D512 / ORS-D512
 
@@ -6325,6 +6337,12 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         // rotates them itself and hands dispatch 1 its own `q_out`; the
         // registered fallback arrays are then never evaluated. A miss keeps
         // the WRITE-022 store byte for byte.
+        var reusableInputs: [MLXArray] = []
+        if inputListReuseEnabled {
+            reusableInputs.reserveCapacity(24)
+            CBv2EngageMark.once("d512-input-list-reuse")
+        }
+
         let storeFence: MLXArray
         let liveQueries: MLXArray
         var normalizedKeys: MLXArray? = nil
@@ -6333,95 +6351,210 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             let normRope = takeFullNormRope(
                 queries: queries, keys: keys, values: values)
         {
-            let stored = ringStoreNormRopeKernel(
-                keyBuffers + valueBuffers + [
-                    paramsArray,
-                    normRope.rawQueries,
-                    normRope.rawKeys,
-                    normRope.qWeight,
-                    normRope.kWeight,
-                    normRope.positionOffsets,
-                    normRope.ropeFrequencies,
-                    previousWriteFence,
-                ],
-                template: template,
-                grid: (128, 1, batch * kvHeads + batch * queryHeads),
-                threadGroup: (128, 1, 1),
-                outputShapes: [
-                    [1],
-                    [batch, queryHeads, 1, headDim],
-                    [batch, kvHeads, 1, headDim],
-                    [batch, kvHeads, 1, headDim],
-                ],
-                outputDTypes: [.int32, .bfloat16, .bfloat16, .bfloat16]
-            )
+            let stored: [MLXArray]
+            if inputListReuseEnabled {
+                reusableInputs.removeAll(keepingCapacity: true)
+                reusableInputs.append(contentsOf: keyBuffers)
+                reusableInputs.append(contentsOf: valueBuffers)
+                reusableInputs.append(paramsArray)
+                reusableInputs.append(normRope.rawQueries)
+                reusableInputs.append(normRope.rawKeys)
+                reusableInputs.append(normRope.qWeight)
+                reusableInputs.append(normRope.kWeight)
+                reusableInputs.append(normRope.positionOffsets)
+                reusableInputs.append(normRope.ropeFrequencies)
+                reusableInputs.append(previousWriteFence)
+                stored = ringStoreNormRopeKernel(
+                    reusableInputs,
+                    template: template,
+                    grid: (128, 1, batch * kvHeads + batch * queryHeads),
+                    threadGroup: (128, 1, 1),
+                    outputShapes: [
+                        [1],
+                        [batch, queryHeads, 1, headDim],
+                        [batch, kvHeads, 1, headDim],
+                        [batch, kvHeads, 1, headDim],
+                    ],
+                    outputDTypes: [.int32, .bfloat16, .bfloat16, .bfloat16]
+                )
+            } else {
+                stored = ringStoreNormRopeKernel(
+                    keyBuffers + valueBuffers + [
+                        paramsArray,
+                        normRope.rawQueries,
+                        normRope.rawKeys,
+                        normRope.qWeight,
+                        normRope.kWeight,
+                        normRope.positionOffsets,
+                        normRope.ropeFrequencies,
+                        previousWriteFence,
+                    ],
+                    template: template,
+                    grid: (128, 1, batch * kvHeads + batch * queryHeads),
+                    threadGroup: (128, 1, 1),
+                    outputShapes: [
+                        [1],
+                        [batch, queryHeads, 1, headDim],
+                        [batch, kvHeads, 1, headDim],
+                        [batch, kvHeads, 1, headDim],
+                    ],
+                    outputDTypes: [.int32, .bfloat16, .bfloat16, .bfloat16]
+                )
+            }
             storeFence = stored[0]
             liveQueries = stored[1]
             normalizedKeys = stored[2]
             normalizedValues = stored[3]
             CBv2EngageMark.once("d512-normrope-store")
         } else {
-            storeFence = ringStoreKernel(
-                keyBuffers + valueBuffers
-                    + [paramsArray, keys, values, previousWriteFence],
-                template: template,
-                grid: (128, 1, batch * kvHeads),
-                threadGroup: (128, 1, 1),
-                outputShapes: [[1]],
-                outputDTypes: [.int32]
-            )[0]
+            let stored: [MLXArray]
+            if inputListReuseEnabled {
+                reusableInputs.removeAll(keepingCapacity: true)
+                reusableInputs.append(contentsOf: keyBuffers)
+                reusableInputs.append(contentsOf: valueBuffers)
+                reusableInputs.append(paramsArray)
+                reusableInputs.append(keys)
+                reusableInputs.append(values)
+                reusableInputs.append(previousWriteFence)
+                stored = ringStoreKernel(
+                    reusableInputs,
+                    template: template,
+                    grid: (128, 1, batch * kvHeads),
+                    threadGroup: (128, 1, 1),
+                    outputShapes: [[1]],
+                    outputDTypes: [.int32]
+                )
+            } else {
+                stored = ringStoreKernel(
+                    keyBuffers + valueBuffers
+                        + [paramsArray, keys, values, previousWriteFence],
+                    template: template,
+                    grid: (128, 1, batch * kvHeads),
+                    threadGroup: (128, 1, 1),
+                    outputShapes: [[1]],
+                    outputDTypes: [.int32]
+                )
+            }
+            storeFence = stored[0]
             liveQueries = queries
         }
 
         let chunks = (keyLength + 63) / 64
-        let scores = qkFencedKernel(
-            [liveQueries] + keyBuffers + [paramsArray, storeFence],
-            template: template,
-            grid: (32, 4, batch * kvHeads * chunks),
-            threadGroup: (32, 4, 1),
-            outputShapes: [scratchShape],
-            outputDTypes: [.bfloat16]
-        )[0]
+        let scores: MLXArray
+        if inputListReuseEnabled {
+            reusableInputs.removeAll(keepingCapacity: true)
+            reusableInputs.append(liveQueries)
+            reusableInputs.append(contentsOf: keyBuffers)
+            reusableInputs.append(paramsArray)
+            reusableInputs.append(storeFence)
+            scores = qkFencedKernel(
+                reusableInputs,
+                template: template,
+                grid: (32, 4, batch * kvHeads * chunks),
+                threadGroup: (32, 4, 1),
+                outputShapes: [scratchShape],
+                outputDTypes: [.bfloat16]
+            )[0]
+        } else {
+            scores = qkFencedKernel(
+                [liveQueries] + keyBuffers + [paramsArray, storeFence],
+                template: template,
+                grid: (32, 4, batch * kvHeads * chunks),
+                threadGroup: (32, 4, 1),
+                outputShapes: [scratchShape],
+                outputDTypes: [.bfloat16]
+            )[0]
+        }
 
         let softmaxThreads = ((keyLength + 3) / 4 + 31) / 32 * 32
-        let probs = softmaxActive(
-            [scores, paramsArray],
-            template: template,
-            grid: (softmaxThreads * batch * queryHeads, 1, 1),
-            threadGroup: (softmaxThreads, 1, 1),
-            outputShapes: [scratchShape],
-            outputDTypes: [.bfloat16]
-        )[0]
+        let probs: MLXArray
+        if inputListReuseEnabled {
+            reusableInputs.removeAll(keepingCapacity: true)
+            reusableInputs.append(scores)
+            reusableInputs.append(paramsArray)
+            probs = softmaxActive(
+                reusableInputs,
+                template: template,
+                grid: (softmaxThreads * batch * queryHeads, 1, 1),
+                threadGroup: (softmaxThreads, 1, 1),
+                outputShapes: [scratchShape],
+                outputDTypes: [.bfloat16]
+            )[0]
+        } else {
+            probs = softmaxActive(
+                [scores, paramsArray],
+                template: template,
+                grid: (softmaxThreads * batch * queryHeads, 1, 1),
+                threadGroup: (softmaxThreads, 1, 1),
+                outputShapes: [scratchShape],
+                outputDTypes: [.bfloat16]
+            )[0]
+        }
+
 
         // ORS-D512: dispatch 3 also emits the o_proj run-sum table (or its
         // per-threadgroup pair partials) for the activation it stores.
         let output: MLXArray
         let oRunsum: MLXArray?
         if oRunsumFoldEnabled, softmaxVecEnabled {
-            let attended = avVecORunsumKernel(
-                [probs] + valueBuffers + [paramsArray],
-                template: template,
-                grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
-                threadGroup: (32, avSimdgroups, 1),
-                outputShapes: [
-                    [batch, queryHeads, 1, headDim],
-                    [batch, queryHeads * headDim / 64 * avORunsumPartials],
-                ],
-                outputDTypes: [.bfloat16, .float32]
-            )
+            let attended: [MLXArray]
+            if inputListReuseEnabled {
+                reusableInputs.removeAll(keepingCapacity: true)
+                reusableInputs.append(probs)
+                reusableInputs.append(contentsOf: valueBuffers)
+                reusableInputs.append(paramsArray)
+                attended = avVecORunsumKernel(
+                    reusableInputs,
+                    template: template,
+                    grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
+                    threadGroup: (32, avSimdgroups, 1),
+                    outputShapes: [
+                        [batch, queryHeads, 1, headDim],
+                        [batch, queryHeads * headDim / 64 * avORunsumPartials],
+                    ],
+                    outputDTypes: [.bfloat16, .float32]
+                )
+            } else {
+                attended = avVecORunsumKernel(
+                    [probs] + valueBuffers + [paramsArray],
+                    template: template,
+                    grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
+                    threadGroup: (32, avSimdgroups, 1),
+                    outputShapes: [
+                        [batch, queryHeads, 1, headDim],
+                        [batch, queryHeads * headDim / 64 * avORunsumPartials],
+                    ],
+                    outputDTypes: [.bfloat16, .float32]
+                )
+            }
             output = attended[0]
             oRunsum = attended[1]
             CBv2EngageMark.once(
                 avORunsumPartials == 1 ? "d512-ors-av-table" : "d512-ors-av-pairs")
         } else {
-            output = avActive(
-                [probs] + valueBuffers + [paramsArray],
-                template: template,
-                grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
-                threadGroup: (32, avSimdgroups, 1),
-                outputShapes: [[batch, queryHeads, 1, headDim]],
-                outputDTypes: [.bfloat16]
-            )[0]
+            if inputListReuseEnabled {
+                reusableInputs.removeAll(keepingCapacity: true)
+                reusableInputs.append(probs)
+                reusableInputs.append(contentsOf: valueBuffers)
+                reusableInputs.append(paramsArray)
+                output = avActive(
+                    reusableInputs,
+                    template: template,
+                    grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
+                    threadGroup: (32, avSimdgroups, 1),
+                    outputShapes: [[batch, queryHeads, 1, headDim]],
+                    outputDTypes: [.bfloat16]
+                )[0]
+            } else {
+                output = avActive(
+                    [probs] + valueBuffers + [paramsArray],
+                    template: template,
+                    grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
+                    threadGroup: (32, avSimdgroups, 1),
+                    outputShapes: [[batch, queryHeads, 1, headDim]],
+                    outputDTypes: [.bfloat16]
+                )[0]
+            }
             oRunsum = nil
         }
 

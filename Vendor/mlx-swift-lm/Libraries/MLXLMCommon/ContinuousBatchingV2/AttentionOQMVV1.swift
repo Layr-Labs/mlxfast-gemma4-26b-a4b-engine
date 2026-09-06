@@ -477,7 +477,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         to: mma8Rsp2KernelHeader, occurrences: 2)
 
     /// Selects the loop unroll directive on the o-projection run-sum group
-    /// loop: `#pragma clang loop unroll_count(4)` when on, the incumbent
+    /// loop: `#pragma clang loop unroll_count(2)` when on, the incumbent
     /// pragma when off. Loop order, addresses, and arithmetic are unchanged
     /// in both positions.
     ///
@@ -498,11 +498,11 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    private static let unroll4KeySuffix = unroll4Enabled ? "_ur4_58ef" : ""
+    private static let unroll4KeySuffix = unroll4Enabled ? "_ur2_58ef" : ""
 
     private static func applyOprojUr4(to header: String, occurrences: Int) -> String {
         let old = "#pragma unroll\n  for (int gi = 0; gi < nGroups; ++gi) {\n    const int g = g0 + gi;\n    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));"
-        let new = "#pragma clang loop unroll_count(4)" + old.dropFirst("#pragma unroll".count)
+        let new = "#pragma clang loop unroll_count(2)" + old.dropFirst("#pragma unroll".count)
         precondition(
             header.components(separatedBy: old).count == occurrences + 1,
             "ur4 anchor drift")

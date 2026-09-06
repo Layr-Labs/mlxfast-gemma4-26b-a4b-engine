@@ -120,7 +120,8 @@ inline float mma8_runsum4(uint4 r) {
 
 #define MMA8_SETB(BB, W, HI) BB.thread_elements()[0] = mma8_##HI<T>(r0.W); BB.thread_elements()[1] = mma8_##HI<T>(r1.W);
 
-#define MMA8_STEP(BB, J) A.thread_elements()[0] = float(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = float(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, BB, C);
+\(Gemma4MMA8HalfDequant.macro)
+#define MMA8_STEP(BB, J) A.thread_elements()[0] = MMA8_DQ(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = MMA8_DQ(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, BB, C);
 
 template <typename T, int KS, int KFIX>
 METAL_FUNC void qkv_mma8_affine4_g64_impl(

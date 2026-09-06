@@ -613,7 +613,8 @@ inline float mma8_runsum8(uint4 r) {
 // byte 0..255 and x is unscaled, exactly as the 8-bit `qdot` arm forms its
 // product; a bf16 x carries 8 significant bits and the code 8, so the product
 // needs at most 16 and is exact in fp32.
-#define MMA8_STEP8(BB, WLO, WHI, SH) A.thread_elements()[0] = float(extract_bits(wv.WLO, (SH), 8)); A.thread_elements()[1] = float(extract_bits(wv.WHI, (SH), 8)); simdgroup_multiply_accumulate(C, A, BB, C);
+\(Gemma4MMA8HalfDequant.macro)
+#define MMA8_STEP8(BB, WLO, WHI, SH) A.thread_elements()[0] = MMA8_DQ(extract_bits(wv.WLO, (SH), 8)); A.thread_elements()[1] = MMA8_DQ(extract_bits(wv.WHI, (SH), 8)); simdgroup_multiply_accumulate(C, A, BB, C);
 
 // x is [8, K] with K % 64 == 0, w is packed [N, K / 4] uint32 (one byte per
 // code, so the row stride is K bytes and K % 64 == 0 keeps every `uint4` load

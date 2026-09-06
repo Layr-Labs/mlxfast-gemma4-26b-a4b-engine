@@ -519,6 +519,46 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         return unroll4Enabled ? applyOprojUr4(to: base, occurrences: 2) : base
     }()
 
+    /// Supplies the output row stride at kernel selection instead of reading
+    /// it from the bound shape inside the body. `outputWidth` is a
+    /// compile-time constant here and the admission guard already requires
+    /// `weight.shape[0] == outputWidth`, so no admitted dispatch can present
+    /// any other value; the two forms agree on every element by construction.
+    ///
+    /// Applied to the FINAL header, after the carry and unroll rewrites, so
+    /// the selected body keeps both. Set the environment switch to 0 and the
+    /// bound-shape form is selected instead, byte for byte.
+    public static let staticNEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_OPROJ_STATIC_N"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
+    private static func applyOprojStaticN(to header: String, occurrences: Int)
+        -> String
+    {
+        var result = header
+        func replace(_ old: String, with new: String) {
+            precondition(
+                result.components(separatedBy: old).count == occurrences + 1,
+                "static-N anchor drift")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replace("    const int N,\n", with: "")
+        replace(
+            "  constexpr int K = KFIX;",
+            with: "  constexpr int N = \(outputWidth);\n  constexpr int K = KFIX;")
+        return result
+    }
+
+    private static let mma8StaticNHeader =
+        applyOprojStaticN(to: mma8RspHeader, occurrences: 2)
+
+    private static let mma8Rsp2StaticNHeader =
+        applyOprojStaticN(to: mma8Rsp2Header, occurrences: 3)
+
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_bfill_v4",
@@ -823,6 +863,60 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
         header: mma8Rsp2Header,
         ensureRowContiguous: true)
 
+    private static let mma8RspStaticNKernelK4096 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_rsp_staticn_v1"
+            + carry2KeySuffix + unroll4KeySuffix,
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            attention_o_qmv_mma8_affine4_g64_rsp<T, 2, 4096>(
+                w, scales, biases, x, rs_table, y,
+                int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8StaticNHeader,
+        ensureRowContiguous: true)
+
+    private static let mma8RspStaticNKernelK8192 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp_staticn_v1"
+            + carry2KeySuffix + unroll4KeySuffix,
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            attention_o_qmv_mma8_affine4_g64_rsp<T, 2, 8192>(
+                w, scales, biases, x, rs_table, y,
+                int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8StaticNHeader,
+        ensureRowContiguous: true)
+
+    private static let mma8Rsp2StaticNKernelK8192 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp2_staticn_v1"
+            + carry2KeySuffix + unroll4KeySuffix,
+        inputNames: ["x", "w", "scales", "biases", "rs_pairs"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            attention_o_qmv_mma8_affine4_g64_rsp2<T, 2, 8192>(
+                w, scales, biases, x, rs_pairs, y,
+                int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8Rsp2StaticNHeader,
+        ensureRowContiguous: true)
+
     @inline(__always)
     private static func liveInputWidth(_ width: Int) -> Bool {
         width == 4096 || width == 8192
@@ -887,6 +981,17 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
                     CBv2EngageMark.once("oproj-ur4")
                 }
                 CBv2EngageMark.once("d512-ors-oproj-pairs")
+                if staticNEnabled {
+                    CBv2EngageMark.once("oproj-static-n")
+                    return mma8Rsp2StaticNKernelK8192(
+                        [x, weight, scales, biases, rsPairTable!],
+                        template: [("T", x.dtype)],
+                        grid: (simdWidth, yTiles * simdGroups, 1),
+                        threadGroup: (simdWidth, simdGroups, 1),
+                        outputShapes: [[batch, sequence, outputWidth]],
+                        outputDTypes: [x.dtype]
+                    )[0]
+                }
                 return mma8Rsp2KernelK8192(
                     [x, weight, scales, biases, rsPairTable!],
                     template: [("T", x.dtype)],
@@ -902,6 +1007,19 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
                 }
                 if unroll4Enabled {
                     CBv2EngageMark.once("oproj-ur4")
+                }
+                if staticNEnabled {
+                    CBv2EngageMark.once("oproj-static-n")
+                    let staticNKernel = inDim == 8192
+                        ? mma8RspStaticNKernelK8192 : mma8RspStaticNKernelK4096
+                    return staticNKernel(
+                        [x, weight, scales, biases, rsTable!],
+                        template: [("T", x.dtype)],
+                        grid: (simdWidth, yTiles * simdGroups, 1),
+                        threadGroup: (simdWidth, simdGroups, 1),
+                        outputShapes: [[batch, sequence, outputWidth]],
+                        outputDTypes: [x.dtype]
+                    )[0]
                 }
                 let kernel = inDim == 8192 ? mma8RspKernelK8192 : mma8RspKernelK4096
                 return kernel(

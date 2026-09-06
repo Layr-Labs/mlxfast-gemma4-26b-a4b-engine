@@ -3303,6 +3303,27 @@ template <typename T, const int group_size, const int bits, bool batched>
     }
     // Pair adjacent cohort rows so each weight byte feeds both exact per-row
     // dot-product streams.
+    //
+    // ROUTER-WIDEGRID: pairing claims two of the batch rows per host x-group, so
+    // four of the eight dispatched x-groups retire immediately and only half
+    // the launched threadgroups carry work. On a wide plane that trade is
+    // right: the shared byte stream dominates. On a narrow plane it is not,
+    // because the plane is already too small to fill the part and the pair
+    // halves what little occupancy the grid provides. Below the floor the
+    // stock one-row-per-x-group body runs instead: every dispatched
+    // threadgroup carries work, and each output element keeps the same qdot,
+    // K-loop and simd_sum sequence the pair body preserves, so the two arms
+    // are bit-identical element for element.
+    //
+    // KILL SWITCH: set kGemma4QmvPairFloorN to 0 and every plane returns to
+    // the pair body byte for byte; nothing else in this tier was edited.
+    constexpr int kGemma4QmvPairFloorN = 256;
+    if (out_vec_size < kGemma4QmvPairFloorN) {
+      qmv_impl<T, group_size, bits>(
+          w, scales, biases, x, y, in_vec_size, out_vec_size,
+          tid, simd_gid, simd_lid);
+      return;
+    }
     const int first_m = int(tid.x) * 2;
     if (first_m >= 8) {
       return;

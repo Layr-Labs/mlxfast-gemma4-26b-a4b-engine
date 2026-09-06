@@ -1423,6 +1423,35 @@ public class SwitchGLU: Module {
     /// GATEUP-FUSE-PREFILL: the primary gate|up storage bound at load (nil
     /// when the layer is not the exact production geometry or the arm is
     /// off), and its once-resolved dispatch contract.
+    private var tightDownStorage: Gemma4DownTightGridV1.Storage?
+    private var tightDownResolved = false
+    private var tightDownContract = false
+
+    public func bindTightDownStorage(_ storage: Gemma4DownTightGridV1.Storage) {
+        tightDownStorage = storage
+        tightDownResolved = false
+        tightDownContract = false
+    }
+
+    private func tightDecodeDown(_ x: MLXArray, _ indices: MLXArray, sorted: Bool) -> MLXArray? {
+        guard Gemma4DownTightGridV1.enabled, sorted, let storage = tightDownStorage,
+            Gemma4DownTightGridV1.Storage.admits(x: x, indices: indices)
+        else { return nil }
+        if !tightDownResolved {
+            tightDownResolved = true
+            if let down = downProj as? QuantizedSwitchLinear {
+                tightDownContract = down.inputDims == 704 && down.outputDims == 2816
+                    && down.numExperts == 128 && down.groupSize == 64 && down.bits == 4
+                    && down.mode == .affine && down.bias == nil
+                    && down.weight.dtype == .uint32 && down.weight.shape == [128, 2816, 88]
+                    && down.scales.dtype == .bfloat16 && down.scales.shape == [128, 2816, 11]
+                    && down.biases?.dtype == .bfloat16 && down.biases?.shape == [128, 2816, 11]
+            }
+        }
+        guard tightDownContract else { return nil }
+        return storage.call(x: x, lhsIndices: switchDownIdentity64, indices: indices)
+    }
+
     private var fusedGateUpStorage: SwitchGateUpFusedStorage?
     private var fusedGateUpResolved = false
     private var fusedGateUpContract: (groupSize: Int, bits: Int, mode: QuantizationMode)?
@@ -1626,6 +1655,24 @@ public class SwitchGLU: Module {
             }
         }
 
+        // The existing B8 sort branch already validates [8, 2816] input
+        // and produces the [64] LHS/RHS planes. Retain its inverse order.
+        if Gemma4DecodeFusedGUV1.enabled, doSort, useLhsIndices,
+            inputDims == 2816, hiddenDims == 704, numExperts == 128,
+            weightedReductionProfile == .gemma4ProductionGeGLU,
+            activationProduct == nil, isGeluActivation,
+            MLXHardwareInfo.isCompiledDecodeSupported, switchGeluShapedFuseEnabled,
+            x.dtype == .bfloat16, idx.dtype == .uint32,
+            let lhsIndices, lhsIndices.dtype == .uint32,
+            let fused = fusedGateUpDispatch()
+        {
+            let activated = Gemma4DecodeFusedGUV1.call(
+                x: x, storage: fused.storage, lhs: lhsIndices, rhs: idx)
+            let output = tightDecodeDown(activated, idx, sorted: true)
+                ?? downProj(activated, idx, lhsIndices: switchDownIdentity64, sortedIndices: true)
+            return (output, inverseOrder, true)
+        }
+
         let xGate: MLXArray
         let xUp: MLXArray
         // PROMPT-GLUE (pg1): the routed-expert GeLU product computed straight
@@ -1702,7 +1749,8 @@ public class SwitchGLU: Module {
         // which otherwise materializes the same arange(64) on every call.
         let downLhs: MLXArray? =
             (doSort && idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
-        x = downProj(activated, idx, lhsIndices: downLhs, sortedIndices: doSort)
+        x = tightDecodeDown(activated, idx, sorted: doSort)
+            ?? downProj(activated, idx, lhsIndices: downLhs, sortedIndices: doSort)
         // Under `doSort` a producer above always assigned `inverseOrder`;
         // otherwise it is still nil, which is exactly what the old
         // `doSort ? inverseOrder : nil` produced.

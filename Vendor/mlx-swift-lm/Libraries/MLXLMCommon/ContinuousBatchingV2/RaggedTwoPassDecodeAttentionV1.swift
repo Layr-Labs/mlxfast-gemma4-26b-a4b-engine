@@ -1785,7 +1785,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp3_ey51_yrp1_ey130_ey186",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp3_ey51_yrp1_ey130_ey186_ey235",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -4875,8 +4875,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     private static let avColumnTiles: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_D512_AV_TILES"], let value = Int(raw)
-        else { return 16 }
-        return value == 8 || value == 16 ? value : 16
+        else { return 8 }
+        return value == 8 || value == 16 ? value : 8
     }()
 
     /// Columns one threadgroup of dispatch 3 owns, and the simdgroups it

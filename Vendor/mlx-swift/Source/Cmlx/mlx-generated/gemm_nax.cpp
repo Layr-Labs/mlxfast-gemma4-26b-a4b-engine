@@ -1373,7 +1373,8 @@ template <
 #define DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY 1
 #endif
 
-    typename AccumType = float>
+    typename AccumType = float,
+    bool kHostAligned = false>
 auto gemm_loop(
     const device T* A,
     const device T* B,
@@ -1403,7 +1404,9 @@ auto gemm_loop(
 
   STEEL_PRAGMA_NO_UNROLL
   for (int kk0 = 0; kk0 < gemm_k_iterations_; kk0++) {
-    threadgroup_barrier(mem_flags::mem_none);
+    if constexpr (!kHostAligned) {
+      threadgroup_barrier(mem_flags::mem_none);
+    }
     if constexpr (
         (DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY != 0) &&
         (!kAlignedM || !kAlignedN)) {
@@ -1554,7 +1557,8 @@ template <
     bool kAlignedM,
     bool kAlignedN,
     bool kAlignedK,
-    typename AccumType = float>
+    typename AccumType = float,
+    bool kHostAligned = false>
 auto gemm_loop_softmax(
     const device T* A,
     const device T* B,
@@ -1605,7 +1609,9 @@ auto gemm_loop_softmax(
 
   STEEL_PRAGMA_NO_UNROLL
   for (int kk0 = 0; kk0 < gemm_k_iterations_; kk0++) {
-    threadgroup_barrier(mem_flags::mem_none);
+    if constexpr (!kHostAligned) {
+      threadgroup_barrier(mem_flags::mem_none);
+    }
     if constexpr (
         (DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY != 0) &&
         (!kAlignedM || !kAlignedN)) {
@@ -1631,14 +1637,6 @@ auto gemm_loop_softmax(
         const short cmax = transpose_a ? sgp_sm : SK;
         Atile.load_safe(A + A_offset, lda, short2(cmax, rmax));
       }
-      softmax_transform_atile(
-          Atile,
-          sm_rmax,
-          sm_rinv,
-          sm_sc,
-          kAlignedM ? short(SM) : sgp_sm,
-          short(SK));
-
       if constexpr (kAlignedN) {
         Btile.load(B + B_offset, ldb);
       } else {
@@ -1646,6 +1644,14 @@ auto gemm_loop_softmax(
         const short cmax = transpose_b ? SK : sgp_sn;
         Btile.load_safe(B + B_offset, ldb, short2(cmax, rmax));
       }
+
+      softmax_transform_atile(
+          Atile,
+          sm_rmax,
+          sm_rinv,
+          sm_sc,
+          kAlignedM ? short(SM) : sgp_sm,
+          short(SK));
 
       tile_matmad_nax(
           Dtile,

@@ -305,11 +305,38 @@ template <
   dispatch_bool(align_K, [&](auto kAlignedK) {
     dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
       dispatch_bool(align_N || !is_unaligned_sn, [&](auto kAlignedN) {
-        bool loop_done = false;
-        if constexpr (kSoftmaxLoaderEligible) {
-          if (softmax_loader) {
-            // PREFILL-ATTN-TRAFFIC (at1): the softmax-in-loader twin.
-            Dtile = gemm_loop_softmax<
+        dispatch_bool(align_M && align_N, [&](auto kHostAligned) {
+          bool loop_done = false;
+          if constexpr (kSoftmaxLoaderEligible) {
+            if (softmax_loader) {
+              // PREFILL-ATTN-TRAFFIC (at1): the softmax-in-loader twin.
+              Dtile = gemm_loop_softmax<
+                  T,
+                  SM,
+                  SN,
+                  SK,
+                  BK,
+                  transpose_a,
+                  transpose_b,
+                  kAlignedM.value,
+                  kAlignedN.value,
+                  kAlignedK.value,
+                  AccumType,
+                  kHostAligned.value>(
+                  A,
+                  B,
+                  params->lda,
+                  params->ldb,
+                  params->K,
+                  params->gemm_k_iterations_aligned,
+                  sgp_sm,
+                  sgp_sn,
+                  sm_stats);
+              loop_done = true;
+            }
+          }
+          if (!loop_done) {
+            Dtile = gemm_loop<
                 T,
                 SM,
                 SN,
@@ -320,7 +347,8 @@ template <
                 kAlignedM.value,
                 kAlignedN.value,
                 kAlignedK.value,
-                AccumType>(
+                AccumType,
+                kHostAligned.value>(
                 A,
                 B,
                 params->lda,
@@ -328,33 +356,9 @@ template <
                 params->K,
                 params->gemm_k_iterations_aligned,
                 sgp_sm,
-                sgp_sn,
-                sm_stats);
-            loop_done = true;
+                sgp_sn);
           }
-        }
-        if (!loop_done) {
-          Dtile = gemm_loop<
-              T,
-              SM,
-              SN,
-              SK,
-              BK,
-              transpose_a,
-              transpose_b,
-              kAlignedM.value,
-              kAlignedN.value,
-              kAlignedK.value,
-              AccumType>(
-              A,
-              B,
-              params->lda,
-              params->ldb,
-              params->K,
-              params->gemm_k_iterations_aligned,
-              sgp_sm,
-              sgp_sn);
-        }
+        });
         if ((DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY == 0) ||
             ((kAlignedM.value || sgp_sm > 0) &&
              (kAlignedN.value || sgp_sn > 0))) {

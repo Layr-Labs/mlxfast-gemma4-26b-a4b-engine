@@ -1558,7 +1558,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         {
             let caches = eagerCaches(rowStates: rowStates)
             sampled = fusedModel.decodeArgmax(tokens: inputs, caches: caches)
-            cacheInnerState = eagerCacheInnerState(caches)
+            // The fused token remains a lazy root of the same decode graph, so
+            // it can use the compact proof path instead of every cache buffer.
+            cacheInnerState = eagerDecodeEvaluationRoots(caches, logitsRoot: sampled)
             stepLogprobs = nil
             fusedSampler.noteFusedGreedySample()
             if CBv2StepProfiler.enabled {

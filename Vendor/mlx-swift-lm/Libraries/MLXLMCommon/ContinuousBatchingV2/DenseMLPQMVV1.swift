@@ -997,6 +997,228 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         header: mma8GateUpGeluHeader,
         ensureRowContiguous: true)
 
+    /// DENSE-GEGLU-SHARED-B. `mma8GateUpGeluKernel` runs the accumulate body
+    /// TWICE from the same threadgroup -- once at `n0` for gate, once at
+    /// `n0 + 2112` for up -- and the two calls take the SAME `x`, `simd_gid`
+    /// and `simd_lid`, hence the same `g` range. Every x-side quantity of the
+    /// second call is therefore a bit-for-bit recomputation of the first's:
+    /// the two `uint4` activation loads, the two `mma8_runsum8` results, the
+    /// three xor-butterflies that broadcast them, and all eight `B` operands.
+    /// Only `wv`, `s` and `b` differ between the planes.
+    ///
+    /// This arm runs ONE `g` walk that fills each `B_j` once and issues two
+    /// `simdgroup_multiply_accumulate` against it -- gate's `C` then up's `CU`.
+    /// Per lane per group it removes 2 `uint4` x loads, 2 `mma8_runsum8`
+    /// (~32 issue slots), 3 butterflies and 8 `MMA8_SETB` casts, and it drops
+    /// one threadgroup-barrier round per column pair.
+    ///
+    /// EXACT by construction. `C` still accumulates `B0..B7` in that order and
+    /// `CU` likewise; `acc0/acc1` and `accu0/accu1` still accumulate ascending
+    /// `g`; each close is still the reference's `s * C + rs * b` with the same
+    /// `rs`; the KS = 2 join is still simdgroup 0's partial plus simdgroup 1's,
+    /// in that order. No product, addend or rounding changes -- the arm deletes
+    /// a recomputation, it does not reassociate one.
+    ///
+    /// `DARKBLOOM_GEMMA4_DENSE_SHAREDB=0` restores
+    /// `cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_gelu_k2816_v1` and its
+    /// source text byte for byte in the same binary.
+    public static let sharedBEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DENSE_SHAREDB"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
+    /// Derived from `mma8GateUpStaticKHeader`, not from `mma8GateUpGeluHeader`:
+    /// the dual body changes the close and the store, so it splices the
+    /// pre-epilogue text and appends its own GeGLU tape.
+    private static let mma8GateUpGeluSharedBHeader: String = {
+        var result = mma8GateUpStaticKHeader
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(
+                result.components(separatedBy: old).count == 2,
+                "mma8GateUpGeluSharedBHeader: pattern not found exactly once")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        // The dual step: same A fill and same MMA as `MMA8_STEP8`, run once
+        // for the gate codes in `wv` and once for the up codes in `wu`, both
+        // against the B operand the caller just filled.
+        replaceOnce(
+            "#define MMA8_STEP8(BB, WLO, WHI, SH) A.thread_elements()[0]"
+                + " = float(extract_bits(wv.WLO, (SH), 8));"
+                + " A.thread_elements()[1]"
+                + " = float(extract_bits(wv.WHI, (SH), 8));"
+                + " simdgroup_multiply_accumulate(C, A, BB, C);",
+            with: "#define MMA8_STEP8(BB, WLO, WHI, SH) A.thread_elements()[0]"
+                + " = float(extract_bits(wv.WLO, (SH), 8));"
+                + " A.thread_elements()[1]"
+                + " = float(extract_bits(wv.WHI, (SH), 8));"
+                + " simdgroup_multiply_accumulate(C, A, BB, C);\n"
+                + "\n#define MMA8_STEP8D(BB, WLO, WHI, SH)"
+                + " A.thread_elements()[0]"
+                + " = float(extract_bits(wv.WLO, (SH), 8));"
+                + " A.thread_elements()[1]"
+                + " = float(extract_bits(wv.WHI, (SH), 8));"
+                + " simdgroup_multiply_accumulate(C, A, BB, C);"
+                + " A.thread_elements()[0]"
+                + " = float(extract_bits(wu.WLO, (SH), 8));"
+                + " A.thread_elements()[1]"
+                + " = float(extract_bits(wu.WHI, (SH), 8));"
+                + " simdgroup_multiply_accumulate(CU, A, BB, CU);")
+        replaceOnce(
+            "gemma4_qmv_mma8_affine8_g64_gateup_k2816_impl(",
+            with: "gemma4_qmv_mma8_affine8_g64_gateup_k2816_dual(")
+        replaceOnce("    device T* y,\n    const int N,\n", with: "")
+        replaceOnce(
+            "    uint simd_lid) {",
+            with: "    uint simd_lid,\n"
+                + "    thread float& o0,\n"
+                + "    thread float& o1,\n"
+                + "    thread float& o2,\n"
+                + "    thread float& o3) {")
+        // The up plane is the second 2112 rows of the joined gate|up storage,
+        // so `n0 + 2112 + c.fm` is `wrow` advanced by exactly 2112 rows. K and
+        // G are compile-time here, so these are the same addresses the second
+        // call formed from `n0 + 2112`.
+        replaceOnce(
+            "  const device T* x0 = x + c.fn * K + 8 * c.fm;",
+            with: "  const device uint8_t* wu_row = wrow + 2112 * K;\n"
+                + "  const device T* su_row = srow + 2112 * G;\n"
+                + "  const device T* bu_row = brow + 2112 * G;\n"
+                + "  const device T* x0 = x + c.fn * K + 8 * c.fm;")
+        replaceOnce(
+            "  float acc0 = 0.0f;\n  float acc1 = 0.0f;",
+            with: "  float acc0 = 0.0f;\n  float acc1 = 0.0f;\n"
+                + "  float accu0 = 0.0f;\n  float accu1 = 0.0f;")
+        replaceOnce(
+            "    const uint4 wv = *((const device uint4*)(wrow + 64 * g));\n"
+                + "    const float s = float(srow[g]);\n"
+                + "    const float b = float(brow[g]);\n"
+                + "\n"
+                + "    simdgroup_float8x8 C = simdgroup_float8x8(0.0f);",
+            with: "    const uint4 wv = *((const device uint4*)(wrow + 64 * g));\n"
+                + "    const float s = float(srow[g]);\n"
+                + "    const float b = float(brow[g]);\n"
+                + "    const uint4 wu = *((const device uint4*)(wu_row + 64 * g));\n"
+                + "    const float su = float(su_row[g]);\n"
+                + "    const float bu = float(bu_row[g]);\n"
+                + "\n"
+                + "    simdgroup_float8x8 C = simdgroup_float8x8(0.0f);\n"
+                + "    simdgroup_float8x8 CU = simdgroup_float8x8(0.0f);")
+        replaceOnce(
+            "    MMA8_SETB(B0, x, lo)\n"
+                + "    MMA8_STEP8(B0, x, z, 0)\n"
+                + "    MMA8_SETB(B1, x, hi)\n"
+                + "    MMA8_STEP8(B1, x, z, 8)\n"
+                + "    MMA8_SETB(B2, y, lo)\n"
+                + "    MMA8_STEP8(B2, x, z, 16)\n"
+                + "    MMA8_SETB(B3, y, hi)\n"
+                + "    MMA8_STEP8(B3, x, z, 24)\n"
+                + "    MMA8_SETB(B4, z, lo)\n"
+                + "    MMA8_STEP8(B4, y, w, 0)\n"
+                + "    MMA8_SETB(B5, z, hi)\n"
+                + "    MMA8_STEP8(B5, y, w, 8)\n"
+                + "    MMA8_SETB(B6, w, lo)\n"
+                + "    MMA8_STEP8(B6, y, w, 16)\n"
+                + "    MMA8_SETB(B7, w, hi)\n"
+                + "    MMA8_STEP8(B7, y, w, 24)",
+            with: "    MMA8_SETB(B0, x, lo)\n"
+                + "    MMA8_STEP8D(B0, x, z, 0)\n"
+                + "    MMA8_SETB(B1, x, hi)\n"
+                + "    MMA8_STEP8D(B1, x, z, 8)\n"
+                + "    MMA8_SETB(B2, y, lo)\n"
+                + "    MMA8_STEP8D(B2, x, z, 16)\n"
+                + "    MMA8_SETB(B3, y, hi)\n"
+                + "    MMA8_STEP8D(B3, x, z, 24)\n"
+                + "    MMA8_SETB(B4, z, lo)\n"
+                + "    MMA8_STEP8D(B4, y, w, 0)\n"
+                + "    MMA8_SETB(B5, z, hi)\n"
+                + "    MMA8_STEP8D(B5, y, w, 8)\n"
+                + "    MMA8_SETB(B6, w, lo)\n"
+                + "    MMA8_STEP8D(B6, y, w, 16)\n"
+                + "    MMA8_SETB(B7, w, hi)\n"
+                + "    MMA8_STEP8D(B7, y, w, 24)")
+        replaceOnce(
+            "    acc0 += s * C.thread_elements()[0] + rs.x * b;\n"
+                + "    acc1 += s * C.thread_elements()[1] + rs.y * b;",
+            with: "    acc0 += s * C.thread_elements()[0] + rs.x * b;\n"
+                + "    acc1 += s * C.thread_elements()[1] + rs.y * b;\n"
+                + "    accu0 += su * CU.thread_elements()[0] + rs.x * bu;\n"
+                + "    accu1 += su * CU.thread_elements()[1] + rs.y * bu;")
+        // `red` is 64 float2 in this arm: slots 0..31 carry gate, 32..63 up.
+        replaceOnce(
+            "    if (simd_gid == 1) {\n"
+                + "      red[simd_lid] = float2(acc0, acc1);\n"
+                + "    }\n"
+                + "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+                + "    if (simd_gid == 1) {\n"
+                + "      return;\n"
+                + "    }\n"
+                + "    const float2 other = red[simd_lid];\n"
+                + "    acc0 = acc0 + other.x;\n"
+                + "    acc1 = acc1 + other.y;",
+            with: "    if (simd_gid == 1) {\n"
+                + "      red[simd_lid] = float2(acc0, acc1);\n"
+                + "      red[32 + simd_lid] = float2(accu0, accu1);\n"
+                + "    }\n"
+                + "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+                + "    if (simd_gid == 1) {\n"
+                + "      return;\n"
+                + "    }\n"
+                + "    const float2 other = red[simd_lid];\n"
+                + "    acc0 = acc0 + other.x;\n"
+                + "    acc1 = acc1 + other.y;\n"
+                + "    const float2 otheru = red[32 + simd_lid];\n"
+                + "    accu0 = accu0 + otheru.x;\n"
+                + "    accu1 = accu1 + otheru.y;")
+        replaceOnce(
+            "  y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);\n"
+                + "  y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);",
+            with: "  o0 = acc0;\n  o1 = acc1;\n  o2 = accu0;\n  o3 = accu1;")
+        // Character-for-character the tape `mma8GateUpGeluHeader` appends.
+        result += "\n"
+            + "template <typename T>\n"
+            + "inline T gemma4_dense_geglu_tape(T gate, T up) {\n"
+            + "  const T c0 = static_cast<T>(static_cast<T>(0.044715f) * gate);\n"
+            + "  const T c1 = static_cast<T>(c0 * gate);\n"
+            + "  const T c2 = static_cast<T>(c1 * gate);\n"
+            + "  const T inner = static_cast<T>(gate + c2);\n"
+            + "  const T scaled ="
+            + " static_cast<T>(static_cast<T>(0.7978845608028654f) * inner);\n"
+            + "  const T curved = metal::precise::tanh(scaled);\n"
+            + "  const T shifted = static_cast<T>(static_cast<T>(1.0f) + curved);\n"
+            + "  const T half_gate = static_cast<T>(static_cast<T>(0.5f) * gate);\n"
+            + "  const T gelu = static_cast<T>(half_gate * shifted);\n"
+            + "  return static_cast<T>(gelu * up);\n"
+            + "}\n"
+        return result
+    }()
+
+    private static let mma8GateUpGeluSharedBKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_gelu_k2816_sharedb_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            const int n0 = int(tid.y) * 8;
+            float g0 = 0.0f, g1 = 0.0f, u0 = 0.0f, u1 = 0.0f;
+            gemma4_qmv_mma8_affine8_g64_gateup_k2816_dual<T, 2>(
+                w, scales, biases, x, n0, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup, g0, g1, u0, u1);
+            if (simdgroup_index_in_threadgroup == 0) {
+              const mma8_coord c = mma8_lane(thread_index_in_simdgroup);
+              y[c.fn * 2112 + n0 + c.fm] = gemma4_dense_geglu_tape<T>(
+                  static_cast<T>(g0), static_cast<T>(u0));
+              y[(c.fn + 1) * 2112 + n0 + c.fm] = gemma4_dense_geglu_tape<T>(
+                  static_cast<T>(g1), static_cast<T>(u1));
+            }
+            """,
+        header: mma8GateUpGeluSharedBHeader,
+        ensureRowContiguous: true)
+
     /// ON by default. Measured over 30 ABBA-interleaved rounds: **+0.364%
     /// decode, faster in 27 of 30, tokens bit-identical** (paired per-round
     /// mean, SE 0.163%). Kill switch:
@@ -1031,6 +1253,17 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         else { return nil }
         CBv2EngageMark.once("dense-gelu-epilogue-decode")
         let yTiles = 2112 / outputsPerGroup
+        if sharedBEnabled {
+            CBv2EngageMark.once("dense-geglu-sharedb")
+            return mma8GateUpGeluSharedBKernel(
+                [x, weight, scales, biases],
+                template: [("T", x.dtype)],
+                grid: (simdWidth, yTiles * simdGroups, 1),
+                threadGroup: (simdWidth, simdGroups, 1),
+                outputShapes: [[batch, sequence, 2112]],
+                outputDTypes: [x.dtype]
+            )[0]
+        }
         return mma8GateUpGeluKernel(
             [x, weight, scales, biases],
             template: [("T", x.dtype)],

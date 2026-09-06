@@ -127,6 +127,19 @@ internal func resolveGemma4PrefillChunkEvalLayers(_ raw: String?) -> Int {
 private let gemma4PrefillChunkEvalLayers = resolveGemma4PrefillChunkEvalLayers(
     ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL"])
 
+/// Bound live prefill intermediates on the low-memory startup profile.
+/// Unlike async submission this waits for a layer to finish before building
+/// the next one, preserving its operations and every input/output row.
+private let gemma4LowMemoryPrefillFence: Bool = {
+    let profile = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_STARTUP_MEMORY_PROFILE"]?.lowercased()
+    if profile == "full" { return false }
+    return profile == "low" || ProcessInfo.processInfo.physicalMemory < (UInt64(64) << 30)
+}()
+
+private let gemma4MemoryTrace = ProcessInfo.processInfo.environment[
+    "DARKBLOOM_GEMMA4_MEMORY_TRACE"] == "1"
+
 /// Submission cadence used when a prompt pass is long enough to run on the
 /// blocked-query prefill path. The documented 18-layer serving default, the
 /// zero kill switch and every explicit non-default tuning value are preserved;
@@ -7260,7 +7273,13 @@ public class Gemma4TextModelInner: Module {
             }
 
             let layerNumber = idx + 1
-            if gemma4ShouldSubmitPrefillChunkEval(
+            if gemma4LowMemoryPrefillFence && inputLength >= 128 {
+                eval(h)
+                Memory.clearCache()
+                if gemma4MemoryTrace {
+                    fputs("gemma4: prefill layer=\(layerNumber) batch=\(inputBatchSize) length=\(inputLength) active=\(Memory.activeMemory >> 20) MiB peak=\(Memory.peakMemory >> 20) MiB\n", stderr)
+                }
+            } else if gemma4ShouldSubmitPrefillChunkEval(
                 schedulePrefill: schedulePrefill,
                 isCBv2: isCBv2,
                 inputLength: inputLength,

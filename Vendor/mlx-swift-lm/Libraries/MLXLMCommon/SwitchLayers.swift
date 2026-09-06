@@ -1305,7 +1305,8 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
 /// and portable 32-column tile own complete pairs without cross-threadgroup
 /// exchange. Decode and speculative verification still require contiguous
 /// split matrices, so the loaded gate/up arrays remain their primary storage
-/// and the paired prefill plane is one additional load-time copy. It contains
+/// and the paired prefill plane is one additional copy. Full-memory profiles
+/// retain it; low-memory profiles rebuild it for each use. It contains
 /// the same frozen quantized bytes; no weight is re-quantized or represented in
 /// another numerical format.
 ///
@@ -1341,11 +1342,19 @@ public let switchGateUpFusePrefillEnabled: Bool = {
 /// plain final class (not a `Module`, not an `MLXArray` tuple) so the module
 /// reflection that enumerates parameters treats it as an opaque value: it is
 /// never a parameter in its own right, never quantized again, never saved and
-/// never updated. Built once at load, retained for the life of the layer.
+/// never updated. The original split arrays are retained for the layer's life;
+/// the low-memory profile lets the packed operands retire after each use.
 public final class SwitchGateUpFusedStorage {
-    public let weight: MLXArray
-    public let scales: MLXArray
-    public let biases: MLXArray
+    private let retainedPlanes: (weight: MLXArray, scales: MLXArray, biases: MLXArray)?
+    public var weight: MLXArray {
+        retainedPlanes?.weight ?? Self.paired16(gateWeight, upWeight, tail: 352)
+    }
+    public var scales: MLXArray {
+        retainedPlanes?.scales ?? Self.paired16(gateScales, upScales, tail: 44)
+    }
+    public var biases: MLXArray {
+        retainedPlanes?.biases ?? Self.paired16(gateBiases, upBiases, tail: 44)
+    }
     public let gateWeight: MLXArray
     public let gateScales: MLXArray
     public let gateBiases: MLXArray
@@ -1353,6 +1362,20 @@ public final class SwitchGateUpFusedStorage {
     public let upScales: MLXArray
     public let upBiases: MLXArray
     public let hiddenDims: Int
+
+    private static let retainPackedPlanes: Bool = {
+        let profile = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_STARTUP_MEMORY_PROFILE"]?.lowercased()
+        if profile == "full" { return true }
+        return profile != "low" && ProcessInfo.processInfo.physicalMemory >= (UInt64(64) << 30)
+    }()
+
+    private static func paired16(_ gate: MLXArray, _ up: MLXArray, tail: Int) -> MLXArray {
+        let gateBlocks = gate.reshaped(128, 44, 16, tail)
+        let upBlocks = up.reshaped(128, 44, 16, tail)
+        return MLX.stacked([gateBlocks, upBlocks], axis: 2)
+            .reshaped(128, 1408, tail)
+    }
 
     /// Exact production geometry only: two packed affine 4-bit / group-64
     /// planes of 2816 -> 704 over 128 experts, `[128, 704, 352]` uint32 with
@@ -1376,15 +1399,18 @@ public final class SwitchGateUpFusedStorage {
         // Pair one 16-column gate block with the matching up block. Both the
         // NAX 64-column tile and portable 32-column tile then own complete
         // gate/up pairs and can close GeGLU without cross-group exchange.
-        func paired16(_ gate: MLXArray, _ up: MLXArray, tail: Int) -> MLXArray {
-            let gateBlocks = gate.reshaped(128, n / 16, 16, tail)
-            let upBlocks = up.reshaped(128, n / 16, 16, tail)
-            return MLX.stacked([gateBlocks, upBlocks], axis: 2)
-                .reshaped(128, n * 2, tail)
+        // The packed operands duplicate ~272 MiB of each layer's original
+        // quantized bytes (~8 GiB over this model). Small machines build the
+        // same operands per use, so the prefill layer fence can retire them.
+        // Full-memory machines retain the existing lifetime cache.
+        if Self.retainPackedPlanes {
+            retainedPlanes = (
+                Self.paired16(gateWeight, upWeight, tail: 352),
+                Self.paired16(gateScales, upScales, tail: 44),
+                Self.paired16(gateBiases, upBiases, tail: 44))
+        } else {
+            retainedPlanes = nil
         }
-        self.weight = paired16(gateWeight, upWeight, tail: 352)
-        self.scales = paired16(gateScales, upScales, tail: 44)
-        self.biases = paired16(gateBiases, upBiases, tail: 44)
         self.gateWeight = gateWeight
         self.gateScales = gateScales
         self.gateBiases = gateBiases

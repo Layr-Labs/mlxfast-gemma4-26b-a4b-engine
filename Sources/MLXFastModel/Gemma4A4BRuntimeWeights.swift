@@ -98,6 +98,22 @@ public final class Gemma4A4BRuntimeWeightCache {
         self.config = config
 
         let startupEnvironment = ProcessInfo.processInfo.environment
+        var lowMemoryStartup = false
+        // Apply the existing low-memory budgets before loadLibraryModel makes
+        // its first MLX allocations. The phase-start cache clear happens only
+        // after this constructor's model load and warmup have finished.
+        if config.numHiddenLayers >= 16 {
+            let policy = RuntimeStartupMemoryPolicy.resolve(
+                physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
+                requestedProfile: startupEnvironment[
+                    RuntimeStartupMemoryPolicy.profileOverrideEnvironmentName
+                ]
+            )
+            if policy.isLowMemory {
+                lowMemoryStartup = true
+                policy.apply()
+            }
+        }
         if config.numHiddenLayers >= 16,
            RuntimeStartupMemoryPolicy.gemma4MTPFullProfileCommandBufferGateIsOpen(
                physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
@@ -116,10 +132,11 @@ public final class Gemma4A4BRuntimeWeightCache {
 
         do {
             let model = try Self.loadLibraryModel(
-                denseStore: loader.denseStore, config: config)
+                denseStore: loader.denseStore, config: config,
+                lowMemoryStartup: lowMemoryStartup)
             libraryModel = model
             loadError = nil
-            Self.warmLibraryModel(model, config: config)
+            Self.warmLibraryModel(model, config: config, lowMemoryStartup: lowMemoryStartup)
         } catch {
             libraryModel = nil
             loadError = error
@@ -153,7 +170,8 @@ public final class Gemma4A4BRuntimeWeightCache {
     /// strict parameter update -> eval.
     private static func loadLibraryModel(
         denseStore: DenseTensorStore,
-        config: Gemma4A4BConfig
+        config: Gemma4A4BConfig,
+        lowMemoryStartup: Bool
     ) throws -> Gemma4TextModel {
         let directory = URL(fileURLWithPath: denseStore.weightsPath)
         let configData = try Data(
@@ -203,7 +221,23 @@ public final class Gemma4A4BRuntimeWeightCache {
             parameters: ModuleParameters.unflattened(sanitized),
             verify: [.all]
         )
-        eval(model)
+        if lowMemoryStartup {
+            // Materialize one parameter graph at a time so concatenating one
+            // layer's expert planes can retire its source buffers before the
+            // next layer is loaded. The arrays and their operations are the
+            // same as the full-model eval; only evaluation boundaries differ.
+            fputs("mlxfast: materializing low-memory model parameters\n", stderr)
+            for (_, parameter) in model.parameters().flattened().sorted(by: { $0.0 < $1.0 }) {
+                eval(parameter)
+                Memory.clearCache()
+            }
+            fputs(
+                "mlxfast: model materialized: active=\(Memory.activeMemory >> 20) MiB "
+                    + "cache=\(Memory.cacheMemory >> 20) MiB "
+                    + "peak=\(Memory.peakMemory >> 20) MiB\n", stderr)
+        } else {
+            eval(model)
+        }
         return model
     }
 
@@ -293,8 +327,20 @@ public final class Gemma4A4BRuntimeWeightCache {
     /// throwaway cache, evaluated and discarded. Inputs are constant BOS
     /// tokens, so this is prompt-independent and cannot affect model output.
     private static func warmLibraryModel(
-        _ model: Gemma4TextModel, config: Gemma4A4BConfig
+        _ model: Gemma4TextModel, config: Gemma4A4BConfig, lowMemoryStartup: Bool
     ) {
+        // Warmup retains compiled pipelines, not these temporary buffers.
+        // On small machines return freed allocations immediately while warming
+        // the same shapes, then restore the normal runtime cache budget.
+        let runtimeCacheLimit = Memory.cacheLimit
+        if lowMemoryStartup {
+            Memory.cacheLimit = 0
+            Memory.clearCache()
+            fputs("mlxfast: warming model with temporary allocator cache disabled\n", stderr)
+        }
+        defer {
+            if lowMemoryStartup { Memory.cacheLimit = runtimeCacheLimit }
+        }
         let bosToken = Int32(config.bosTokenId)
         let caches = model.newCache(parameters: nil)
         let prefillTokens = MLXArray(
@@ -303,12 +349,18 @@ public final class Gemma4A4BRuntimeWeightCache {
         )
         eval(model(prefillTokens, cache: caches))
         eval(model(MLXArray([bosToken], [1, 1]), cache: caches))
+        if lowMemoryStartup {
+            fputs("mlxfast: single-stream warm complete: active=\(Memory.activeMemory >> 20) MiB\n", stderr)
+        }
         warmCohortShapes(model, config: config)
         // Retire the warm's own buffers HERE, unscored: the trusted
         // phase-start clearCache runs inside the charged window, so any
         // free buffers the warm leaves behind would be deallocated on the
         // measured clock.
         Memory.clearCache()
+        if lowMemoryStartup {
+            fputs("mlxfast: cohort warm complete: active=\(Memory.activeMemory >> 20) MiB peak=\(Memory.peakMemory >> 20) MiB\n", stderr)
+        }
     }
 
     /// Prompt-independent constructor warmup at the scored B=8 cohort shapes.

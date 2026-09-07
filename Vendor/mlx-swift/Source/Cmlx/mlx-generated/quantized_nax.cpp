@@ -1644,6 +1644,45 @@ METAL_FUNC void gather_rhs_mma_frag_row(
 #define DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE 1
 #endif
 
+// DARKBLOOM GEMMA4 NAX GATHER-RHS SIMDGROUP K-STEP NARROWING.
+// affine_gather_qmm_rhs_nax walks each BK-wide weight block in SK-wide
+// simdgroup steps. SK sets TK = SK / 16, which is the fragment-column count
+// of BOTH per-step register tiles: the A tile is NAXTile<T, TM, TK> and the B
+// tile is NAXTile<T, TN, TK> on the transposed arm. At the shipped SK of 32
+// that is TK = 2, so the two tiles together hold (TM + TN) * 2 fragments of
+// live registers across every MMA in the step.
+//
+// Narrowing SK to 16 makes TK = 1 and halves that register footprint. The
+// kk1 loop runs BK / SK iterations instead of BK / (2 * SK), so the same
+// fragments are loaded in the same order -- just one per iteration rather
+// than two -- and the loop is already STEEL_PRAGMA_NO_UNROLL, so neither
+// form is unrolled into the other.
+//
+// EXACTNESS. The k values an output element accumulates over, and the order
+// it accumulates them in, are unchanged. tile_matmad_nax and
+// gather_rhs_mma_frag_row both walk kk = 0 .. TK-1 innermost for a fixed
+// fragment, and the kk1 loop walks blocks of SK in increasing k. At SK = 32
+// a BK of 64 issues k fragments (0, 16) then (32, 48); at SK = 16 it issues
+// 0, then 16, then 32, then 48. Same sequence, same accumulator, same
+// operands, same fragment addresses -- SK enters the A address only as
+// xn + kk1 and the B address only as + kk1, both of which enumerate the same
+// multiples of 16 either way. Nothing is reassociated, added or removed.
+//
+// The unaligned-K tail keeps its own bound: psk = min(SK, BK - kk1) shrinks
+// with SK and still covers exactly the same columns across the whole tail.
+// BK is 64 on every dispatch this kernel takes and 16 divides it, so no
+// partial simdgroup step is introduced.
+//
+// This is register-negative work on the kernel that carries the routed
+// expert gate|up and down GEMMs, which together are the largest single block
+// of the prompt forward. Kill switch: build with
+// -DDARKBLOOM_GEMMA4_NAX_GATHER_SK16=0 and SK folds back to the shipped 32,
+// reproducing the incumbent expressions byte for byte. Independent of the
+// row-strip tiling switch and of the volatile-fence elide.
+#ifndef DARKBLOOM_GEMMA4_NAX_GATHER_SK16
+#define DARKBLOOM_GEMMA4_NAX_GATHER_SK16 1
+#endif
+
 template <
     typename T,
     int group_size,
@@ -1737,7 +1776,10 @@ template <
 
   constexpr short SM = BM / SGM;
   constexpr short SN = BN / SGN;
-  constexpr short SK = 32;
+  // See the note on DARKBLOOM_GEMMA4_NAX_GATHER_SK16 above: this halves TK,
+  // and therefore the live A and B fragment count, without moving any k.
+  constexpr short SK = (DARKBLOOM_GEMMA4_NAX_GATHER_SK16 != 0) ? 16 : 32;
+  static_assert(SK >= 16 && (SK % 16) == 0, "SK must be a fragment multiple");
 
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;

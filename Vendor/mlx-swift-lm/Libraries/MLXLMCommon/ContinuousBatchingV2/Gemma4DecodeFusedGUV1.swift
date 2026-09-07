@@ -25,6 +25,21 @@ public enum Gemma4DecodeFusedGUV1 {
         return Int(raw).map { min(max($0, 1), 4) } ?? 2
     }()
 
+    /// GU-SWIZZLE. The launch-index remap on the fused gate/up kernel makes the
+    /// assignment the fastest-varying axis, so consecutive threadgroups touch 64
+    /// different expert planes and every DRAM burst lands in a different region.
+    /// This spans `S` consecutive column groups of one assignment before moving
+    /// on, which lengthens the sequential run inside a plane while keeping the
+    /// assignment interleaving that balances leader and non-leader work. The
+    /// mapping stays a bijection over (column group, assignment), so each output
+    /// element is still produced by exactly one threadgroup and the result is
+    /// bit-identical. `S = 1` is the incumbent order, byte for byte.
+    static let swizzleSpan: Int = {
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_SWIZZLE_SPAN"] ?? "4"
+        guard let value = Int(raw), value >= 1, value <= 176, 176 % value == 0 else { return 1 }
+        return value
+    }()
+
     static func call(x: MLXArray, storage: SwitchGateUpFusedStorage,
         lhs: MLXArray, rhs: MLXArray, taggedRoute: Bool = false) -> MLXArray {
         call([storage.weight, storage.scales, storage.biases, x, lhs, rhs],
@@ -51,14 +66,22 @@ public enum Gemma4DecodeFusedGUV1 {
     private static func makeKernel(tagged: Bool) -> MLXFast.MLXFastKernel {
         MLXFast.metalKernel(
         name: "gemma4_b8_decode_gateup_geglu_threadgroup_v1"
-            + (tagged ? "_tagged_v1" : ""),
+            + (tagged ? "_tagged_v1" : "")
+            + (swizzleSpan == 1 ? "" : "_swz\(swizzleSpan)"),
         inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"],
         outputNames: ["y"],
         source: #"""
 uint3 tid=threadgroup_position_in_grid;
 uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
 
-    const uint linear=tid.y+tid.z*(176/guPairs);tid.y=linear/64;tid.z=linear%64;
+    const uint linear=tid.y+tid.z*(176/guPairs);
+#if GU_SWIZZLE_SPAN > 1
+    const uint swzWithin=linear%(GU_SWIZZLE_SPAN*64u);
+    tid.y=(linear/(GU_SWIZZLE_SPAN*64u))*GU_SWIZZLE_SPAN+swzWithin%GU_SWIZZLE_SPAN;
+    tid.z=swzWithin/GU_SWIZZLE_SPAN;
+#else
+    tid.y=linear/64;tid.z=linear%64;
+#endif
     const uint assignment=tid.z;const ExpertRun run=expert_run(rhs,assignment);
     if(!run.leader)return;
     const uint localSg=sg&1u, localColumn=(sg/2)*4;
@@ -83,7 +106,8 @@ uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
 
 """#,
         header: "#define GU_RUN_CAP \(runCap)\n"
-            + "#define GU_TAGGED_ROUTE \(tagged ? 1 : 0)\n" + #"""
+            + "#define GU_TAGGED_ROUTE \(tagged ? 1 : 0)\n"
+            + "#define GU_SWIZZLE_SPAN \(swizzleSpan)\n" + #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helpers from 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>

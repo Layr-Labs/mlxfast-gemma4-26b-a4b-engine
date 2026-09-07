@@ -38,30 +38,6 @@ public enum Gemma4DownTightGridV1 {
         #endif
     }()
 
-    /// The singleton QMV consumes one aligned eight-code packet per lane.
-    /// Fetch its two 16-bit halves with one 32-bit load, preserving the qdot.
-    static let packedWordLoads =
-        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_PACKED_WORD_LOAD"] != "0"
-
-    private static let compiledGateUpEnabled =
-        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_COMPILED_GU_DOWN"] != "0"
-
-    /// Check the task-local stream on every attempt, outside the trace.
-    static var compiledGateUpAvailable: Bool {
-        compiledGateUpEnabled && StreamOrDevice.default == .gpu
-    }
-
-    // One identity across layers. Every tensor, including both projections' weights
-    // and the shared RHS, is substituted from the current explicit arguments.
-    private static let compiledGateUpDown: @Sendable ([MLXArray]) -> [MLXArray] =
-        MLX.compile(shapeless: false) { inputs in
-            let activated = Gemma4DecodeFusedGUV1.call(
-                [inputs[0], inputs[1], inputs[2], inputs[6], inputs[7], inputs[8]])
-            return [Gemma4DownTightGridV1.call(
-                [inputs[3], inputs[4], inputs[5], activated, inputs[9], inputs[8]],
-                span: tileSpan)]
-        }
-
     /// Bound to the immutable sanitized checkpoint, like the fused gate/up storage.
     public final class Storage {
         private let weight: MLXArray
@@ -79,11 +55,7 @@ public enum Gemma4DownTightGridV1 {
         }
 
         static func admits(x: MLXArray, indices: MLXArray) -> Bool {
-            admits(xShape: x.shape, xDType: x.dtype, indices: indices)
-        }
-
-        static func admits(xShape: [Int], xDType: DType, indices: MLXArray) -> Bool {
-            xDType == .bfloat16 && xShape == [64, 1, 704]
+            x.dtype == .bfloat16 && x.shape == [64, 1, 704]
                 && indices.dtype == .uint32 && indices.shape == [64]
         }
 
@@ -95,34 +67,17 @@ public enum Gemma4DownTightGridV1 {
         func call(
             x: MLXArray, lhsIndices: MLXArray, indices: MLXArray, span: Int
         ) -> MLXArray {
-            Gemma4DownTightGridV1.call(
-                [weight, scales, biases, x, lhsIndices, indices], span: span)
+            kernel(
+                [weight, scales, biases, x, lhsIndices, indices],
+                template: [("T", DType.bfloat16), ("SPAN", span)],
+                grid: (32, (352 / span) * 2, 64), threadGroup: (32, 2, 1),
+                outputShapes: [[64, 1, 2816]], outputDTypes: [.bfloat16]
+            )[0]
         }
-
-        /// The caller has checked compiledGateUpAvailable and both projection
-        /// contracts. Storage is read here, never captured by the compiled body.
-        func callCompiledGateUp(
-            x: MLXArray, storage: SwitchGateUpFusedStorage, lhs: MLXArray,
-            rhs: MLXArray, downLHS: MLXArray
-        ) -> MLXArray? {
-            Gemma4DownTightGridV1.compiledGateUpDown(
-                [storage.weight, storage.scales, storage.biases, weight, scales, biases,
-                 x, lhs, rhs, downLHS]).first
-        }
-    }
-
-    /// Raw launch for callers that already passed the tight-DOWN contract.
-    static func call(_ inputs: [MLXArray], span: Int) -> MLXArray {
-        kernel(
-            inputs,
-            template: [("T", DType.bfloat16), ("SPAN", span)],
-            grid: (32, (352 / span) * 2, 64), threadGroup: (32, 2, 1),
-            outputShapes: [[64, 1, 2816]], outputDTypes: [.bfloat16]
-        )[0]
     }
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_down_qmv_span4_tight_zorder_v1" + (packedWordLoads ? "_word32" : ""),
+        name: "gemma4_b8_down_qmv_span4_tight_zorder_v1",
         inputNames: ["w", "scales", "biases", "x", "lhs_indices", "rhs_indices"],
         outputNames: ["y"],
         source: #"""
@@ -139,7 +94,7 @@ gather_qmv_gemma4_down_tile<T, 64, 4, SPAN>(
     704, 2816 * 704 / 8, 2816 * 704 / 64, 2816 * 704 / 64,
     tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
 """#,
-        header: "#define DOWN_PACKED_WORD_LOAD \(packedWordLoads ? 1 : 0)\n" + #"""
+        header: #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helper bodies verified byte-identical to 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -366,20 +321,6 @@ inline U qdot(
   }
 
   else if (bits == 4) {
-#if DOWN_PACKED_WORD_LOAD
-    // Each admitted lane packet contains eight aligned 4-bit codes. Only the
-    // integer load changes: the two four-value sums and their order stay exact.
-    static_assert(values_per_thread == 8, "This kernel uses eight-value packets");
-    const uint packet = *((const device uint*)w);
-    for (int i = 0; i < (values_per_thread / 4); i++) {
-      const uint word = (packet >> (16 * i)) & 0xffffu;
-      accum +=
-          (x_thread[4 * i] * (word & 0x000f) +
-           x_thread[4 * i + 1] * (word & 0x00f0) +
-           x_thread[4 * i + 2] * (word & 0x0f00) +
-           x_thread[4 * i + 3] * (word & 0xf000));
-    }
-#else
     const device uint16_t* ws = (const device uint16_t*)w;
     for (int i = 0; i < (values_per_thread / 4); i++) {
       accum +=
@@ -388,7 +329,6 @@ inline U qdot(
            x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
            x_thread[4 * i + 3] * (ws[i] & 0xf000));
     }
-#endif
   }
 
   else if (bits == 5) {

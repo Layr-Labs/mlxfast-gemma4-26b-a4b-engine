@@ -13,30 +13,6 @@ import Foundation
 import MLX
 import MLXFast
 
-// Per-call input assembly only: tensor identities and argument order are
-// unchanged, and no request-dependent values are retained between calls.
-fileprivate enum Q4InputAssemblyV1 {
-    static let enabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_Q4_INPUT_ASSEMBLY_V1"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    @inline(__always)
-    static func build(first: MLXArray, mirrors: [MLXArray], tail: [MLXArray])
-        -> [MLXArray]
-    {
-        guard enabled else { return [first] + mirrors + tail }
-        var result: [MLXArray] = []
-        result.reserveCapacity(1 + mirrors.count + tail.count)
-        result.append(first)
-        result.append(contentsOf: mirrors)
-        result.append(contentsOf: tail)
-        return result
-    }
-}
-
 public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
@@ -3858,11 +3834,8 @@ for (int element = 0; element < values_per_lane; ++element) {
         else { return nil }
 
         let startArray = getStartArray(starts: starts, batch: batch)
-        if Q4InputAssemblyV1.enabled { CBv2EngageMark.once("q4-input-assembly-v1") }
         func fallbackInputs() -> [MLXArray] {
-            Q4InputAssemblyV1.build(
-                first: queries, mirrors: mirrors,
-                tail: [startArray, newKeys, newValues, previousWriteFence])
+            [queries] + mirrors + [startArray, newKeys, newValues, previousWriteFence]
         }
         if q4ResidentMergeEnabled,
             blocks == 8,
@@ -3872,8 +3845,8 @@ for (int element = 0; element < values_per_lane; ++element) {
             if let normRope = takeResidentNormRope(
                 queries: queries, keys: newKeys, values: newValues)
             {
-                let residentInputs = Q4InputAssemblyV1.build(
-                    first: normRope.rawQueries, mirrors: mirrors, tail: [
+                let residentInputs =
+                    [normRope.rawQueries] + mirrors + [
                         startArray,
                         normRope.rawKeys,
                         normRope.rawValues,
@@ -3882,7 +3855,7 @@ for (int element = 0; element < values_per_lane; ++element) {
                         normRope.positionOffsets,
                         normRope.ropeInverseFrequencies ?? normRope.ropeLog2Base,
                         previousWriteFence,
-                    ])
+                    ]
                 let residentTemplate: [(String, any KernelTemplateArg)] = [
                     ("T", normRope.rawQueries.dtype),
                     ("D", headDim),
@@ -4255,16 +4228,6 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_D512_DECODE_SDPA"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    /// Direct in-place full row cast kill switch:
-    /// `DARKBLOOM_GEMMA4_D512_DIRECT_FULL_ROW_CAST=0` restores the
-    /// `compactMap` heap allocation path. Default ON.
-    public static let directFullRowCastEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_D512_DIRECT_FULL_ROW_CAST"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
@@ -4780,103 +4743,118 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    private static let softmaxVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1_sv1",
-        inputNames: ["scores", "params"],
-        outputNames: ["probs"],
-        source: """
-            const int axis_size = int(params[0]);
-            const int gid = int(threadgroup_position_in_grid.x);
-            const int lid = int(thread_position_in_threadgroup.x);
-            const int simd_lane_id = int(thread_index_in_simdgroup);
-            const int simd_group_id = int(simdgroup_index_in_threadgroup);
-            const int num_simdgroups = (axis_size + 127) / 128;
+    private static let probabilityPitchEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_PROBABILITY_PITCH4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
 
-            typedef vec<T, 4> T4;
-            const bool row_vec4 = (axis_size & 3) == 0;
+    private static let softmaxVecKernel = makeSoftmaxVecKernel(paddedPitch: false)
+    private static let softmaxPitchKernel = makeSoftmaxVecKernel(paddedPitch: true)
 
-            threadgroup float local_max[32];
-            threadgroup float local_normalizer[32];
+    private static func makeSoftmaxVecKernel(paddedPitch: Bool) -> MLXFast.MLXFastKernel {
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1_sv1\(paddedPitch ? "_pitch4" : "")",
+            inputNames: ["scores", "params"],
+            outputNames: ["probs"],
+            source: """
+                const int axis_size = int(params[0]);
+                const int probability_pitch = \(paddedPitch ? "(axis_size + 3) & ~3" : "axis_size");
+                const int gid = int(threadgroup_position_in_grid.x);
+                const int lid = int(thread_position_in_threadgroup.x);
+                const int simd_lane_id = int(thread_index_in_simdgroup);
+                const int simd_group_id = int(simdgroup_index_in_threadgroup);
+                const int num_simdgroups = (axis_size + 127) / 128;
 
-            float ld[4];
-            const device T* in =
-                scores + size_t(gid) * axis_size + lid * 4;
-            if (lid * 4 + 4 <= axis_size) {
-                if (row_vec4) {
-                    const T4 raw = *reinterpret_cast<const device T4*>(in);
-                    for (int i = 0; i < 4; i++) {
-                        ld[i] = static_cast<float>(raw[i]);
+                typedef vec<T, 4> T4;
+                const bool row_vec4 = (axis_size & 3) == 0;
+
+                threadgroup float local_max[32];
+                threadgroup float local_normalizer[32];
+
+                float ld[4];
+                const device T* in =
+                    scores + size_t(gid) * axis_size + lid * 4;
+                if (lid * 4 + 4 <= axis_size) {
+                    if (row_vec4) {
+                        const T4 raw = *reinterpret_cast<const device T4*>(in);
+                        for (int i = 0; i < 4; i++) {
+                            ld[i] = static_cast<float>(raw[i]);
+                        }
+                    } else {
+                        for (int i = 0; i < 4; i++) {
+                            ld[i] = static_cast<float>(in[i]);
+                        }
                     }
                 } else {
                     for (int i = 0; i < 4; i++) {
-                        ld[i] = static_cast<float>(in[i]);
+                        ld[i] = ((lid * 4 + i) < axis_size)
+                            ? static_cast<float>(in[i]) : -INFINITY;
                     }
                 }
-            } else {
+
+                float maxval = -3.402823466e+38F;
                 for (int i = 0; i < 4; i++) {
-                    ld[i] = ((lid * 4 + i) < axis_size)
-                        ? static_cast<float>(in[i]) : -INFINITY;
+                    maxval = (maxval < ld[i]) ? ld[i] : maxval;
                 }
-            }
+                maxval = simd_max(maxval);
+                if (simd_lane_id == 0) {
+                    local_max[simd_group_id] = maxval;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            float maxval = -3.402823466e+38F;
-            for (int i = 0; i < 4; i++) {
-                maxval = (maxval < ld[i]) ? ld[i] : maxval;
-            }
-            maxval = simd_max(maxval);
-            if (simd_lane_id == 0) {
-                local_max[simd_group_id] = maxval;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+                maxval = -3.402823466e+38F;
+                for (int s = 0; s < num_simdgroups; ++s) {
+                    const float sm = local_max[s];
+                    maxval = (maxval < sm) ? sm : maxval;
+                }
 
-            maxval = -3.402823466e+38F;
-            for (int s = 0; s < num_simdgroups; ++s) {
-                const float sm = local_max[s];
-                maxval = (maxval < sm) ? sm : maxval;
-            }
+                float normalizer = 0.0f;
+                for (int i = 0; i < 4; i++) {
+                    float exp_x = fast::exp(ld[i] - maxval);
+                    ld[i] = exp_x;
+                    normalizer += exp_x;
+                }
+                normalizer = simd_sum(normalizer);
+                if (simd_lane_id == 0) {
+                    local_normalizer[simd_group_id] = normalizer;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            float normalizer = 0.0f;
-            for (int i = 0; i < 4; i++) {
-                float exp_x = fast::exp(ld[i] - maxval);
-                ld[i] = exp_x;
-                normalizer += exp_x;
-            }
-            normalizer = simd_sum(normalizer);
-            if (simd_lane_id == 0) {
-                local_normalizer[simd_group_id] = normalizer;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+                normalizer = 0.0f;
+                for (int s = 0; s < num_simdgroups; ++s) {
+                    normalizer += local_normalizer[s];
+                }
+                const float inv_normalizer = 1.0f / normalizer;
 
-            normalizer = 0.0f;
-            for (int s = 0; s < num_simdgroups; ++s) {
-                normalizer += local_normalizer[s];
-            }
-            const float inv_normalizer = 1.0f / normalizer;
-
-            device T* out_row =
-                probs + size_t(gid) * axis_size + lid * 4;
-            if (lid * 4 + 4 <= axis_size) {
-                if (row_vec4) {
-                    T4 out_vec;
-                    for (int i = 0; i < 4; i++) {
-                        out_vec[i] = static_cast<T>(ld[i] * inv_normalizer);
+                device T* out_row =
+                    probs + size_t(gid) * probability_pitch + lid * 4;
+                if (lid * 4 + 4 <= axis_size) {
+                    if ((probability_pitch & 3) == 0) {
+                        T4 out_vec;
+                        for (int i = 0; i < 4; i++) {
+                            out_vec[i] = static_cast<T>(ld[i] * inv_normalizer);
+                        }
+                        *reinterpret_cast<device T4*>(out_row) = out_vec;
+                    } else {
+                        for (int i = 0; i < 4; i++) {
+                            out_row[i] = static_cast<T>(ld[i] * inv_normalizer);
+                        }
                     }
-                    *reinterpret_cast<device T4*>(out_row) = out_vec;
                 } else {
                     for (int i = 0; i < 4; i++) {
-                        out_row[i] = static_cast<T>(ld[i] * inv_normalizer);
+                        if ((lid * 4 + i) < axis_size) {
+                            out_row[i] = static_cast<T>(ld[i] * inv_normalizer);
+                        } else if ((lid * 4 + i) < probability_pitch) {
+                            out_row[i] = T(0);
+                        }
                     }
                 }
-            } else {
-                for (int i = 0; i < 4; i++) {
-                    if ((lid * 4 + i) < axis_size) {
-                        out_row[i] = static_cast<T>(ld[i] * inv_normalizer);
-                    }
-                }
-            }
-        """,
-        ensureRowContiguous: true
-    )
+            """,
+            ensureRowContiguous: true
+        )
+    }
 
     private static var softmaxActive: MLXFast.MLXFastKernel {
         softmaxVecEnabled ? softmaxVecKernel : softmaxKernel
@@ -5302,207 +5280,213 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// prepass's butterfly adds; float addition is commutative, so the
     /// left/right order at a node is immaterial. The `out` store, the
     /// accumulation and the fold above it are the promoted text.
-    private static let avVecORunsumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_sv1_ors1",
-        inputNames: [
-            "probs",
-            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-            "params",
-        ],
-        outputNames: ["out", "rs"],
-        source: """
-            constexpr int D = 512;
-            constexpr int GQA = 8;
+    private static let avVecORunsumKernel = makeAVVecORunsumKernel(paddedPitch: false)
+    private static let avPitchORunsumKernel = makeAVVecORunsumKernel(paddedPitch: true)
 
-            const int key_length = int(params[0]);
-            const bool row_vec4 = (key_length & 3) == 0;
+    private static func makeAVVecORunsumKernel(paddedPitch: Bool) -> MLXFast.MLXFastKernel {
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_sv1_ors1\(paddedPitch ? "_pitch4" : "")",
+            inputNames: [
+                "probs",
+                "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+                "params",
+            ],
+            outputNames: ["out", "rs"],
+            source: """
+                constexpr int D = 512;
+                constexpr int GQA = 8;
 
-            const int z = int(threadgroup_position_in_grid.z);
-            const int tile = z % \(avColumnTiles);
-            const int row_kv = z / \(avColumnTiles);
-            const int row = row_kv / 2;
-            const int kv_head = row_kv % 2;
-            const int sg = int(simdgroup_index_in_threadgroup);
-            const int lane = int(thread_index_in_simdgroup);
+                const int key_length = int(params[0]);
+                const int probability_pitch = \(paddedPitch ? "(key_length + 3) & ~3" : "key_length");
+                const bool row_vec4 = (probability_pitch & 3) == 0;
 
-            const int row_capacity = int(params[2 + row]);
+                const int z = int(threadgroup_position_in_grid.z);
+                const int tile = z % \(avColumnTiles);
+                const int row_kv = z / \(avColumnTiles);
+                const int row = row_kv / 2;
+                const int kv_head = row_kv % 2;
+                const int sg = int(simdgroup_index_in_threadgroup);
+                const int lane = int(thread_index_in_simdgroup);
 
-            const device T* value_plane = v0;
-            switch (row) {
-                case 1: value_plane = v1; break;
-                case 2: value_plane = v2; break;
-                case 3: value_plane = v3; break;
-                case 4: value_plane = v4; break;
-                case 5: value_plane = v5; break;
-                case 6: value_plane = v6; break;
-                case 7: value_plane = v7; break;
-                default: break;
-            }
-            value_plane += size_t(kv_head) * size_t(row_capacity) * D;
+                const int row_capacity = int(params[2 + row]);
 
-            const device T* prob_rows =
-                probs + size_t(row * 16 + kv_head * GQA) * key_length;
-
-            const int thrM = lane / 4;
-            const int thrN = lane % 4;
-            int bm = thrM * 4;
-            const int out_col = tile * \(avTileColumns) + (4 * sg + thrN) * 4;
-
-            // XFOLD: one flat accumulator over the same 32 partial sums, so
-            // the cross-lane fold below can address the whole set with
-            // compile-time indices.
-            float result[GQA * 4] = {0.0f};
-            // VTILE: the 4x4 value tile is shared by all GQA heads, the
-            // probability block is not. Staging the tile costs 16 halves and
-            // frees the 32-float per-head staging array.
-            typedef vec<T, 4> T4;
-            T4 v_tile[4];
-            float p_coeff[4];
-            const int n_iter = key_length / 32;
-            const int leftover = key_length - n_iter * 32;
-
-            for (int i = 0; i < n_iter; ++i) {
-                #pragma clang loop unroll(full)
-                for (int tm = 0; tm < 4; ++tm) {
-                    v_tile[tm] = *reinterpret_cast<const device T4*>(
-                        value_plane + size_t(bm + tm) * D + out_col);
+                const device T* value_plane = v0;
+                switch (row) {
+                    case 1: value_plane = v1; break;
+                    case 2: value_plane = v2; break;
+                    case 3: value_plane = v3; break;
+                    case 4: value_plane = v4; break;
+                    case 5: value_plane = v5; break;
+                    case 6: value_plane = v6; break;
+                    case 7: value_plane = v7; break;
+                    default: break;
                 }
-                #pragma clang loop unroll(full)
-                for (int h = 0; h < GQA; ++h) {
-                    if (row_vec4) {
-                        const T4 p_raw = *reinterpret_cast<const device T4*>(
-                            prob_rows + size_t(h) * key_length + bm);
-                        #pragma clang loop unroll(full)
-                        for (int tm = 0; tm < 4; ++tm) {
-                            p_coeff[tm] = static_cast<float>(p_raw[tm]);
-                        }
-                    } else {
-                        #pragma clang loop unroll(full)
-                        for (int tm = 0; tm < 4; ++tm) {
-                            p_coeff[tm] = static_cast<float>(
-                                prob_rows[size_t(h) * key_length + bm + tm]);
-                        }
-                    }
+                value_plane += size_t(kv_head) * size_t(row_capacity) * D;
+
+                const device T* prob_rows =
+                    probs + size_t(row * 16 + kv_head * GQA) * probability_pitch;
+
+                const int thrM = lane / 4;
+                const int thrN = lane % 4;
+                int bm = thrM * 4;
+                const int out_col = tile * \(avTileColumns) + (4 * sg + thrN) * 4;
+
+                // XFOLD: one flat accumulator over the same 32 partial sums, so
+                // the cross-lane fold below can address the whole set with
+                // compile-time indices.
+                float result[GQA * 4] = {0.0f};
+                // VTILE: the 4x4 value tile is shared by all GQA heads, the
+                // probability block is not. Staging the tile costs 16 halves and
+                // frees the 32-float per-head staging array.
+                typedef vec<T, 4> T4;
+                T4 v_tile[4];
+                float p_coeff[4];
+                const int n_iter = key_length / 32;
+                const int leftover = key_length - n_iter * 32;
+
+                for (int i = 0; i < n_iter; ++i) {
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
-                        float vc = p_coeff[tm];
-                        for (int tn = 0; tn < 4; ++tn) {
-                            result[h * 4 + tn] += vc * v_tile[tm][tn];
-                        }
-                    }
-                }
-                bm += 32;
-            }
-            if (leftover > 0) {
-                for (int tm = 0; tm < 4 && bm + tm < key_length; ++tm) {
-                    #pragma clang loop unroll(full)
-                    for (int tn = 0; tn < 4; ++tn) {
-                        v_tile[0][tn] = value_plane[
-                            size_t(bm + tm) * D + out_col + tn];
+                        v_tile[tm] = *reinterpret_cast<const device T4*>(
+                            value_plane + size_t(bm + tm) * D + out_col);
                     }
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
-                        const float pc = static_cast<float>(
-                            prob_rows[size_t(h) * key_length + bm + tm]);
+                        if (row_vec4) {
+                            const T4 p_raw = *reinterpret_cast<const device T4*>(
+                                prob_rows + size_t(h) * probability_pitch + bm);
+                            #pragma clang loop unroll(full)
+                            for (int tm = 0; tm < 4; ++tm) {
+                                p_coeff[tm] = static_cast<float>(p_raw[tm]);
+                            }
+                        } else {
+                            #pragma clang loop unroll(full)
+                            for (int tm = 0; tm < 4; ++tm) {
+                                p_coeff[tm] = static_cast<float>(
+                                    prob_rows[size_t(h) * probability_pitch + bm + tm]);
+                            }
+                        }
+                        #pragma clang loop unroll(full)
+                        for (int tm = 0; tm < 4; ++tm) {
+                            float vc = p_coeff[tm];
+                            for (int tn = 0; tn < 4; ++tn) {
+                                result[h * 4 + tn] += vc * v_tile[tm][tn];
+                            }
+                        }
+                    }
+                    bm += 32;
+                }
+                if (leftover > 0) {
+                    for (int tm = 0; tm < 4 && bm + tm < key_length; ++tm) {
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h * 4 + tn] += pc * v_tile[0][tn];
+                            v_tile[0][tn] = value_plane[
+                                size_t(bm + tm) * D + out_col + tn];
+                        }
+                        #pragma clang loop unroll(full)
+                        for (int h = 0; h < GQA; ++h) {
+                            const float pc = static_cast<float>(
+                                prob_rows[size_t(h) * probability_pitch + bm + tm]);
+                            #pragma clang loop unroll(full)
+                            for (int tn = 0; tn < 4; ++tn) {
+                                result[h * 4 + tn] += pc * v_tile[0][tn];
+                            }
                         }
                     }
                 }
-            }
-            // XFOLD: the 32 sums fold across the eight lanes that share this
-            // thrN as ONE butterfly over the whole set rather than 32
-            // independent shuffle-down chains. The traffic is 16 + 8 + 4 = 28
-            // shuffles instead of 32 * 3 = 96, and the live accumulator
-            // collapses 32 -> 16 -> 8 -> 4 instead of staying 32 wide.
-            //
-            // Exactness: as in the QK fold, step K merges the group holding
-            // lane l with the group holding lane l ^ K, so the merge hierarchy
-            // over the eight thrM lanes is the same coset chain for every lane
-            // and the same one the shuffle-down form built. Only the left and
-            // right order at each node varies, and float addition is
-            // commutative. Measured bit-identical alongside the QK fold.
-            //
-            // Landing: bit i of a lane's surviving head index equals bit i + 2
-            // of the lane, so the lane finishes holding head thrM's four
-            // columns. The eight thrM == 0 lanes' run of 32 stores becomes
-            // four stores on every lane, to the same 32 addresses per thrN.
-            {
-                const bool hi = (lane & 16) != 0;
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < 16; ++j) {
-                    const float a = result[j];
-                    const float b = result[16 + j];
-                    result[j] = (hi ? b : a)
-                        + simd_shuffle_xor(hi ? a : b, ushort(16));
+                // XFOLD: the 32 sums fold across the eight lanes that share this
+                // thrN as ONE butterfly over the whole set rather than 32
+                // independent shuffle-down chains. The traffic is 16 + 8 + 4 = 28
+                // shuffles instead of 32 * 3 = 96, and the live accumulator
+                // collapses 32 -> 16 -> 8 -> 4 instead of staying 32 wide.
+                //
+                // Exactness: as in the QK fold, step K merges the group holding
+                // lane l with the group holding lane l ^ K, so the merge hierarchy
+                // over the eight thrM lanes is the same coset chain for every lane
+                // and the same one the shuffle-down form built. Only the left and
+                // right order at each node varies, and float addition is
+                // commutative. Measured bit-identical alongside the QK fold.
+                //
+                // Landing: bit i of a lane's surviving head index equals bit i + 2
+                // of the lane, so the lane finishes holding head thrM's four
+                // columns. The eight thrM == 0 lanes' run of 32 stores becomes
+                // four stores on every lane, to the same 32 addresses per thrN.
+                {
+                    const bool hi = (lane & 16) != 0;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 16; ++j) {
+                        const float a = result[j];
+                        const float b = result[16 + j];
+                        result[j] = (hi ? b : a)
+                            + simd_shuffle_xor(hi ? a : b, ushort(16));
+                    }
                 }
-            }
-            {
-                const bool hi = (lane & 8) != 0;
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < 8; ++j) {
-                    const float a = result[j];
-                    const float b = result[8 + j];
-                    result[j] = (hi ? b : a)
-                        + simd_shuffle_xor(hi ? a : b, ushort(8));
+                {
+                    const bool hi = (lane & 8) != 0;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 8; ++j) {
+                        const float a = result[j];
+                        const float b = result[8 + j];
+                        result[j] = (hi ? b : a)
+                            + simd_shuffle_xor(hi ? a : b, ushort(8));
+                    }
                 }
-            }
-            {
-                const bool hi = (lane & 4) != 0;
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < 4; ++j) {
-                    const float a = result[j];
-                    const float b = result[4 + j];
-                    result[j] = (hi ? b : a)
-                        + simd_shuffle_xor(hi ? a : b, ushort(4));
+                {
+                    const bool hi = (lane & 4) != 0;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        const float a = result[j];
+                        const float b = result[4 + j];
+                        result[j] = (hi ? b : a)
+                            + simd_shuffle_xor(hi ? a : b, ushort(4));
+                    }
                 }
-            }
-            {
-                device T* out_ptr = out
-                    + size_t(row * 16 + kv_head * GQA + thrM) * D
-                    + out_col;
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < 4; ++j) {
-                    out_ptr[j] = static_cast<T>(result[j]);
+                {
+                    device T* out_ptr = out
+                        + size_t(row * 16 + kv_head * GQA + thrM) * D
+                        + out_col;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        out_ptr[j] = static_cast<T>(result[j]);
+                    }
                 }
-            }
-            // ORS-D512 epilogue: the o_proj run-sum octet tree of
-            // cbv2_b8_rs_table_dyn_v1 over the values just stored.
-            threadgroup float rs_partial[\(avSimdgroups)][32];
-            {
-                thread ushort own[4];
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < 4; ++j) {
-                    own[j] = as_type<ushort>(static_cast<T>(result[j]));
+                // ORS-D512 epilogue: the o_proj run-sum octet tree of
+                // cbv2_b8_rs_table_dyn_v1 over the values just stored.
+                threadgroup float rs_partial[\(avSimdgroups)][32];
+                {
+                    thread ushort own[4];
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        own[j] = as_type<ushort>(static_cast<T>(result[j]));
+                    }
+                    const ushort partner = ushort(lane ^ 1);
+                    const bool upper = (lane & 1) != 0;
+                    thread T xt[8];
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        const ushort other = simd_shuffle(own[j], partner);
+                        xt[j] = as_type<T>(upper ? other : own[j]);
+                        xt[4 + j] = as_type<T>(upper ? own[j] : other);
+                    }
+                    float rsv = 0;
+                    rsv += xt[0] + xt[1] + xt[2] + xt[3];
+                    rsv += xt[4] + xt[5] + xt[6] + xt[7];
+                    rsv += simd_shuffle_xor(rsv, 2u);
+                    rs_partial[sg][lane] = rsv;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    rsv += rs_partial[sg ^ 1][lane];
+                    \(avSimdgroups == 4
+                        ? "rsv += rs_partial[sg ^ 2][lane] + rs_partial[sg ^ 3][lane];"
+                        : "")
+                    if (sg == 0 && thrN == 0) {
+                        rs[row * (16 * \(avColumnTiles))
+                            + (kv_head * GQA + thrM) * \(avColumnTiles) + tile] = rsv;
+                    }
                 }
-                const ushort partner = ushort(lane ^ 1);
-                const bool upper = (lane & 1) != 0;
-                thread T xt[8];
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < 4; ++j) {
-                    const ushort other = simd_shuffle(own[j], partner);
-                    xt[j] = as_type<T>(upper ? other : own[j]);
-                    xt[4 + j] = as_type<T>(upper ? own[j] : other);
-                }
-                float rsv = 0;
-                rsv += xt[0] + xt[1] + xt[2] + xt[3];
-                rsv += xt[4] + xt[5] + xt[6] + xt[7];
-                rsv += simd_shuffle_xor(rsv, 2u);
-                rs_partial[sg][lane] = rsv;
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                rsv += rs_partial[sg ^ 1][lane];
-                \(avSimdgroups == 4
-                    ? "rsv += rs_partial[sg ^ 2][lane] + rs_partial[sg ^ 3][lane];"
-                    : "")
-                if (sg == 0 && thrN == 0) {
-                    rs[row * (16 * \(avColumnTiles))
-                        + (kv_head * GQA + thrM) * \(avColumnTiles) + tile] = rsv;
-                }
-            }
-        """,
-        ensureRowContiguous: true
-    )
+            """,
+            ensureRowContiguous: true
+        )
+    }
 
     // ATTRIBUTION. Everything in this WRITE-016-D512 section, and the
     // matching hunks in AttentionV1.swift and SequenceKV/FullSequenceKV.swift,
@@ -6315,84 +6299,41 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         else { return nil }
         guard case .full = kind.attention else { return nil }
 
-        let offset: Int
-        let keyLength: Int
+        let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
+        guard fullRows.count == batch else { return nil }
+
+        let offset = fullRows[0].absoluteOffset
+        let keyLength = offset + 1
+        guard offset > 0,
+            keyLength >= minKeyLength,
+            keyLength <= maxKeyLength,
+            fullRows.allSatisfy({ $0.cohortPool == nil }),
+            fullRows.allSatisfy({ $0.absoluteOffset == offset }),
+            fullRows.allSatisfy({ keyLength <= $0.maxLength })
+        else { return nil }
+
         var keyBuffers: [MLXArray] = []
         var valueBuffers: [MLXArray] = []
         keyBuffers.reserveCapacity(batch)
         valueBuffers.reserveCapacity(batch)
-        var params: [UInt32]
-        let fallbackFullRows: [CBv2FullSequenceKV]?
-
-        if directFullRowCastEnabled {
-            CBv2EngageMark.once("d512-direct-full-row-cast")
-            guard let first = rows.first as? CBv2FullSequenceKV else { return nil }
-            offset = first.absoluteOffset
-            keyLength = offset + 1
-            guard offset > 0,
-                keyLength >= minKeyLength,
-                keyLength <= maxKeyLength
+        var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
+        params.reserveCapacity(batch + 2)
+        for row in fullRows {
+            let state = row.cbv2InnerState()
+            guard state.count == 2,
+                state[0].dtype == .bfloat16,
+                state[1].dtype == .bfloat16,
+                state[0].ndim == 4,
+                state[0].dim(0) == 1,
+                state[0].dim(1) == kvHeads,
+                state[0].dim(3) == headDim,
+                state[1].shape == state[0].shape,
+                state[1].dtype == state[0].dtype,
+                state[0].dim(2) >= keyLength
             else { return nil }
-
-            params = [UInt32(keyLength), UInt32(headDim)]
-            params.reserveCapacity(batch + 2)
-            for seq in rows {
-                guard let row = seq as? CBv2FullSequenceKV,
-                    row.cohortPool == nil,
-                    row.absoluteOffset == offset,
-                    keyLength <= row.maxLength
-                else { return nil }
-                let state = row.cbv2InnerState()
-                guard state.count == 2,
-                    state[0].dtype == .bfloat16,
-                    state[1].dtype == .bfloat16,
-                    state[0].ndim == 4,
-                    state[0].dim(0) == 1,
-                    state[0].dim(1) == kvHeads,
-                    state[0].dim(3) == headDim,
-                    state[1].shape == state[0].shape,
-                    state[1].dtype == state[0].dtype,
-                    state[0].dim(2) >= keyLength
-                else { return nil }
-                keyBuffers.append(state[0])
-                valueBuffers.append(state[1])
-                params.append(UInt32(state[0].dim(2)))
-            }
-            fallbackFullRows = nil
-        } else {
-            let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
-            guard fullRows.count == batch else { return nil }
-
-            offset = fullRows[0].absoluteOffset
-            keyLength = offset + 1
-            guard offset > 0,
-                keyLength >= minKeyLength,
-                keyLength <= maxKeyLength,
-                fullRows.allSatisfy({ $0.cohortPool == nil }),
-                fullRows.allSatisfy({ $0.absoluteOffset == offset }),
-                fullRows.allSatisfy({ keyLength <= $0.maxLength })
-            else { return nil }
-
-            params = [UInt32(keyLength), UInt32(headDim)]
-            params.reserveCapacity(batch + 2)
-            for row in fullRows {
-                let state = row.cbv2InnerState()
-                guard state.count == 2,
-                    state[0].dtype == .bfloat16,
-                    state[1].dtype == .bfloat16,
-                    state[0].ndim == 4,
-                    state[0].dim(0) == 1,
-                    state[0].dim(1) == kvHeads,
-                    state[0].dim(3) == headDim,
-                    state[1].shape == state[0].shape,
-                    state[1].dtype == state[0].dtype,
-                    state[0].dim(2) >= keyLength
-                else { return nil }
-                keyBuffers.append(state[0])
-                valueBuffers.append(state[1])
-                params.append(UInt32(state[0].dim(2)))
-            }
-            fallbackFullRows = fullRows
+            keyBuffers.append(state[0])
+            valueBuffers.append(state[1])
+            params.append(UInt32(state[0].dim(2)))
         }
         let paramsArray = getD512ParamsArray(params: params)
 
@@ -6464,13 +6405,17 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             outputDTypes: [.bfloat16]
         )[0]
 
+        let useProbabilityPitch = probabilityPitchEnabled
+            && oRunsumFoldEnabled && softmaxVecEnabled
+        let probabilityPitch = useProbabilityPitch ? ((keyLength + 3) & ~3) : keyLength
+        let softmax = useProbabilityPitch ? softmaxPitchKernel : softmaxActive
         let softmaxThreads = ((keyLength + 3) / 4 + 31) / 32 * 32
-        let probs = softmaxActive(
+        let probs = softmax(
             [scores, paramsArray],
             template: template,
             grid: (softmaxThreads * batch * queryHeads, 1, 1),
             threadGroup: (softmaxThreads, 1, 1),
-            outputShapes: [scratchShape],
+            outputShapes: [[batch, queryHeads, 1, probabilityPitch]],
             outputDTypes: [.bfloat16]
         )[0]
 
@@ -6479,7 +6424,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let output: MLXArray
         let oRunsum: MLXArray?
         if oRunsumFoldEnabled, softmaxVecEnabled {
-            let attended = avVecORunsumKernel(
+            let av = useProbabilityPitch ? avPitchORunsumKernel : avVecORunsumKernel
+            let attended = av(
                 [probs] + valueBuffers + [paramsArray],
                 template: template,
                 grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
@@ -6492,6 +6438,9 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             )
             output = attended[0]
             oRunsum = attended[1]
+            if useProbabilityPitch {
+                CBv2EngageMark.once("d512-probability-pitch4")
+            }
             CBv2EngageMark.once(
                 avORunsumPartials == 1 ? "d512-ors-av-table" : "d512-ors-av-pairs")
         } else {
@@ -6515,14 +6464,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 for: output)
         }
 
-        if let fallbackFullRows {
-            for row in fallbackFullRows {
-                row.advanceAfterFusedAppend()
-            }
-        } else {
-            for seq in rows {
-                (seq as! CBv2FullSequenceKV).advanceAfterFusedAppend()
-            }
+        for row in fullRows {
+            row.advanceAfterFusedAppend()
         }
         return (output, storeFence)
     }
@@ -6563,84 +6506,45 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         else { return nil }
         guard case .full = kind.attention else { return nil }
 
-        let offset: Int
-        let keyLength: Int
+        let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
+        guard fullRows.count == batch else { return nil }
+
+        // Lockstep + storage gates, ALL before any write. The extra gate
+        // over the unfused path: the backing buffers must already have room
+        // for the new token (capacity >= kL), because the fused store cannot
+        // grow them — an ensureCapacity step falls back to the append path.
+        let offset = fullRows[0].absoluteOffset
+        let keyLength = offset + 1
+        guard offset > 0,
+            keyLength >= minKeyLength,
+            keyLength <= maxKeyLength,
+            fullRows.allSatisfy({ $0.cohortPool == nil }),
+            fullRows.allSatisfy({ $0.absoluteOffset == offset }),
+            fullRows.allSatisfy({ keyLength <= $0.maxLength })
+        else { return nil }
+
         var keyBuffers: [MLXArray] = []
         var valueBuffers: [MLXArray] = []
         keyBuffers.reserveCapacity(batch)
         valueBuffers.reserveCapacity(batch)
-        var params: [UInt32]
-        let fallbackFullRows: [CBv2FullSequenceKV]?
-
-        if directFullRowCastEnabled {
-            CBv2EngageMark.once("d512-direct-full-row-cast")
-            guard let first = rows.first as? CBv2FullSequenceKV else { return nil }
-            offset = first.absoluteOffset
-            keyLength = offset + 1
-            guard offset > 0,
-                keyLength >= minKeyLength,
-                keyLength <= maxKeyLength
+        var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
+        params.reserveCapacity(batch + 2)
+        for row in fullRows {
+            let state = row.cbv2InnerState()
+            guard state.count == 2,
+                state[0].dtype == .bfloat16,
+                state[1].dtype == .bfloat16,
+                state[0].ndim == 4,
+                state[0].dim(0) == 1,
+                state[0].dim(1) == kvHeads,
+                state[0].dim(3) == headDim,
+                state[1].shape == state[0].shape,
+                state[1].dtype == state[0].dtype,
+                state[0].dim(2) >= keyLength
             else { return nil }
-
-            params = [UInt32(keyLength), UInt32(headDim)]
-            params.reserveCapacity(batch + 2)
-            for seq in rows {
-                guard let row = seq as? CBv2FullSequenceKV,
-                    row.cohortPool == nil,
-                    row.absoluteOffset == offset,
-                    keyLength <= row.maxLength
-                else { return nil }
-                let state = row.cbv2InnerState()
-                guard state.count == 2,
-                    state[0].dtype == .bfloat16,
-                    state[1].dtype == .bfloat16,
-                    state[0].ndim == 4,
-                    state[0].dim(0) == 1,
-                    state[0].dim(1) == kvHeads,
-                    state[0].dim(3) == headDim,
-                    state[1].shape == state[0].shape,
-                    state[1].dtype == state[0].dtype,
-                    state[0].dim(2) >= keyLength
-                else { return nil }
-                keyBuffers.append(state[0])
-                valueBuffers.append(state[1])
-                params.append(UInt32(state[0].dim(2)))
-            }
-            fallbackFullRows = nil
-        } else {
-            let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
-            guard fullRows.count == batch else { return nil }
-
-            offset = fullRows[0].absoluteOffset
-            keyLength = offset + 1
-            guard offset > 0,
-                keyLength >= minKeyLength,
-                keyLength <= maxKeyLength,
-                fullRows.allSatisfy({ $0.cohortPool == nil }),
-                fullRows.allSatisfy({ $0.absoluteOffset == offset }),
-                fullRows.allSatisfy({ keyLength <= $0.maxLength })
-            else { return nil }
-
-            params = [UInt32(keyLength), UInt32(headDim)]
-            params.reserveCapacity(batch + 2)
-            for row in fullRows {
-                let state = row.cbv2InnerState()
-                guard state.count == 2,
-                    state[0].dtype == .bfloat16,
-                    state[1].dtype == .bfloat16,
-                    state[0].ndim == 4,
-                    state[0].dim(0) == 1,
-                    state[0].dim(1) == kvHeads,
-                    state[0].dim(3) == headDim,
-                    state[1].shape == state[0].shape,
-                    state[1].dtype == state[0].dtype,
-                    state[0].dim(2) >= keyLength
-                else { return nil }
-                keyBuffers.append(state[0])
-                valueBuffers.append(state[1])
-                params.append(UInt32(state[0].dim(2)))
-            }
-            fallbackFullRows = fullRows
+            keyBuffers.append(state[0])
+            valueBuffers.append(state[1])
+            params.append(UInt32(state[0].dim(2)))
         }
         let paramsArray = getD512ParamsArray(params: params)
 
@@ -6681,14 +6585,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             outputDTypes: [.bfloat16]
         )[0]
 
-        if let fallbackFullRows {
-            for row in fallbackFullRows {
-                row.advanceAfterFusedAppend()
-            }
-        } else {
-            for seq in rows {
-                (seq as! CBv2FullSequenceKV).advanceAfterFusedAppend()
-            }
+        for row in fullRows {
+            row.advanceAfterFusedAppend()
         }
         return (output, nextWriteFence)
     }
@@ -6718,93 +6616,54 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         else { return nil }
         guard case .full = kind.attention else { return nil }
 
-        let offset: Int
-        let keyLength: Int
+        let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
+        guard fullRows.count == batch else { return nil }
+
+        // Lockstep + storage gates, ALL before any append. Pooled (ATT-008)
+        // rows fail closed: their backing layout is the pool's batch axis,
+        // and the pooled route already has its own batched path.
+        let offset = fullRows[0].absoluteOffset
+        let keyLength = offset + 1
+        guard offset > 0,
+            keyLength >= minKeyLength,
+            keyLength <= maxKeyLength,
+            fullRows.allSatisfy({ $0.cohortPool == nil }),
+            fullRows.allSatisfy({ $0.absoluteOffset == offset }),
+            fullRows.allSatisfy({ keyLength <= $0.maxLength })
+        else { return nil }
+        for row in fullRows {
+            let state = row.cbv2InnerState()
+            guard state.count == 2,
+                state[0].dtype == .bfloat16,
+                state[1].dtype == .bfloat16,
+                state[0].ndim == 4,
+                state[0].dim(0) == 1,
+                state[0].dim(1) == kvHeads,
+                state[0].dim(3) == headDim,
+                state[1].shape == state[0].shape,
+                state[1].dtype == state[0].dtype
+            else { return nil }
+        }
+
+        // Byte-identical per-row appends — the same `update` calls, in the
+        // same row order, as the established per-row loop. Only the
+        // returned temporal views go unused; the kernels read the full
+        // backing buffers (contiguous, so no `ensureRowContiguous` copy)
+        // with kL/capacity as runtime scalars.
         var keyBuffers: [MLXArray] = []
         var valueBuffers: [MLXArray] = []
         keyBuffers.reserveCapacity(batch)
         valueBuffers.reserveCapacity(batch)
-        var params: [UInt32]
-
-        if directFullRowCastEnabled {
-            CBv2EngageMark.once("d512-direct-full-row-cast")
-            guard let first = rows.first as? CBv2FullSequenceKV else { return nil }
-            offset = first.absoluteOffset
-            keyLength = offset + 1
-            guard offset > 0,
-                keyLength >= minKeyLength,
-                keyLength <= maxKeyLength
-            else { return nil }
-
-            for seq in rows {
-                guard let row = seq as? CBv2FullSequenceKV,
-                    row.cohortPool == nil,
-                    row.absoluteOffset == offset,
-                    keyLength <= row.maxLength
-                else { return nil }
-                let state = row.cbv2InnerState()
-                guard state.count == 2,
-                    state[0].dtype == .bfloat16,
-                    state[1].dtype == .bfloat16,
-                    state[0].ndim == 4,
-                    state[0].dim(0) == 1,
-                    state[0].dim(1) == kvHeads,
-                    state[0].dim(3) == headDim,
-                    state[1].shape == state[0].shape,
-                    state[1].dtype == state[0].dtype
-                else { return nil }
-            }
-
-            params = [UInt32(keyLength), UInt32(headDim)]
-            params.reserveCapacity(batch + 2)
-            for (index, seq) in rows.enumerated() {
-                let row = seq as! CBv2FullSequenceKV
-                _ = row.update(
-                    keys: keys[index ..< (index + 1)],
-                    values: values[index ..< (index + 1)])
-                let state = row.cbv2InnerState()
-                keyBuffers.append(state[0])
-                valueBuffers.append(state[1])
-                params.append(UInt32(state[0].dim(2)))
-            }
-        } else {
-            let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
-            guard fullRows.count == batch else { return nil }
-
-            offset = fullRows[0].absoluteOffset
-            keyLength = offset + 1
-            guard offset > 0,
-                keyLength >= minKeyLength,
-                keyLength <= maxKeyLength,
-                fullRows.allSatisfy({ $0.cohortPool == nil }),
-                fullRows.allSatisfy({ $0.absoluteOffset == offset }),
-                fullRows.allSatisfy({ keyLength <= $0.maxLength })
-            else { return nil }
-            for row in fullRows {
-                let state = row.cbv2InnerState()
-                guard state.count == 2,
-                    state[0].dtype == .bfloat16,
-                    state[1].dtype == .bfloat16,
-                    state[0].ndim == 4,
-                    state[0].dim(0) == 1,
-                    state[0].dim(1) == kvHeads,
-                    state[0].dim(3) == headDim,
-                    state[1].shape == state[0].shape,
-                    state[1].dtype == state[0].dtype
-                else { return nil }
-            }
-
-            params = [UInt32(keyLength), UInt32(headDim)]
-            params.reserveCapacity(batch + 2)
-            for (index, row) in fullRows.enumerated() {
-                _ = row.update(
-                    keys: keys[index ..< (index + 1)],
-                    values: values[index ..< (index + 1)])
-                let state = row.cbv2InnerState()
-                keyBuffers.append(state[0])
-                valueBuffers.append(state[1])
-                params.append(UInt32(state[0].dim(2)))
-            }
+        var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
+        params.reserveCapacity(batch + 2)
+        for (index, row) in fullRows.enumerated() {
+            _ = row.update(
+                keys: keys[index ..< (index + 1)],
+                values: values[index ..< (index + 1)])
+            let state = row.cbv2InnerState()
+            keyBuffers.append(state[0])
+            valueBuffers.append(state[1])
+            params.append(UInt32(state[0].dim(2)))
         }
         return dispatchChain(
             queries: queries, keyBuffers: keyBuffers, valueBuffers: valueBuffers,
@@ -6855,74 +6714,41 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         else { return nil }
         guard case .full = kind.attention else { return nil }
 
-        let keyLength: Int
+        let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
+        guard fullRows.count == batch else { return nil }
+
+        // Lockstep + storage gates, ALL before any dispatch. Pooled
+        // (ATT-008) rows fail closed exactly like the decode path: their
+        // backing layout is the pool's batch axis.
+        let keyLength = fullRows[0].absoluteOffset
+        guard keyLength >= minKeyLength,
+            keyLength <= maxKeyLength,
+            fullRows.allSatisfy({ $0.cohortPool == nil }),
+            fullRows.allSatisfy({ $0.absoluteOffset == keyLength })
+        else { return nil }
+
         var keyBuffers: [MLXArray] = []
         var valueBuffers: [MLXArray] = []
         keyBuffers.reserveCapacity(batch)
         valueBuffers.reserveCapacity(batch)
-        var params: [UInt32]
-
-        if directFullRowCastEnabled {
-            CBv2EngageMark.once("d512-direct-full-row-cast")
-            guard let first = rows.first as? CBv2FullSequenceKV else { return nil }
-            keyLength = first.absoluteOffset
-            guard keyLength >= minKeyLength,
-                keyLength <= maxKeyLength
+        var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
+        params.reserveCapacity(batch + 2)
+        for row in fullRows {
+            let state = row.cbv2InnerState()
+            guard state.count == 2,
+                state[0].dtype == .bfloat16,
+                state[1].dtype == .bfloat16,
+                state[0].ndim == 4,
+                state[0].dim(0) == 1,
+                state[0].dim(1) == kvHeads,
+                state[0].dim(3) == headDim,
+                state[1].shape == state[0].shape,
+                state[1].dtype == state[0].dtype,
+                state[0].dim(2) >= keyLength
             else { return nil }
-
-            params = [UInt32(keyLength), UInt32(headDim)]
-            params.reserveCapacity(batch + 2)
-            for seq in rows {
-                guard let row = seq as? CBv2FullSequenceKV,
-                    row.cohortPool == nil,
-                    row.absoluteOffset == keyLength
-                else { return nil }
-                let state = row.cbv2InnerState()
-                guard state.count == 2,
-                    state[0].dtype == .bfloat16,
-                    state[1].dtype == .bfloat16,
-                    state[0].ndim == 4,
-                    state[0].dim(0) == 1,
-                    state[0].dim(1) == kvHeads,
-                    state[0].dim(3) == headDim,
-                    state[1].shape == state[0].shape,
-                    state[1].dtype == state[0].dtype,
-                    state[0].dim(2) >= keyLength
-                else { return nil }
-                keyBuffers.append(state[0])
-                valueBuffers.append(state[1])
-                params.append(UInt32(state[0].dim(2)))
-            }
-        } else {
-            let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
-            guard fullRows.count == batch else { return nil }
-
-            keyLength = fullRows[0].absoluteOffset
-            guard keyLength >= minKeyLength,
-                keyLength <= maxKeyLength,
-                fullRows.allSatisfy({ $0.cohortPool == nil }),
-                fullRows.allSatisfy({ $0.absoluteOffset == keyLength })
-            else { return nil }
-
-            params = [UInt32(keyLength), UInt32(headDim)]
-            params.reserveCapacity(batch + 2)
-            for row in fullRows {
-                let state = row.cbv2InnerState()
-                guard state.count == 2,
-                    state[0].dtype == .bfloat16,
-                    state[1].dtype == .bfloat16,
-                    state[0].ndim == 4,
-                    state[0].dim(0) == 1,
-                    state[0].dim(1) == kvHeads,
-                    state[0].dim(3) == headDim,
-                    state[1].shape == state[0].shape,
-                    state[1].dtype == state[0].dtype,
-                    state[0].dim(2) >= keyLength
-                else { return nil }
-                keyBuffers.append(state[0])
-                valueBuffers.append(state[1])
-                params.append(UInt32(state[0].dim(2)))
-            }
+            keyBuffers.append(state[0])
+            valueBuffers.append(state[1])
+            params.append(UInt32(state[0].dim(2)))
         }
         return dispatchChain(
             queries: queries, keyBuffers: keyBuffers, valueBuffers: valueBuffers,

@@ -4,8 +4,6 @@ import MLX
 /// B8 affine-4/group-64 expert gate/up with explicit BF16 closes before GeGLU.
 public enum Gemma4DecodeFusedGUV1 {
     static let enabled = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DECODE_FUSED_GEGLU"] != "0"
-    static let outputShape = [64, 1, 704]
-    static let outputDType: DType = .bfloat16
 
     /// RUN-CAP SWEEP. The pair/triple/quad impls all inline into one kernel, so
     /// register allocation is worst-case across every path -- proven by RUN-OCT,
@@ -27,14 +25,9 @@ public enum Gemma4DecodeFusedGUV1 {
 
     static func call(x: MLXArray, storage: SwitchGateUpFusedStorage,
         lhs: MLXArray, rhs: MLXArray) -> MLXArray {
-        call([storage.weight, storage.scales, storage.biases, x, lhs, rhs])
-    }
-
-    /// Raw launch for callers that already passed the fused-GU contract.
-    static func call(_ inputs: [MLXArray]) -> MLXArray {
-        kernel(inputs,
+        kernel([storage.weight, storage.scales, storage.biases, x, lhs, rhs],
             grid: (32, 176 * 2, 64), threadGroup: (32, 2, 1),
-            outputShapes: [outputShape], outputDTypes: [outputDType])[0]
+            outputShapes: [[64, 1, 704]], outputDTypes: [.bfloat16])[0]
     }
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(

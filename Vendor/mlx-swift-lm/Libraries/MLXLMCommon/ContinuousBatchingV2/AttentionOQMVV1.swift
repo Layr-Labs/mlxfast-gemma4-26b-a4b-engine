@@ -547,6 +547,203 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
     private static let mma8Rsp2StaticNHeader =
         applyOprojStaticN(to: mma8Rsp2Header, occurrences: 3)
 
+    /// OPROJ-MULTITILE. The `_rsp` body owns ONE eight-column output tile per
+    /// threadgroup, so all 352 threadgroups of an o_proj dispatch rebuild the
+    /// same plane-independent half of the group loop: the two `uint4`
+    /// activation loads, the run-sum pair, and all eight `simdgroup_float8x8`
+    /// B fills. None of those carry an `n0` term; only `wrow`/`srow`/`brow`,
+    /// `wv`/`s`/`b`, `A`, `C` and the accumulators do. At 4 bits the weight
+    /// side of a group is one `uint2` while the activation side still moves
+    /// two full `uint4`s, so the shared half is ~45% of the loop.
+    ///
+    /// This gives the threadgroup TILES tiles and hoists the shared half above
+    /// a fully-unrolled tile loop. It is a direct port of the shape already
+    /// shipping and default-ON one tier over, in `AttentionQKVMMA8V1.swift`'s
+    /// `qkv_mma8_affine4_g64_mt_rsp`: same `mma8_coord`, same macros, same
+    /// `[TILES]` arrays, same `red[t * 32 + simd_lid]` split reduction, same
+    /// read of the weight operands at point of use inside the tile loop.
+    ///
+    /// EXACT. Each output column keeps its own accumulator and walks the same
+    /// `g` sequence with the same `s`, `b`, `rs` and the same eight B operands
+    /// in the same order, so every emitted element is the same sum of the same
+    /// products in the same association. Tiling changes only which threadgroup
+    /// owns a column. The dispatch is sized `outputWidth / (8 * TILES)`, so the
+    /// same columns are covered exactly once.
+    ///
+    /// REWRITE HYGIENE. This file now carries THREE anchored rewrites --
+    /// `applyOprojCarry2`, `applyOprojUr4` and `applyOprojStaticN` -- each with
+    /// a `precondition` on its match count, and a body edit that moves their
+    /// anchor text compiles, passes the contract suite, and then kills the
+    /// worker on the first batch-8 dispatch. This body is appended to
+    /// `mma8StaticNHeader`, which is the text AFTER all three have run, so no
+    /// rewrite ever sees it and no match count can move. It is written in the
+    /// post-static-N form (N as a `constexpr`, no `N` parameter) for the same
+    /// reason.
+    ///
+    /// `DARKBLOOM_GEMMA4_OPROJ_MULTITILE=0` restores the incumbent single-tile
+    /// bodies, names and dispatch byte for byte.
+    ///
+    /// `var`, not `let`: the only trustworthy local estimator flips the arm
+    /// IN-PROCESS and interleaves the arms inside one run, because off-arm
+    /// samples on this part are bimodal across GPU clock states. A `let` would
+    /// force the probe to measure a tree that is not the tree that ships.
+    /// Production never assigns to it.
+    nonisolated(unsafe) public static var multiTileEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_OPROJ_MULTITILE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let mtGroupLoopPragma = unroll4Enabled
+        ? "#pragma clang loop unroll_count(4)" : "#pragma unroll"
+
+    private static let mma8RspMtStaticNHeader: String = mma8StaticNHeader + """
+
+template <typename T, int KS, int KFIX, int TILES>
+METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp_mt(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    const device float* rs_table,
+    device T* y,
+    const int n0,
+    threadgroup float2* red,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int N = \(outputWidth);
+  constexpr int K = KFIX;
+  constexpr int G = K / 64;
+  constexpr int gh = (G + 1) / 2;
+  constexpr int nGroups = (KS == 2) ? gh : G;
+  const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const mma8_coord c = mma8_lane(simd_lid);
+
+  const device uint8_t* wrow[TILES];
+  const device T* srow[TILES];
+  const device T* brow[TILES];
+  thread float acc0[TILES];
+  thread float acc1[TILES];
+#pragma clang loop unroll(full)
+  for (int t = 0; t < TILES; ++t) {
+    const int nt = n0 + t * 8;
+    wrow[t] = (const device uint8_t*)w + (nt + c.fm) * (K / 2) + 4 * c.fn;
+    srow[t] = scales + (nt + c.fm) * G;
+    brow[t] = biases + (nt + c.fm) * G;
+    acc0[t] = 0.0f;
+    acc1[t] = 0.0f;
+  }
+
+  const device T* x0 = x + c.fn * K + 8 * c.fm;
+  const device T* x1 = x0 + K;
+
+  simdgroup_float8x8 A;
+  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+\(mtGroupLoopPragma)
+  for (int gi = 0; gi < nGroups; ++gi) {
+    const int g = g0 + gi;
+    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+    const float2 rs = float2(
+        rs_table[c.fn * G + g], rs_table[(c.fn + 1) * G + g]);
+
+    MMA8_SETB(B0, x, lo)
+    MMA8_SETB(B1, x, hi)
+    MMA8_SETB(B2, y, lo)
+    MMA8_SETB(B3, y, hi)
+    MMA8_SETB(B4, z, lo)
+    MMA8_SETB(B5, z, hi)
+    MMA8_SETB(B6, w, lo)
+    MMA8_SETB(B7, w, hi)
+
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      const uint2 wv = *((const device uint2*)(wrow[t] + 32 * g));
+      const float s = float(srow[t][g]);
+      const float b = float(brow[t][g]);
+
+      simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+      MMA8_STEP(B0, 0)
+      MMA8_STEP(B1, 1)
+      MMA8_STEP(B2, 2)
+      MMA8_STEP(B3, 3)
+      MMA8_STEP(B4, 4)
+      MMA8_STEP(B5, 5)
+      MMA8_STEP(B6, 6)
+      MMA8_STEP(B7, 7)
+
+      acc0[t] += s * C.thread_elements()[0] + rs.x * b;
+      acc1[t] += s * C.thread_elements()[1] + rs.y * b;
+    }
+  }
+
+  if (KS == 2) {
+    if (simd_gid == 1) {
+#pragma clang loop unroll(full)
+      for (int t = 0; t < TILES; ++t) {
+        red[t * 32 + simd_lid] = float2(acc0[t], acc1[t]);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 1) {
+      return;
+    }
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      const float2 other = red[t * 32 + simd_lid];
+      acc0[t] = acc0[t] + other.x;
+      acc1[t] = acc1[t] + other.y;
+    }
+  }
+
+#pragma clang loop unroll(full)
+  for (int t = 0; t < TILES; ++t) {
+    const int nt = n0 + t * 8;
+    y[c.fn * N + nt + c.fm] = static_cast<T>(acc0[t]);
+    y[(c.fn + 1) * N + nt + c.fm] = static_cast<T>(acc1[t]);
+  }
+}
+"""
+
+    private static let mma8RspMtStaticNKernelK4096 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_rsp_staticn_v1"
+            + "_mt2" + unroll4KeySuffix,
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            attention_o_qmv_mma8_affine4_g64_rsp_mt<T, 2, 4096, 2>(
+                w, scales, biases, x, rs_table, y,
+                int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8RspMtStaticNHeader,
+        ensureRowContiguous: true)
+
+    private static let mma8RspMtStaticNKernelK8192 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp_staticn_v1"
+            + "_mt2" + unroll4KeySuffix,
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            attention_o_qmv_mma8_affine4_g64_rsp_mt<T, 2, 8192, 2>(
+                w, scales, biases, x, rs_table, y,
+                int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8RspMtStaticNHeader,
+        ensureRowContiguous: true)
+
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_bfill_v4",
@@ -998,6 +1195,25 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
                 }
                 if staticNEnabled {
                     CBv2EngageMark.once("oproj-static-n")
+                    if multiTileEnabled,
+                        outputWidth % (outputsPerGroup * 2) == 0
+                    {
+                        CBv2EngageMark.once("oproj-mt2")
+                        let mtKernel = inDim == 8192
+                            ? mma8RspMtStaticNKernelK8192
+                            : mma8RspMtStaticNKernelK4096
+                        return mtKernel(
+                            [x, weight, scales, biases, rsTable!],
+                            template: [("T", x.dtype)],
+                            grid: (
+                                simdWidth,
+                                (outputWidth / (outputsPerGroup * 2))
+                                    * simdGroups, 1),
+                            threadGroup: (simdWidth, simdGroups, 1),
+                            outputShapes: [[batch, sequence, outputWidth]],
+                            outputDTypes: [x.dtype]
+                        )[0]
+                    }
                     let staticNKernel = inDim == 8192
                         ? mma8RspStaticNKernelK8192 : mma8RspStaticNKernelK4096
                     return staticNKernel(

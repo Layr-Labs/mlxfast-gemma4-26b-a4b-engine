@@ -25,6 +25,19 @@ public enum Gemma4DecodeFusedGUV1 {
         return Int(raw).map { min(max($0, 1), 4) } ?? 2
     }()
 
+    /// Runs of one are 40.7 of the 53 distinct expert planes a layer touches at
+    /// top-8-of-128 over eight streams, so `tg_qmv_impl` carries roughly 77% of
+    /// this kernel's device weight traffic. The pair, triple and quad impls all
+    /// fetch their aligned eight-code lane packet with a single 32-bit load
+    /// (`qdot_affine4_pair_word`, `qdot_affine4_registered_word`); the singleton
+    /// path was left on the generic `qdot`, which issues two 16-bit loads for
+    /// the same four bytes. This brings the majority path onto the same load.
+    /// The two 16-bit halves are extracted from the word in place, so the
+    /// packet contents, the four-value sub-sums and their accumulation order
+    /// are untouched.
+    static let packedWordLoads =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_PACKED_WORD_LOAD"] != "0"
+
     static func call(x: MLXArray, storage: SwitchGateUpFusedStorage,
         lhs: MLXArray, rhs: MLXArray) -> MLXArray {
         call([storage.weight, storage.scales, storage.biases, x, lhs, rhs])
@@ -38,7 +51,8 @@ public enum Gemma4DecodeFusedGUV1 {
     }
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_decode_gateup_geglu_threadgroup_v1",
+        name: "gemma4_b8_decode_gateup_geglu_threadgroup_v1"
+            + (packedWordLoads ? "_word32" : ""),
         inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"],
         outputNames: ["y"],
         source: #"""
@@ -69,7 +83,8 @@ uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
     }
 
 """#,
-        header: "#define GU_RUN_CAP \(runCap)\n" + #"""
+        header: "#define GU_RUN_CAP \(runCap)\n"
+            + "#define GU_PACKED_WORD_LOAD \(packedWordLoads ? 1 : 0)\n" + #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helpers from 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -295,6 +310,23 @@ inline U qdot(
   }
 
   else if (bits == 4) {
+#if GU_PACKED_WORD_LOAD
+    // The singleton run path admits exactly one aligned four-byte lane packet
+    // holding eight 4-bit codes. Fetch it as one 32-bit word and split the two
+    // 16-bit halves in register: `packet & 0xffff` is byte 0 and byte 1, which
+    // is what `ws[0]` read, and `packet >> 16` is bytes 2 and 3, which is
+    // `ws[1]`. Same values, same two four-value sub-sums, same order.
+    static_assert(values_per_thread == 8, "Word load expects eight 4-bit values");
+    const uint packet = *((const device uint*)w);
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+      const uint word = (packet >> (16 * i)) & 0xffffu;
+      accum +=
+          (x_thread[4 * i] * (word & 0x000f) +
+           x_thread[4 * i + 1] * (word & 0x00f0) +
+           x_thread[4 * i + 2] * (word & 0x0f00) +
+           x_thread[4 * i + 3] * (word & 0xf000));
+    }
+#else
     const device uint16_t* ws = (const device uint16_t*)w;
     for (int i = 0; i < (values_per_thread / 4); i++) {
       accum +=
@@ -303,6 +335,7 @@ inline U qdot(
            x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
            x_thread[4 * i + 3] * (ws[i] & 0xf000));
     }
+#endif
   }
 
   else if (bits == 5) {

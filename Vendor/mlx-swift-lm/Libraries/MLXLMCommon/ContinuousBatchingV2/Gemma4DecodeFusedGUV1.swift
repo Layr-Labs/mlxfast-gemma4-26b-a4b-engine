@@ -6,6 +6,8 @@ public enum Gemma4DecodeFusedGUV1 {
     static let enabled = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DECODE_FUSED_GEGLU"] != "0"
     static let outputShape = [64, 1, 704]
     static let outputDType: DType = .bfloat16
+    static let simdLocalEnabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_SIMDLOCAL_V1"] != "0"
 
     /// RUN-CAP SWEEP. The pair/triple/quad impls all inline into one kernel, so
     /// register allocation is worst-case across every path -- proven by RUN-OCT,
@@ -33,7 +35,9 @@ public enum Gemma4DecodeFusedGUV1 {
 
     /// Raw launch for callers that already passed the fused-GU contract.
     static func call(_ inputs: [MLXArray], taggedRoute: Bool = false) -> MLXArray {
-        (taggedRoute ? kernelTagged : kernelGeneral)(inputs,
+        let selected = taggedRoute && runCap == 2 && simdLocalEnabled
+            ? kernelTaggedSIMDLocal : (taggedRoute ? kernelTagged : kernelGeneral)
+        return selected(inputs,
             grid: (32, 176 * 2, 64), threadGroup: (32, 2, 1),
             outputShapes: [outputShape], outputDTypes: [outputDType])[0]
     }
@@ -48,13 +52,81 @@ public enum Gemma4DecodeFusedGUV1 {
     /// two carry distinct kernel names so their pipeline-cache entries never
     /// alias. Only an already-unreachable branch is removed, so the output is
     /// bit-identical.
-    private static func makeKernel(tagged: Bool) -> MLXFast.MLXFastKernel {
+    private static func makeKernel(tagged: Bool, simdLocal: Bool = false) -> MLXFast.MLXFastKernel {
         MLXFast.metalKernel(
         name: "gemma4_b8_decode_gateup_geglu_threadgroup_v1"
-            + (tagged ? "_tagged_v1" : ""),
+            + (tagged ? "_tagged_v1" : "")
+            + (simdLocal ? "_simdlocal_v1" : ""),
         inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"],
         outputNames: ["y"],
         source: #"""
+#if GU_SIMDLOCAL
+// Each SIMD owns two matching G/U columns. Preserve the incumbent dot-product
+// reductions and BF16 closes without exchanging results between SIMD groups.
+const uint linear = threadgroup_position_in_grid.y
+    + threadgroup_position_in_grid.z * 176u;
+const uint tile = linear / 64u;
+const uint assignment = linear % 64u;
+const ExpertRun run = expert_run(rhs, assignment);
+if (!run.leader) return;
+const uint sg = simdgroup_index_in_threadgroup;
+const uint lane = thread_index_in_simdgroup;
+const uint hidden = tile * 4u + sg * 2u;
+const uint pbase = run.expert * 1408u + (hidden / 16u) * 32u + hidden % 16u;
+const uint rows[4] = {pbase, pbase + 1u, pbase + 16u, pbase + 17u};
+const device bfloat* x0 = x + lhs[assignment] * 2816u + lane * 8u;
+thread float result0[4] = {0};
+thread float result1[4] = {0};
+if (run.count == 1u) {
+    thread float xv[8];
+    for (uint k = 0; k < 2816u; k += 256u) {
+        const float sum = load_vector<bfloat, float, 8, 4>(x0 + k, xv);
+        for (uint r = 0; r < 4u; ++r) {
+            const device uint8_t* wp = reinterpret_cast<const device uint8_t*>(
+                w + rows[r] * 352u + k / 8u + lane);
+            const float s = scales[rows[r] * 44u + k / 64u + lane / 8u];
+            const float b = biases[rows[r] * 44u + k / 64u + lane / 8u];
+            result0[r] += qdot<float, 8, 4>(wp, xv, s, b, sum);
+        }
+    }
+} else {
+    const device bfloat* x1 = x + lhs[assignment + 1u] * 2816u + lane * 8u;
+    thread float xv0[8], xv1[8];
+    thread uint packed[4];
+    thread float sl[4], bl[4];
+    for (uint k = 0; k < 2816u; k += 256u) {
+        for (uint r = 0; r < 4u; ++r) {
+            packed[r] = w[rows[r] * 352u + k / 8u + lane];
+            sl[r] = scales[rows[r] * 44u + k / 64u + lane / 8u];
+            bl[r] = biases[rows[r] * 44u + k / 64u + lane / 8u];
+        }
+        const float sum0 = load_vector<bfloat, float, 8, 4>(x0 + k, xv0);
+        const float sum1 = load_vector<bfloat, float, 8, 4>(x1 + k, xv1);
+        for (uint r = 0; r < 4u; ++r) {
+            float dot0, dot1;
+            qdot_affine4_pair_word<float, 8>(packed[r], xv0, xv1,
+                sl[r], bl[r], sum0, sum1, dot0, dot1);
+            result0[r] += dot0;
+            result1[r] += dot1;
+        }
+    }
+}
+for (uint r = 0; r < 4u; ++r) {
+    result0[r] = simd_sum(result0[r]);
+    result1[r] = simd_sum(result1[r]);
+}
+if (lane < 2u) {
+    const bfloat g = static_cast<bfloat>(result0[lane]);
+    const bfloat u = static_cast<bfloat>(result0[lane + 2u]);
+    y[assignment * 704u + hidden + lane] = gemma4_geglu_compiled_tape(g, u);
+}
+if (run.count == 2u && lane >= 2u && lane < 4u) {
+    const uint col = lane - 2u;
+    const bfloat g = static_cast<bfloat>(result1[col]);
+    const bfloat u = static_cast<bfloat>(result1[col + 2u]);
+    y[(assignment + 1u) * 704u + hidden + col] = gemma4_geglu_compiled_tape(g, u);
+}
+#else
 uint3 tid=threadgroup_position_in_grid;
 uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
 
@@ -80,9 +152,11 @@ uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
         if(false){y[row*1408+hidden]=g;y[row*1408+704+hidden]=u;}
         y[(false ? 64*1408:0)+row*704+hidden]=gemma4_geglu_compiled_tape(g,u);
     }
+#endif
 
 """#,
         header: "#define GU_RUN_CAP \(runCap)\n"
+            + "#define GU_SIMDLOCAL \(simdLocal ? 1 : 0)\n"
             + "#define GU_TAGGED_ROUTE \(tagged ? 1 : 0)\n" + #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helpers from 093e716.
 #include <metal_stdlib>
@@ -1182,4 +1256,6 @@ METAL_FUNC void tg_execute_projection(const device uint* w,const device T* scale
 
     private static let kernelGeneral: MLXFast.MLXFastKernel = makeKernel(tagged: false)
     private static let kernelTagged: MLXFast.MLXFastKernel = makeKernel(tagged: true)
+    private static let kernelTaggedSIMDLocal: MLXFast.MLXFastKernel =
+        makeKernel(tagged: true, simdLocal: true)
 }

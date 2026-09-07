@@ -193,6 +193,42 @@ template <
   const short lim_rows_q = params->qL_rem - tm;
   const short lim_rows_k = params->kL_rem;
 
+  // QHOIST-001: Q is invariant across the kb loop -- Q_load_off depends only
+  // on iq and id, and the Q pointer is advanced to its final position above,
+  // before the loop. Stock re-loads every Q fragment from device memory once
+  // per key block (kb_lim = ceil(kL / BK); 32 blocks at a 1024-token prefill
+  // with BK = 32), so the same BQ x BD tile is fetched kb_lim times. Hoisting
+  // the load out of the loop fetches it once.
+  //
+  // Bit-exact: NAXTile<T, TQ, TD>::load walks kTileRows x kTileCols frags at
+  // row offset idx_row * kFragRows and column offset idx_col * kFragCols with
+  // the same `ld` and Int<1>{} arguments the per-fragment NAXTile<T, 1, 1>
+  // load used, and TQ == 1 (static_assert above) pins the row offset to 0.
+  // Fragment (0, id) therefore receives exactly the values the stock load at
+  // Q_load_off = iq * kU * ld + id * kU produced. load_rows takes the same
+  // n_rows the stock call passed (lim_rows_q - iq * kU, and iq == 0). Only
+  // WHEN a value is fetched changes, never WHICH; the mma operand sequence
+  // and every accumulation order are untouched.
+  //
+  // Register cost: TD bf16 frags. Otile above is already NAXTile<AccumType,
+  // TQ, TD> -- the same frag count in the wider accumulator type -- and is
+  // live across the whole kb loop, so this adds strictly less than the
+  // kernel already carries.
+  //
+  // Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_ATTN_QHOIST=0 to restore
+  // the per-kb load in place.
+#ifndef DARKBLOOM_GEMMA4_NAX_ATTN_QHOIST
+#define DARKBLOOM_GEMMA4_NAX_ATTN_QHOIST 1
+#endif
+#if DARKBLOOM_GEMMA4_NAX_ATTN_QHOIST
+  NAXTile<T, TQ, TD> Qtile_hoisted;
+  if (!align_Q && is_last_q) {
+    Qtile_hoisted.load_rows(Q, int(params->Q_strides[2]), lim_rows_q);
+  } else {
+    Qtile_hoisted.load(Q, int(params->Q_strides[2]));
+  }
+#endif
+
   // Loop over KV seq length
   for (int kb = 0; kb < kb_lim; kb++) {
     const int is_last_k = (kb == (params->NK_aligned));
@@ -209,12 +245,13 @@ template <
       for (short ik = 0; ik < TK; ik += 2) {
         STEEL_PRAGMA_UNROLL
         for (short id = 0; id < TD; id++) {
-          NAXTile<T, 1, 1> Qtile;
           NAXTile<T, 2, 1> Ktile;
 
-          const int Q_load_off = iq * kU * int(params->Q_strides[2]) + id * kU;
           const int K_load_off = ik * kU * int(params->K_strides[2]) + id * kU;
 
+#if !DARKBLOOM_GEMMA4_NAX_ATTN_QHOIST
+          NAXTile<T, 1, 1> Qtile;
+          const int Q_load_off = iq * kU * int(params->Q_strides[2]) + id * kU;
           if (!align_Q && is_last_q) {
             Qtile.load_rows(
                 Q + Q_load_off,
@@ -223,6 +260,7 @@ template <
           } else {
             Qtile.load(Q + Q_load_off, int(params->Q_strides[2]));
           }
+#endif
 
           if (!align_K && is_last_k) {
             Ktile.load_rows(
@@ -236,7 +274,11 @@ template <
           stile_t::NAXFrag_t::mma(
               Stile.frag_at(iq, ik),
               Stile.frag_at(iq, ik + 1),
+#if DARKBLOOM_GEMMA4_NAX_ATTN_QHOIST
+              Qtile_hoisted.frag_at(iq, id),
+#else
               Qtile.frag_at(0, 0),
+#endif
               metal::false_type{},
               Ktile.frag_at(0, 0),
               Ktile.frag_at(1, 0),

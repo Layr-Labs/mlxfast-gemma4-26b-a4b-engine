@@ -20,6 +20,17 @@
 import Foundation
 import MLX
 
+// MARK: - TAIL-STEP-TRIM-V1
+
+/// Kill switch: `DARKBLOOM_GEMMA4_TAIL_STEP_TRIM_V1` set to `0/false/no/off`
+/// restores the unconditional chained-decode submission.
+private let tailStepTrimEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_TAIL_STEP_TRIM_V1"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 // MARK: - Model interface (WS-F adapters / WS-G fixtures conform)
 
 /// Minimal steppable-model surface the loop drives. `tokens` is [B, L] int32
@@ -1067,6 +1078,24 @@ public final class EngineLoopV2: @unchecked Sendable {
         stateLock.unlock()
     }
 
+    /// TAIL-STEP-TRIM-V1. True when every row of a chained pure-decode step
+    /// has already been marked for cancellation.
+    ///
+    /// The all-or-nothing shape is load bearing, not a conservatism: a step's
+    /// position-offset advance is a single ON-DEVICE batch-wide add over the
+    /// bound rows (`CBv2LayerCache.updateAndAttend`), so a step cannot be
+    /// dropped for some rows and kept for others without the surviving rows'
+    /// offsets desynchronising from their KV writes. `ids` here is
+    /// `SchedulerV2.chainCandidateIDs()` — the COMPLETE non-paused running
+    /// set, matched one-for-one against the plan by `isPureDecodePlan` — so
+    /// "all of `ids` cancelled" means no live row needs this step at all.
+    private func allChainRowsCancelled(_ ids: [CBv2RequestID]) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard !pendingCancels.isEmpty else { return false }
+        return ids.allSatisfy { pendingCancels.contains($0) }
+    }
+
     /// Mark EVERY live request for cancellation, applied at the next step
     /// boundary exactly like `requestCancel`. Used by the fast-ack shutdown
     /// so a detached drain retires at the next boundary instead of running
@@ -1148,7 +1177,18 @@ public final class EngineLoopV2: @unchecked Sendable {
                         "v2.boundary", seconds: CFAbsoluteTimeGetCurrent() - stepStart)
                 }
                 let measurement = mtpMeasurement(for: plan)
-                let next = launchChainedDecode(plan, feeding: previous.sampledTokens!)
+                guard let next = launchChainedDecode(plan, feeding: previous.sampledTokens!)
+                else {
+                    // TAIL-STEP-TRIM-V1: every row was cancelled mid-build, so
+                    // the successor was discarded before submission. Retire the
+                    // chain exactly like the chain-broken path below; the next
+                    // boundary's `processCancellations` finishes the rows.
+                    inFlight = nil
+                    finalize(previous, now: stepNow)
+                    publishGauges()
+                    scheduleNextStep()
+                    return
+                }
                 attachMTPMeasurement(measurement, to: next, chained: true)
                 if var previousMeasurement = previous.mtpMeasurement {
                     // The previous step's finalize-to-launch interval now
@@ -1533,7 +1573,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// Pure-decode step fed by the previous step's still-lazy tokens.
     private func launchChainedDecode(
         _ plan: CBv2StepPlan, feeding lazyTokens: MLXArray
-    ) -> CBv2InFlightStep {
+    ) -> CBv2InFlightStep? {
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
         let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let ids = plan.assignments.map(\.id)
@@ -1590,6 +1630,19 @@ public final class EngineLoopV2: @unchecked Sendable {
                 CBv2StepProfiler.record(
                     "v2.sampler.build", seconds: CFAbsoluteTimeGetCurrent() - samplerStart)
             }
+        }
+        // TAIL-STEP-TRIM-V1: the cancel that ends a closed cohort is a
+        // lock-only set insert on the caller's thread (`requestCancel`), so it
+        // can land AFTER this step's boundary `processCancellations` and while
+        // the graph above is still being built on the engine thread. Re-read
+        // it here — the last point before any scheduler state moves and before
+        // the step's single `asyncEval` submits its GPU work. Discarding costs
+        // nothing on device: everything built above is lazy and is dropped
+        // unevaluated together with the row states it touched, which
+        // `processCancellations` releases at the next boundary.
+        if tailStepTrimEnabled, allChainRowsCancelled(ids) {
+            scheduler.rollback(plan)
+            return nil
         }
         scheduler.markPendingSamples(ids: ids)
         var toEval = [sampled]

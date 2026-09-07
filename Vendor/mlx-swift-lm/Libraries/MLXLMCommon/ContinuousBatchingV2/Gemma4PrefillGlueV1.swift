@@ -81,6 +81,77 @@ public enum Gemma4PrefillGlueV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// GLUEVEC-PREFILL: address each lane's four-element activation window
+    /// with one `vec<T, 4>` transaction instead of four scalar ones.
+    ///
+    /// Every kernel in this file launches 704 threads over the 2816 axis, so
+    /// `GLUE_NREADS` is 4 and lane `lid` owns exactly the aligned window
+    /// `[lid * 4, lid * 4 + 4)`. Both `2816 % 4` and `(lid * 4) % 4` are zero
+    /// and every input is `ensureRowContiguous`, so the window is a naturally
+    /// aligned eight-byte bfloat16 quad on every row of every plane.
+    ///
+    /// Only ACTIVATION planes are widened. The `w`, `w1`, `w2`, `w3`, `wd`,
+    /// `wr` and `wn` operands stay scalar-indexed: they are 5.6 KB rows that
+    /// sit in cache for the whole dispatch, and widening that class of operand
+    /// is what made the decode-side deferred-tail experiment negative.
+    ///
+    /// The values stored are not touched. Each rewritten site computes the
+    /// same expression into a register array and then issues the same bytes in
+    /// one transaction, so the arm is bit-exact by construction.
+    ///
+    /// `DARKBLOOM_GEMMA4_PREFILL_GLUE_VEC4=0` restores the scalar accessors
+    /// and the incumbent kernel names.
+    public static let vec4Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_GLUE_VEC4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Distinct kernel keys per arm, so the two accessor forms can never share
+    /// a compiled pipeline.
+    static let vec4Suffix = vec4Enabled ? "_gv4" : ""
+
+    private static let vec4Macros: String = vec4Enabled
+        ? """
+            #define GLUE_LOADF(dstf, src, base) \
+              { const vec<T, 4> gv4_a = *((const device vec<T, 4>*)((src) + (base))); \
+                (dstf)[0] = static_cast<float>(gv4_a[0]); \
+                (dstf)[1] = static_cast<float>(gv4_a[1]); \
+                (dstf)[2] = static_cast<float>(gv4_a[2]); \
+                (dstf)[3] = static_cast<float>(gv4_a[3]); }
+            #define GLUE_LOADT(dstt, src, base) \
+              { const vec<T, 4> gv4_b = *((const device vec<T, 4>*)((src) + (base))); \
+                (dstt)[0] = gv4_b[0]; \
+                (dstt)[1] = gv4_b[1]; \
+                (dstt)[2] = gv4_b[2]; \
+                (dstt)[3] = gv4_b[3]; }
+            #define GLUE_STORET(dst, base, srct) \
+              { vec<T, 4> gv4_c; \
+                gv4_c[0] = (srct)[0]; \
+                gv4_c[1] = (srct)[1]; \
+                gv4_c[2] = (srct)[2]; \
+                gv4_c[3] = (srct)[3]; \
+                *((device vec<T, 4>*)((dst) + (base))) = gv4_c; }
+            """
+        : """
+            #define GLUE_LOADF(dstf, src, base) \
+              { (dstf)[0] = static_cast<float>((src)[(base) + 0]); \
+                (dstf)[1] = static_cast<float>((src)[(base) + 1]); \
+                (dstf)[2] = static_cast<float>((src)[(base) + 2]); \
+                (dstf)[3] = static_cast<float>((src)[(base) + 3]); }
+            #define GLUE_LOADT(dstt, src, base) \
+              { (dstt)[0] = (src)[(base) + 0]; \
+                (dstt)[1] = (src)[(base) + 1]; \
+                (dstt)[2] = (src)[(base) + 2]; \
+                (dstt)[3] = (src)[(base) + 3]; }
+            #define GLUE_STORET(dst, base, srct) \
+              { (dst)[(base) + 0] = (srct)[0]; \
+                (dst)[(base) + 1] = (srct)[1]; \
+                (dst)[(base) + 2] = (srct)[2]; \
+                (dst)[(base) + 3] = (srct)[3]; }
+            """
+
     /// This checkpoint's hidden size, and the `rms_single_row` launch geometry
     /// the stock host derives from it (`RMS_N_READS` 4, so 2816 / 4 = 704
     /// threads, 22 simdgroups, one threadgroup per row).
@@ -97,6 +168,10 @@ public enum Gemma4PrefillGlueV1 {
         constant constexpr const int GLUE_NREADS = 4;
         // Pinned; `planeRows` refuses any other eps.
         constant constexpr const float GLUE_EPS = 1e-6f;
+
+        // The accessor macros are written for a four-element lane window.
+        static_assert(GLUE_NREADS == 4, "glue accessors assume a vec4 window");
+        \(vec4Macros)
 
         inline float glue_inv_rms(
             thread const float* xv,
@@ -178,7 +253,7 @@ public enum Gemma4PrefillGlueV1 {
     // MARK: - norm + residual (2 dispatches -> 1)
 
     private static let normResidualKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_norm_residual_2816_unroll_v2",
+        name: "gemma4_prefill_glue_norm_residual_2816_unroll_v2\(vec4Suffix)",
         inputNames: ["x", "w", "res"],
         outputNames: ["out"],
         source: """
@@ -193,22 +268,23 @@ public enum Gemma4PrefillGlueV1 {
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
             float xv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                xv[i] = static_cast<float>(x[base + i]);
-            }
+            GLUE_LOADF(xv, x, base);
 
             const float inv = glue_inv_rms(
                 xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            T resv[GLUE_NREADS];
+            GLUE_LOADT(resv, res, base);
+            T outv[GLUE_NREADS];
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 // The stock pair stores `w * T(x*inv)` to bf16, then reads it
                 // back for the add. Round in the same place.
                 const T normed = static_cast<T>(w[j] * static_cast<T>(xv[i] * inv));
-                out[base + i] = res[base + i] + normed;
+                outv[i] = resv[i] + normed;
             }
+            GLUE_STORET(out, base, outv);
             """,
         header: kernelHeader,
         ensureRowContiguous: true
@@ -275,7 +351,7 @@ public enum Gemma4PrefillGlueV1 {
 
     private static let attentionBranchPrefixKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_prefill_glue_attention_branch_prefix_2816_unroll_v2",
+            name: "gemma4_prefill_glue_attention_branch_prefix_2816_unroll_v2\(vec4Suffix)",
             inputNames: ["x", "w", "res", "wd", "wr"],
             outputNames: ["out", "dense", "router"],
             source: """
@@ -290,24 +366,23 @@ public enum Gemma4PrefillGlueV1 {
                 const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
                 float xv[GLUE_NREADS];
-                #pragma clang loop unroll(full)
-                for (int i = 0; i < GLUE_NREADS; i++) {
-                    xv[i] = static_cast<float>(x[base + i]);
-                }
+                GLUE_LOADF(xv, x, base);
 
                 const float inv = glue_inv_rms(
                     xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
 
                 // `normResidualKernel`'s row, verbatim; the T values just
                 // stored to `out` are kept in registers instead of re-read.
+                T resv[GLUE_NREADS];
+                GLUE_LOADT(resv, res, base);
                 T outv[GLUE_NREADS];
                 #pragma clang loop unroll(full)
                 for (int i = 0; i < GLUE_NREADS; i++) {
                     const uint j = lid * GLUE_NREADS + i;
                     const T normed = static_cast<T>(w[j] * static_cast<T>(xv[i] * inv));
-                    outv[i] = res[base + i] + normed;
-                    out[base + i] = outv[i];
+                    outv[i] = resv[i] + normed;
                 }
+                GLUE_STORET(out, base, outv);
 
                 float ov[GLUE_NREADS];
                 #pragma clang loop unroll(full)
@@ -321,13 +396,17 @@ public enum Gemma4PrefillGlueV1 {
                 const float inv2 = glue_inv_rms(
                     ov, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
 
+                T densev[GLUE_NREADS];
+                T routerv[GLUE_NREADS];
                 #pragma clang loop unroll(full)
                 for (int i = 0; i < GLUE_NREADS; i++) {
                     const uint j = lid * GLUE_NREADS + i;
                     const T scaled = static_cast<T>(ov[i] * inv2);
-                    dense[base + i] = wd[j] * scaled;
-                    router[base + i] = wr[j] * scaled;
+                    densev[i] = wd[j] * scaled;
+                    routerv[i] = wr[j] * scaled;
                 }
+                GLUE_STORET(dense, base, densev);
+                GLUE_STORET(router, base, routerv);
                 """,
             header: kernelHeader,
             ensureRowContiguous: true
@@ -372,7 +451,7 @@ public enum Gemma4PrefillGlueV1 {
     // MARK: - dual pre-norm (2 dispatches -> 1)
 
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_dual_prenorm_2816_unroll_v2",
+        name: "gemma4_prefill_glue_dual_prenorm_2816_unroll_v2\(vec4Suffix)",
         inputNames: ["x", "w1", "w2"],
         outputNames: ["out1", "out2"],
         source: """
@@ -387,23 +466,24 @@ public enum Gemma4PrefillGlueV1 {
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
             float xv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                xv[i] = static_cast<float>(x[base + i]);
-            }
+            GLUE_LOADF(xv, x, base);
 
             // One sum-of-squares serves both weights: the two stock kernels
             // reduce the identical input and differ only in the weight vector.
             const float inv = glue_inv_rms(
                 xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            T out1v[GLUE_NREADS];
+            T out2v[GLUE_NREADS];
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T scaled = static_cast<T>(xv[i] * inv);
-                out1[base + i] = w1[j] * scaled;
-                out2[base + i] = w2[j] * scaled;
+                out1v[i] = w1[j] * scaled;
+                out2v[i] = w2[j] * scaled;
             }
+            GLUE_STORET(out1, base, out1v);
+            GLUE_STORET(out2, base, out2v);
             """,
         header: kernelHeader,
         ensureRowContiguous: true
@@ -461,7 +541,7 @@ public enum Gemma4PrefillGlueV1 {
     /// `dualPreNorm` with its second output removed: the same reduction, the
     /// same `w * T(x * inv)` store, one weight.
     private static let preNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_prenorm_2816_unroll_v2",
+        name: "gemma4_prefill_glue_prenorm_2816_unroll_v2\(vec4Suffix)",
         inputNames: ["x", "w"],
         outputNames: ["out"],
         source: """
@@ -476,20 +556,19 @@ public enum Gemma4PrefillGlueV1 {
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
             float xv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                xv[i] = static_cast<float>(x[base + i]);
-            }
+            GLUE_LOADF(xv, x, base);
 
             const float inv = glue_inv_rms(
                 xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            T outv[GLUE_NREADS];
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T scaled = static_cast<T>(xv[i] * inv);
-                out[base + i] = w[j] * scaled;
+                outv[i] = w[j] * scaled;
             }
+            GLUE_STORET(out, base, outv);
             """,
         header: kernelHeader,
         ensureRowContiguous: true
@@ -554,7 +633,7 @@ public enum Gemma4PrefillGlueV1 {
     /// `preNormScatterKernel` with the `K` index reads lifted above the stores.
     private static let preNormScatterHoistKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_prefill_glue_prenorm_scatter_2816_idxhoist_v3",
+            name: "gemma4_prefill_glue_prenorm_scatter_2816_idxhoist_v3\(vec4Suffix)",
             inputNames: ["x", "w", "inverse"],
             outputNames: ["out"],
             source: """
@@ -569,10 +648,7 @@ public enum Gemma4PrefillGlueV1 {
                 const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
                 float xv[GLUE_NREADS];
-                #pragma clang loop unroll(full)
-                for (int i = 0; i < GLUE_NREADS; i++) {
-                    xv[i] = static_cast<float>(x[base + i]);
-                }
+                GLUE_LOADF(xv, x, base);
 
                 const float inv = glue_inv_rms(
                     xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
@@ -603,10 +679,7 @@ public enum Gemma4PrefillGlueV1 {
                 for (int k = 0; k < K; k++) {
                     const size_t pos = size_t(sorted_pos[k]);
                     const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
-                    #pragma clang loop unroll(full)
-                    for (int i = 0; i < GLUE_NREADS; i++) {
-                        out[obase + i] = normed[i];
-                    }
+                    GLUE_STORET(out, obase, normed);
                 }
                 """,
             header: kernelHeader,
@@ -618,7 +691,7 @@ public enum Gemma4PrefillGlueV1 {
     /// each integer changes; the normalized values and store order do not.
     private static let preNormScatterThreadgroupIndexKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_prefill_glue_prenorm_scatter_2816_idx_tgcache_v4",
+            name: "gemma4_prefill_glue_prenorm_scatter_2816_idx_tgcache_v4\(vec4Suffix)",
             inputNames: ["x", "w", "inverse"],
             outputNames: ["out"],
             source: """
@@ -644,10 +717,7 @@ public enum Gemma4PrefillGlueV1 {
                 const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
                 float xv[GLUE_NREADS];
-                #pragma clang loop unroll(full)
-                for (int i = 0; i < GLUE_NREADS; i++) {
-                    xv[i] = static_cast<float>(x[base + i]);
-                }
+                GLUE_LOADF(xv, x, base);
 
                 const float inv = glue_inv_rms(
                     xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
@@ -664,10 +734,7 @@ public enum Gemma4PrefillGlueV1 {
                 for (uint k = 0; k < 8; ++k) {
                     const size_t pos = size_t(cached_positions[k]);
                     const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
-                    #pragma clang loop unroll(full)
-                    for (int i = 0; i < GLUE_NREADS; i++) {
-                        out[obase + i] = normed[i];
-                    }
+                    GLUE_STORET(out, obase, normed);
                 }
                 """,
             header: kernelHeader,
@@ -679,7 +746,7 @@ public enum Gemma4PrefillGlueV1 {
     /// values are computed once into registers and stored to each of the
     /// row's K sorted positions.
     private static let preNormScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_prenorm_scatter_2816_unroll_v2",
+        name: "gemma4_prefill_glue_prenorm_scatter_2816_unroll_v2\(vec4Suffix)",
         inputNames: ["x", "w", "inverse"],
         outputNames: ["out"],
         source: """
@@ -694,10 +761,7 @@ public enum Gemma4PrefillGlueV1 {
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
             float xv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                xv[i] = static_cast<float>(x[base + i]);
-            }
+            GLUE_LOADF(xv, x, base);
 
             const float inv = glue_inv_rms(
                 xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
@@ -720,10 +784,7 @@ public enum Gemma4PrefillGlueV1 {
             for (int k = 0; k < K; k++) {
                 const size_t pos = size_t(inverse[assignment_base + k]);
                 const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
-                #pragma clang loop unroll(full)
-                for (int i = 0; i < GLUE_NREADS; i++) {
-                    out[obase + i] = normed[i];
-                }
+                GLUE_STORET(out, obase, normed);
             }
             """,
         header: kernelHeader,
@@ -793,7 +854,7 @@ public enum Gemma4PrefillGlueV1 {
     // MARK: - branch tail (5 dispatches -> 1)
 
     private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_tail_2816_unroll_v2",
+        name: "gemma4_prefill_glue_tail_2816_unroll_v2\(vec4Suffix)",
         inputNames: ["h1", "h2", "w1", "w2", "w3", "res2"],
         outputNames: ["out"],
         source: """
@@ -810,11 +871,8 @@ public enum Gemma4PrefillGlueV1 {
 
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                av[i] = static_cast<float>(h1[base + i]);
-                bv[i] = static_cast<float>(h2[base + i]);
-            }
+            GLUE_LOADF(av, h1, base);
+            GLUE_LOADF(bv, h2, base);
 
             float inv_a = 0;
             float inv_b = 0;
@@ -836,12 +894,16 @@ public enum Gemma4PrefillGlueV1 {
             const float inv_t = glue_inv_rms(
                 tv, local_sums_a, local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            T res2v[GLUE_NREADS];
+            GLUE_LOADT(res2v, res2, base);
+            T outv[GLUE_NREADS];
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T normed = static_cast<T>(w3[j] * static_cast<T>(tv[i] * inv_t));
-                out[base + i] = res2[base + i] + normed;
+                outv[i] = res2v[i] + normed;
             }
+            GLUE_STORET(out, base, outv);
             """,
         header: kernelHeader,
         ensureRowContiguous: true
@@ -883,7 +945,7 @@ public enum Gemma4PrefillGlueV1 {
     /// stores `out`, so both cost one extra in-kernel reduction rather than a
     /// re-read of the row plus two launches.
     private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_tail_chain_2816_unroll_v2",
+        name: "gemma4_prefill_glue_tail_chain_2816_unroll_v2\(vec4Suffix)",
         inputNames: ["h1", "h2", "w1", "w2", "w3", "res2", "s", "wn"],
         outputNames: ["out", "normed"],
         source: """
@@ -900,11 +962,8 @@ public enum Gemma4PrefillGlueV1 {
 
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                av[i] = static_cast<float>(h1[base + i]);
-                bv[i] = static_cast<float>(h2[base + i]);
-            }
+            GLUE_LOADF(av, h1, base);
+            GLUE_LOADF(bv, h2, base);
 
             float inv_a = 0;
             float inv_b = 0;
@@ -928,27 +987,33 @@ public enum Gemma4PrefillGlueV1 {
             // multiply reads it back and stores again. Both roundings are
             // explicit here, so `out` is the same array either way.
             const T scalar = s[0];
+            T res2v[GLUE_NREADS];
+            GLUE_LOADT(res2v, res2, base);
             float ov[GLUE_NREADS];
+            T outv[GLUE_NREADS];
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T normed3 = static_cast<T>(w3[j] * static_cast<T>(tv[i] * inv_t));
-                const T summed = static_cast<T>(res2[base + i] + normed3);
+                const T summed = static_cast<T>(res2v[i] + normed3);
                 const T scaled = static_cast<T>(summed * scalar);
-                out[base + i] = scaled;
+                outv[i] = scaled;
                 ov[i] = static_cast<float>(scaled);
             }
+            GLUE_STORET(out, base, outv);
 
             // The next layer's input norm, over exactly the bf16 values just
             // stored to `out`.
             const float inv_n = glue_inv_rms(
                 ov, local_sums_a, local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            T normedv[GLUE_NREADS];
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
-                normed[base + i] = wn[j] * static_cast<T>(ov[i] * inv_n);
+                normedv[i] = wn[j] * static_cast<T>(ov[i] * inv_n);
             }
+            GLUE_STORET(normed, base, normedv);
             """,
         header: kernelHeader,
         ensureRowContiguous: true
@@ -988,7 +1053,7 @@ public enum Gemma4PrefillGlueV1 {
     /// same `[tokens, hidden]` expert result. Produce each reduced expert value
     /// in the tail thread that consumes it, removing the intermediate tensor.
     private static let expertTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_expert_unsort_tail_chain_2816_meta_vec4_v7",
+        name: "gemma4_prefill_expert_unsort_tail_chain_2816_meta_vec4_v7\(vec4Suffix)",
         inputNames: [
             "sorted", "inverse_order", "route_weights", "h1",
             "w1", "w2", "w3", "res2", "s", "wn",

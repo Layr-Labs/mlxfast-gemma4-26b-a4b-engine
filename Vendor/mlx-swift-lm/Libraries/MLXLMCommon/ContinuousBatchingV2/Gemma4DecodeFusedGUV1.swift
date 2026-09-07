@@ -21,7 +21,7 @@ public enum Gemma4DecodeFusedGUV1 {
     /// the 86% of threadgroups that never execute them.
     /// `DARKBLOOM_GEMMA4_GU_RUN_CAP=4` restores the incumbent.
     static let runCap: Int = {
-        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_RUN_CAP"] ?? "4"
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_RUN_CAP"] ?? "2"
         return Int(raw).map { min(max($0, 1), 4) } ?? 2
     }()
 
@@ -38,6 +38,54 @@ public enum Gemma4DecodeFusedGUV1 {
             outputShapes: [outputShape], outputDTypes: [outputDType])[0]
     }
 
+    /// DQS1: sibling outputs from one invocation; no step-dependent cache.
+    /// Caller has proved tagged routes, cap two or four and the production geometry.
+    static func callWithDownQuartets(_ inputs: [MLXArray]) -> [MLXArray] {
+        kernelTaggedDownQuartets(inputs,
+            grid: (32, 176 * 2, 64), threadGroup: (32, 2, 1),
+            outputShapes: [outputShape, [64, 176]],
+            outputDTypes: [outputDType, .float32])
+    }
+
+    private static let downQuartetSource = #"""
+static_assert(GU_PAIRS == 1 && (GU_RUN_CAP == 2 || GU_RUN_CAP == 4), "DQS1 admission");
+uint3 tid=threadgroup_position_in_grid;
+uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
+const uint linear=tid.y+tid.z*176u;tid.y=linear/64u;tid.z=linear%64u;
+const uint assignment=tid.z;const ExpertRun run=expert_run(rhs,assignment);
+if(!run.leader)return;
+const uint column=tid.y*4u;
+const uint packedRow=(column/16u)*32u+column%16u+(sg==1u ? 16u:0u)-sg*4u;
+const uint expertBase=run.expert*1408u;
+threadgroup bfloat tile[32];
+uint3 mathTid=tid;mathTid.y=0;
+tg_execute_projection<bfloat>(
+    w+(expertBase+packedRow)*352u,scales+(expertBase+packedRow)*44u,
+    biases+(expertBase+packedRow)*44u,x,lhs,tile,8,guSliceN,
+    assignment,run.count,mathTid,sg,lane);
+threadgroup_barrier(mem_flags::mem_threadgroup);
+if(sg==0u){
+    // All 32 lanes execute every shuffle; inactive output lanes carry zero.
+    bfloat a=bfloat(0.0f);
+    if(lane<run.count*4u){
+        const uint r=lane/4u,h=lane%4u;
+        const bfloat g=tile[r*8u+h],u=tile[r*8u+4u+h];
+        a=gemma4_geglu_compiled_tape(g,u);
+        y[(assignment+r)*704u+column+h]=a;
+    }
+    const uint bits=uint(as_type<ushort>(a));
+    const uint qbase=lane&~3u;
+    const bfloat b=as_type<bfloat>(ushort(simd_shuffle(bits,ushort(qbase+1u))));
+    const bfloat c=as_type<bfloat>(ushort(simd_shuffle(bits,ushort(qbase+2u))));
+    const bfloat d=as_type<bfloat>(ushort(simd_shuffle(bits,ushort(qbase+3u))));
+    if(lane<run.count*4u && (lane&3u)==0u){
+        // The donor's quartet expression, widened only AFTER it is computed.
+        const float q=a+b+c+d;
+        quartets[(assignment+lane/4u)*176u+column/4u]=q;
+    }
+}
+"""#
+
     /// GU-TAGGED-ROUTE. When the route producer emits prefix-bounds tagged
     /// words, `expert_run`'s untagged fallback -- a backward, data-dependent
     /// scan over `rhs` -- can never execute, but it still inlines into the
@@ -48,13 +96,15 @@ public enum Gemma4DecodeFusedGUV1 {
     /// two carry distinct kernel names so their pipeline-cache entries never
     /// alias. Only an already-unreachable branch is removed, so the output is
     /// bit-identical.
-    private static func makeKernel(tagged: Bool) -> MLXFast.MLXFastKernel {
+    private static func makeKernel(
+        tagged: Bool, downQuartets: Bool = false
+    ) -> MLXFast.MLXFastKernel {
         MLXFast.metalKernel(
         name: "gemma4_b8_decode_gateup_geglu_threadgroup_v1"
-            + (tagged ? "_tagged_v1" : ""),
+            + (tagged ? "_tagged_v1" : "") + (downQuartets ? "_dqs1" : ""),
         inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"],
-        outputNames: ["y"],
-        source: #"""
+        outputNames: downQuartets ? ["y", "quartets"] : ["y"],
+        source: downQuartets ? downQuartetSource : #"""
 uint3 tid=threadgroup_position_in_grid;
 uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
 
@@ -1182,4 +1232,6 @@ METAL_FUNC void tg_execute_projection(const device uint* w,const device T* scale
 
     private static let kernelGeneral: MLXFast.MLXFastKernel = makeKernel(tagged: false)
     private static let kernelTagged: MLXFast.MLXFastKernel = makeKernel(tagged: true)
+    private static let kernelTaggedDownQuartets: MLXFast.MLXFastKernel =
+        makeKernel(tagged: true, downQuartets: true)
 }

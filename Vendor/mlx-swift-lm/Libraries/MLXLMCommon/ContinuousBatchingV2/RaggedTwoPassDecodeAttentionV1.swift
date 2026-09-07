@@ -6115,6 +6115,135 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         """,
         ensureRowContiguous: true)
 
+    // Two SIMD groups retain both halves of their own RoPE pairs.
+    private static let twoSIMDNormStoreEnabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_TWO_SIMD_NORM_STORE_V1"]?.lowercased() ?? ""
+        return !["0", "false", "no", "off"].contains(raw)
+    }()
+
+    private static let ringStoreNormRopeTwoSIMDKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1_two_simd_v1",
+        inputNames: ["k0","k1","k2","k3","k4","k5","k6","k7","v0","v1","v2","v3","v4","v5","v6","v7","params","raw_queries","raw_keys","q_weight","k_weight","position_offsets","rope_freqs","write_fence"],
+        outputNames: ["fence","q_out","k_out","v_out"],
+        source: """
+            constexpr int D = 512;
+            constexpr int KV_ROWS = 16;
+            constexpr int Q_HEADS = 16;
+            constexpr int K_HEADS = 2;
+            constexpr int reads = 4;
+            typedef vec<T, 4> T4;
+            const int z = int(threadgroup_position_in_grid.z);
+            const int lid = int(thread_position_in_threadgroup.x);
+            const int lane = int(thread_index_in_simdgroup);
+            const int simd_group = int(simdgroup_index_in_threadgroup);
+            const int key_length = int(params[0]);
+            const bool is_key = z < KV_ROWS;
+            const int local_row = is_key ? z : z - KV_ROWS;
+            const int batch_index = is_key ? local_row / K_HEADS : local_row / Q_HEADS;
+            const int kv_head = local_row % K_HEADS;
+            const device T* input = (is_key ? raw_keys : raw_queries) + local_row * D;
+            const device T* weight = is_key ? k_weight : q_weight;
+            device T* key_slot = k_out;
+            device T* value_slot = v_out;
+            if (is_key) {
+                const int row_capacity = int(params[2 + batch_index]);
+                const device T* key_plane = k0;
+                const device T* value_plane = v0;
+                switch (batch_index) {
+                    case 1: key_plane = k1; value_plane = v1; break;
+                    case 2: key_plane = k2; value_plane = v2; break;
+                    case 3: key_plane = k3; value_plane = v3; break;
+                    case 4: key_plane = k4; value_plane = v4; break;
+                    case 5: key_plane = k5; value_plane = v5; break;
+                    case 6: key_plane = k6; value_plane = v6; break;
+                    case 7: key_plane = k7; value_plane = v7; break;
+                    default: break;
+                }
+                key_slot = const_cast<device T*>(key_plane)
+                    + size_t(kv_head) * size_t(row_capacity) * D
+                    + size_t(key_length - 1) * D;
+                value_slot = const_cast<device T*>(value_plane)
+                    + size_t(kv_head) * size_t(row_capacity) * D
+                    + size_t(key_length - 1) * D;
+            }
+            device T* output_row = is_key ? key_slot : (q_out + local_row * D);
+            device T* key_mirror = k_out + (is_key ? local_row : 0) * D;
+            device T* value_mirror = v_out + (is_key ? local_row : 0) * D;
+
+            // Each group owns two original stripes separated by half the row.
+            T4 vin[2];
+            float stripe_sum[2];
+            #pragma clang loop unroll(full)
+            for (int stripe = 0; stripe < 2; ++stripe) {
+                vin[stripe] = *reinterpret_cast<const device T4*>(
+                    input + stripe * 256 + lid * reads);
+                float partial = 0.0f;
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < reads; ++i) {
+                    const float value = float(vin[stripe][i]);
+                    partial += value * value;
+                }
+                stripe_sum[stripe] = simd_sum(partial);
+            }
+            threadgroup float partials[4];
+            if (lane == 0) {
+                partials[simd_group] = stripe_sum[0];
+                partials[simd_group + 2] = stripe_sum[1];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float sum = lane < 4 ? partials[lane] : 0.0f;
+            sum = simd_sum(sum);
+            float inverse_rms = 0.0f;
+            if (lane == 0) {
+                inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+            }
+            inverse_rms = simd_shuffle(inverse_rms, ushort(0));
+
+            T4 rounded[2];
+            #pragma clang loop unroll(full)
+            for (int stripe = 0; stripe < 2; ++stripe) {
+                const T4 wv = *reinterpret_cast<const device T4*>(
+                    weight + stripe * 256 + lid * reads);
+                T4 sharedv;
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < reads; ++i) {
+                    const T normalized = T(float(vin[stripe][i]) * inverse_rms);
+                    rounded[stripe][i] = T(wv[i] * normalized);
+                    if (is_key) sharedv[i] = T(1) * normalized;
+                }
+                if (is_key) {
+                    *reinterpret_cast<device T4*>(value_slot + stripe * 256 + lid * reads) = sharedv;
+                    *reinterpret_cast<device T4*>(value_mirror + stripe * 256 + lid * reads) = sharedv;
+                }
+            }
+
+            // Each lane owns both BF16-rounded members of its four RoPE pairs.
+            const float L = static_cast<float>(position_offsets[batch_index]);
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < reads; ++i) {
+                const int pair = lid * reads + i;
+                const float inv_freq = 1.0f / rope_freqs[pair];
+                const float theta = L * inv_freq;
+                const float costheta = metal::fast::cos(theta);
+                const float sintheta = metal::fast::sin(theta);
+                const float x1 = static_cast<float>(rounded[0][i]);
+                const float x2 = static_cast<float>(rounded[1][i]);
+                const float rx1 = x1 * costheta - x2 * sintheta;
+                const float rx2 = x1 * sintheta + x2 * costheta;
+                output_row[pair] = static_cast<T>(rx1);
+                output_row[pair + D / 2] = static_cast<T>(rx2);
+                if (is_key) {
+                    key_mirror[pair] = static_cast<T>(rx1);
+                    key_mirror[pair + D / 2] = static_cast<T>(rx2);
+                }
+            }
+            if (z == 0 && lid == 0) {
+                fence[0] = write_fence[0] + 1;
+            }
+            """,
+        ensureRowContiguous: true)
+
     /// NORMROPE-D512: the WRITE-022 store dispatch with the full layers' Q/K
     /// RMSNorm + RoPE folded in, so the standalone
     /// `gemma4_b8_qkv_rms_norm_rope_v2_vec1` dispatch leaves the chain.
@@ -6414,7 +6543,10 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             let normRope = takeFullNormRope(
                 queries: queries, keys: keys, values: values)
         {
-            let stored = ringStoreNormRopeKernel(
+            let storeThreads = twoSIMDNormStoreEnabled ? 64 : 128
+            let storeKernel = twoSIMDNormStoreEnabled
+                ? ringStoreNormRopeTwoSIMDKernel : ringStoreNormRopeKernel
+            let stored = storeKernel(
                 keyBuffers + valueBuffers + [
                     paramsArray,
                     normRope.rawQueries,
@@ -6426,8 +6558,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     previousWriteFence,
                 ],
                 template: template,
-                grid: (128, 1, batch * kvHeads + batch * queryHeads),
-                threadGroup: (128, 1, 1),
+                grid: (storeThreads, 1, batch * kvHeads + batch * queryHeads),
+                threadGroup: (storeThreads, 1, 1),
                 outputShapes: [
                     [1],
                     [batch, queryHeads, 1, headDim],
@@ -6441,6 +6573,9 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             normalizedKeys = stored[2]
             normalizedValues = stored[3]
             CBv2EngageMark.once("d512-normrope-store")
+            if twoSIMDNormStoreEnabled {
+                CBv2EngageMark.once("d512-two-simd-norm-store")
+            }
         } else {
             storeFence = ringStoreKernel(
                 keyBuffers + valueBuffers

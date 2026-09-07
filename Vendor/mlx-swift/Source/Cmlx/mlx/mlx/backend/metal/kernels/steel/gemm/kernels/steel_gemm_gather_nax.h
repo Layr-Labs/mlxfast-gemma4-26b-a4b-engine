@@ -2,6 +2,25 @@
 
 using namespace mlx::steel;
 
+// DARKBLOOM GEMMA4 NAX GATHER-BARRIER-ELIDE.
+// `gather_mm_rhs_nax` declares NO threadgroup storage: A, B, C and rhs_indices
+// are all `device`, and `Ctile` is a NAXTile, a `thread` register struct. The
+// `mem_flags::mem_none` barrier in the expert-segment walk therefore orders no
+// memory -- mem_none orders none by definition, and there is none here to
+// order. Its only possible role is an execution rendezvous, and that rendezvous
+// is not uniform: `tm = SM * (simd_group_id / WN)` gives each row-block of
+// simdgroups its own slice of `rhs_indices`, so the while loop's trip count is
+// the number of equal-expert runs in that slice and differs per simdgroup
+// whenever WM > 1. The ranked prefill geometry takes `bm = 64, wm = 2`
+// (matmul.cpp: `M / E > 48`), so the incumbent reaches this barrier a
+// data-dependent, per-simdgroup-varying number of times. Removing it removes a
+// no-op rendezvous, not synchronisation.
+//
+// Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_GATHER_BARRIER_ELIDE=0 to restore the barrier.
+#ifndef DARKBLOOM_GEMMA4_NAX_GATHER_BARRIER_ELIDE
+#define DARKBLOOM_GEMMA4_NAX_GATHER_BARRIER_ELIDE 1
+#endif
+
 constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
 constant bool align_K [[function_constant(202)]];
@@ -83,7 +102,9 @@ gather_mm_rhs_nax(
         break;
       }
     }
+#if !DARKBLOOM_GEMMA4_NAX_GATHER_BARRIER_ELIDE
     threadgroup_barrier(mem_flags::mem_none);
+#endif
 
     NAXTile<AccumType, TM, TN> Ctile;
 

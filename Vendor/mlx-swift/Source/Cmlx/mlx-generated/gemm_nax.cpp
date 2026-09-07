@@ -1343,6 +1343,45 @@ namespace mlx::steel {
 #define DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE 1
 #endif
 
+// DARKBLOOM GEMMA4 NAX TGP-BARRIER ELIDE.
+// Both K loops of the accelerated GEMM family open every BK step with
+// threadgroup_barrier(mem_flags::mem_none). That barrier is a vestige of the
+// non-NAX steel GEMM, whose cooperative loaders stage A and B through the
+// threadgroup arrays As/Bs and must fence readers against writers once per
+// step. The NAX bodies stage nothing: gemm_loop and gemm_loop_softmax load A
+// and B straight from device memory into per-simdgroup NAXTile registers,
+// declare no threadgroup array, run no cooperative loader and write no
+// threadgroup memory, and neither does any of the four NAX kernels that call
+// them (steel_gemm_fused_nax.h, steel_gemm_gather_nax.h,
+// steel_gemm_segmented_nax.h, steel_gemm_splitk_nax.h -- none declares a
+// threadgroup array at all). mem_none requests no memory fence, so the call
+// is a pure execution rendezvous ordering accesses to storage that does not
+// exist, and it costs the threadgroup one full lockstep per BK step.
+//
+// EXACTNESS. Removing an execution barrier cannot change a value. Dtile is a
+// register accumulator private to its simdgroup; A and B are read-only device
+// operands; D is written after the loop into disjoint per-simdgroup extents.
+// No simdgroup reads anything another simdgroup produced, so no output element
+// depends on the order in which the simdgroups advance. Every element still
+// accumulates over exactly the same k values in exactly the same sequence.
+// The kernel's template parameters and every kernel-name string the host
+// builds are untouched.
+//
+// COMPOSITION WITH NAX-SKIP-EMPTY. That mechanism's hazard argument places its
+// `continue` strictly after this barrier so that a skipping simdgroup still
+// reaches the barrier every iteration and threadgroup-uniform barrier arrival
+// is preserved. With the elide on there is no barrier in the loop to arrive
+// at, so the hazard the argument answers cannot arise: Metal constrains
+// uniform arrival only at barriers that exist. The elide therefore weakens
+// nothing in SKIP-EMPTY, and with the elide off the incumbent text and the
+// incumbent argument both stand byte for byte.
+//
+// Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_TGP_BARRIER_ELIDE=0 to
+// restore the barrier at every site.
+#ifndef DARKBLOOM_GEMMA4_NAX_TGP_BARRIER_ELIDE
+#define DARKBLOOM_GEMMA4_NAX_TGP_BARRIER_ELIDE 1
+#endif
+
 template <
     typename T,
     short SM,
@@ -1414,7 +1453,9 @@ auto gemm_loop(
 
   STEEL_PRAGMA_NO_UNROLL
   for (int kk0 = 0; kk0 < gemm_k_iterations_; kk0++) {
+#if !DARKBLOOM_GEMMA4_NAX_TGP_BARRIER_ELIDE
     threadgroup_barrier(mem_flags::mem_none);
+#endif
     if constexpr (
         (DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY != 0) &&
         (!kAlignedM || !kAlignedN)) {
@@ -1620,7 +1661,9 @@ auto gemm_loop_softmax(
 
   STEEL_PRAGMA_NO_UNROLL
   for (int kk0 = 0; kk0 < gemm_k_iterations_; kk0++) {
+#if !DARKBLOOM_GEMMA4_NAX_TGP_BARRIER_ELIDE
     threadgroup_barrier(mem_flags::mem_none);
+#endif
     if constexpr (
         (DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY != 0) &&
         (!kAlignedM || !kAlignedN)) {

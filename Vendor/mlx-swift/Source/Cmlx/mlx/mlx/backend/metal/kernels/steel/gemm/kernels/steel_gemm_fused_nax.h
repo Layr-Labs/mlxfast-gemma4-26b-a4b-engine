@@ -2,6 +2,30 @@
 
 using namespace mlx::steel;
 
+// DARKBLOOM GEMMA4 NAX FUSED-PROLOGUE-BARRIER-ELIDE.
+// The `// Prepare threadgroup memory` comment and the mem_none barrier beneath
+// it are inherited verbatim from the non-NAX ancestor steel_gemm_fused.h, where
+// that comment introduces the declarations it names:
+//     // Prepare threadgroup memory
+//     threadgroup T As[gemm_kernel::tgp_mem_size_a];
+//     threadgroup T Bs[gemm_kernel::tgp_mem_size_b];
+//     threadgroup_barrier(mem_flags::mem_none);
+// In the NAX variant those two declarations are gone -- the tiles are
+// per-simdgroup registers -- and the comment and barrier were carried over
+// without their subject. This file's own NAX-SKIP-EMPTY documentation states
+// the same fact: "gemm_loop reads A and B straight from device memory into
+// per-simdgroup register tiles; it declares no threadgroup array, runs no
+// cooperative loader and writes no threadgroup memory."
+//
+// So the barrier orders no memory (mem_none orders none, and this kernel
+// declares none) and separates only device-pointer arithmetic from more
+// device-pointer arithmetic. It runs once per threadgroup in the prologue.
+//
+// Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_FUSED_PROLOGUE_BARRIER_ELIDE=0 to restore it.
+#ifndef DARKBLOOM_GEMMA4_NAX_FUSED_PROLOGUE_BARRIER_ELIDE
+#define DARKBLOOM_GEMMA4_NAX_FUSED_PROLOGUE_BARRIER_ELIDE 1
+#endif
+
 constant bool has_batch [[function_constant(10)]];
 
 constant bool use_out_source [[function_constant(100)]];
@@ -231,7 +255,9 @@ template <
   D += params->batch_stride_d * tid.z;
 
   // Prepare threadgroup memory
+#if !DARKBLOOM_GEMMA4_NAX_FUSED_PROLOGUE_BARRIER_ELIDE
   threadgroup_barrier(mem_flags::mem_none);
+#endif
 
   // Find block in A, B, C
   const int c_row = tid_y * BM;

@@ -127,6 +127,15 @@ public enum CBv2DenseMLPQMVV1 {
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+    /// SEAM1 composition switch. Default ON: route the down plane through the
+    /// static-K+carry2 lane-sums composition. Off restores the incumbent
+    /// routing (opt-in lane-sums consumer, else static-K, else generic).
+    private static let downLaneSumsStaticKEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_DOWN_LANESUMS_STATICK"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
 
     /// Gate/up compile-time K walk, unrolled by two. Off keeps the runtime-K
     /// kernel for this plane; the down plane and its switch are unaffected.
@@ -1135,6 +1144,67 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
             """,
         header: mma8DownLaneSumHeader,
         ensureRowContiguous: true)
+    /// SEAM1 (P2 sep06-mb1 E2): lane-sums prepass composed onto the promoted
+    /// static-K+carry2 down body. Derivation starts from mma8DownStaticKHeader
+    /// (not the generic header), so the carry2 look-ahead, the K=2112 walk,
+    /// and the unrolled group loop are retained; only the impl name, the
+    /// signature (laneSums table in), and the per-lane run-sum tree (table
+    /// load, matching the promoted lane-sums consumer) change. The producer
+    /// tree is the same mma8_runsum8 + xor(2,4,16) reduction the static-K body
+    /// kept, so values — and hence tokens — match the arm-off tree.
+    private static let mma8DownStaticKLaneSumHeader: String = {
+        var result = mma8DownStaticKHeader
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(
+            "gemma4_qmv_mma8_affine8_g64_down_k2112_impl(",
+            with: "gemma4_qmv_mma8_affine8_g64_down_k2112_lane_sums_impl(")
+        replaceOnce(
+            """
+                const device T* x,
+                device T* y,
+                const int N,
+            """,
+            with: """
+                const device T* x,
+                const device float2* laneSums,
+                device T* y,
+                const int N,
+            """)
+        replaceOnce(
+            """
+                // Each B lane owns the two 8-runs whose run sums the C lane (fm, fn)
+                // needs; three xor-butterfly steps over the fm lane bits broadcast
+                // RS[g][fn] and RS[g][fn + 1] to all eight lanes of the fn column group.
+                float2 rs = float2(mma8_runsum8<T>(r0), mma8_runsum8<T>(r1));
+                rs += simd_shuffle_xor(rs, 2u);
+                rs += simd_shuffle_xor(rs, 4u);
+                rs += simd_shuffle_xor(rs, 16u);
+            """,
+            with: """
+                // Producer retained this exact lane's original reduction tree.
+                const float2 rs = laneSums[g * 32 + simd_lid];
+            """)
+        return result
+    }()
+
+    private static let mma8DownStaticKLaneSumQMVKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_lane_sums_v1",
+        inputNames: ["x", "w", "scales", "biases", "laneSums"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            gemma4_qmv_mma8_affine8_g64_down_k2112_lane_sums_impl<T, 2>(
+                w, scales, biases, x, (const device float2*)laneSums, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            """,
+        header: mma8DownStaticKLaneSumHeader,
+        ensureRowContiguous: true)
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v2_unroll",
@@ -1488,6 +1558,26 @@ inline U qdot_affine8_registered_v4(
             // `mlp-w4-load` disappears and the total is unchanged.
             if isGateUp { CBv2EngageMark.once("mlp-mma8-gateup") }
             let yTiles = outDim / outputsPerGroup
+            if !isGateUp && downLaneSumsStaticKEnabled && mma8DownStaticKEnabled {
+                CBv2EngageMark.once("down-lanesums-statick")
+                let groups = inDim / Self.groupSize
+                let laneSums = mma8DownLaneSumKernel(
+                    [x],
+                    template: [("T", x.dtype)],
+                    grid: (simdWidth, groups, 1),
+                    threadGroup: (simdWidth, 1, 1),
+                    outputShapes: [[groups, simdWidth, 2]],
+                    outputDTypes: [.float32]
+                )[0]
+                return mma8DownStaticKLaneSumQMVKernel(
+                    [x, weight, scales, biases, laneSums],
+                    template: [("T", x.dtype)],
+                    grid: (simdWidth, yTiles * simdGroups, 1),
+                    threadGroup: (simdWidth, simdGroups, 1),
+                    outputShapes: [[batch, sequence, outDim]],
+                    outputDTypes: [x.dtype]
+                )[0]
+            }
             if !isGateUp && mma8DownLaneSumsEnabled {
                 let groups = inDim / Self.groupSize
                 let laneSums = mma8DownLaneSumKernel(

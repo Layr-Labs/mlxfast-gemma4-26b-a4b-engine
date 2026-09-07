@@ -31,7 +31,7 @@ public enum Gemma4DecodeFusedGUV1 {
     }
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_decode_gateup_geglu_threadgroup_v1",
+        name: "gemma4_b8_decode_gateup_geglu_threadgroup_v2",
         inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"],
         outputNames: ["y"],
         source: #"""
@@ -820,6 +820,91 @@ METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
   }
 }
 
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void tg_qmv_affine4_g64_solo_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    threadgroup T* y0,
+    const constant int& in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 8;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x0_thread[values_per_thread];
+  thread uint packed[results_per_simdgroup];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float result0[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  y0 += out_row;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x0_thread, scale_local[row], bias_local[row], sum0);
+    }
+
+    ws += block_size / 2;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+  }
+
+  // Same whole-packet tail contract as the pair path: the only caller enters
+  // with K=guK=2816, a whole number of 256-value blocks, so the final block
+  // holds complete eight-value lane packets and no lane takes this branch.
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum0 =
+        load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x0_thread, scale_local[row], bias_local[row], sum0);
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    if (simd_lid == 0) {
+      y0[row] = static_cast<T>(result0[row]);
+    }
+  }
+}
+
 #if GU_RUN_CAP >= 3
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void tg_qmv_affine4_g64_triple_stream_impl(
@@ -1133,7 +1218,7 @@ METAL_FUNC void tg_execute_projection(const device uint* w,const device T* scale
     const device T* x,const device uint* lhs,threadgroup T* y0,int rowStride,
     const constant int& outputN,uint assignment,uint count,uint3 tid,uint sg,uint lane) {
     const device T* x0=x+lhs[assignment]*2816;
-    if(count==1){tg_qmv_impl<T,64,4>(w,scales,biases,x0,y0,guK,outputN,tid,sg,lane);return;}
+    if(count==1){tg_qmv_affine4_g64_solo_impl<T,64,4>(w,scales,biases,x0,y0,guK,tid,sg,lane);return;}
     const device T* x1=x+lhs[assignment+1]*2816;threadgroup T* y1=y0+rowStride;
     if(count==2){tg_qmv_affine4_g64_pair_impl<T,64,4>(w,scales,biases,x0,x1,y0,y1,guK,tid,sg,lane);return;}
 #if GU_RUN_CAP >= 3

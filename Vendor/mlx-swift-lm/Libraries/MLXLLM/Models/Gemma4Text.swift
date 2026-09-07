@@ -928,7 +928,7 @@ private let gemma4QKVNormRopeEnabled: Bool = {
 }()
 
 private let gemma4QKVNormKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_qkv_rms_norm_rope_v2_vec1",
+        name: "gemma4_b8_qkv_rms_norm_rope_v2_vec1_nb1",
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base", "rope_freqs",
@@ -983,12 +983,10 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
         threadgroup float partials[32];
         threadgroup float inverse_rms;
         threadgroup T rounded[D];
-        if (simd_group == 0) partials[lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) partials[simd_group] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (simd_group == 0) {
-            sum = simd_sum(partials[lane]);
+            sum = simd_sum(lane < (D / 128) ? partials[lane] : 0.0f);
             if (lane == 0) {
                 inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
             }
@@ -1081,7 +1079,7 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
 /// threadgroup, and each row keeps its own 64 threads and its own two
 /// simdgroups, so the reduction tree is the stock one row for row.
 private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_v2",
+    name: "gemma4_qkv_rms_norm_head_major_v2_nb1",
     inputNames: [
         "q", "k", "q_weight", "k_weight",
         "position_offsets", "rope_freqs",
@@ -1149,14 +1147,10 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        // Slots 2..31 stay exactly zero, so the 32-lane combine returns the
-        // two simdgroup partials' sum whatever order the tree adds them in.
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
+            sum = simd_sum(lane < (D / 128) ? partials[slot][lane] : 0.0f);
             if (lane == 0) {
                 inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
             }
@@ -1281,7 +1275,7 @@ private func gemma4FusedQKVNormHeadMajor(
 /// staging boundary. Structure extends the head-major twin; rotation is a
 /// line-for-line transcription of rope.metal's base path.
 private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_sliding_v1",
+    name: "gemma4_qkv_rms_norm_head_major_sliding_v1_nb1",
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base",
@@ -1353,12 +1347,10 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
+            sum = simd_sum(lane < (D / 128) ? partials[slot][lane] : 0.0f);
             if (lane == 0) {
                 inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
             }
@@ -1421,7 +1413,7 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
 /// allocation. The mirror is therefore the pack kernel's output byte for
 /// byte, computed without re-reading the 67 MB of K/V it packs.
 private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_sliding_pack_pg1",
+    name: "gemma4_qkv_rms_norm_head_major_sliding_pack_pg1_nb1",
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base",
@@ -1502,12 +1494,10 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
+            sum = simd_sum(lane < (D / 128) ? partials[slot][lane] : 0.0f);
             if (lane == 0) {
                 inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
             }
@@ -6812,29 +6802,60 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
     private static let threadgroupSize = axis / valuesPerThread
     private static let eps: Float = 1e-6
 
-    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v1",
-        inputNames: ["x", "w"],
-        outputNames: ["out", "xSums"],
-        source: """
-            const uint row = threadgroup_position_in_grid.x;
-            const uint lid = thread_position_in_threadgroup.x;
-            const uint simd_lane_id = thread_index_in_simdgroup;
-            const uint simd_group_id = simdgroup_index_in_threadgroup;
-            threadgroup float local_inv[1];
-            threadgroup float local_sums[32];
-            threadgroup float quad_sums[704];
+    /// `DARKBLOOM_GEMMA4_FINAL_NORM_NB=0` selects the incumbent combine text
+    /// and the incumbent kernel name.
+    static let finalNormNbEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_FINAL_NORM_NB"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
 
-            const uint base = row * 2816 + lid * 4;
-            const uint wbase = lid * 4;
+    static let finalNormRiEnabled: Bool = {
+        guard finalNormNbEnabled else { return false }
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_FINAL_NORM_RI"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
 
-            // Exact `rms_single_row<T, 4>` reduction for axis 2816.
-            float acc = 0.0f;
-            for (int i = 0; i < 4; ++i) {
-                const float xi = x[base + i];
-                acc += xi * xi;
+    private static let nbSuffix: String = {
+        if finalNormRiEnabled { return "_nb1_ri1" }
+        if finalNormNbEnabled { return "_nb1" }
+        return ""
+    }()
+
+    private static let combine: String = {
+        if finalNormRiEnabled {
+            return """
+            if (simd_lane_id == 0) {
+                local_sums[simd_group_id] = acc;
             }
-            acc = simd_sum(acc);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            acc = simd_sum(
+                simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
+            const float inv =
+                metal::precise::rsqrt(acc / 2816.0f + 1e-06f);
+            """
+        }
+        if finalNormNbEnabled {
+            return """
+            if (simd_lane_id == 0) {
+                local_sums[simd_group_id] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                acc = simd_sum(
+                    simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
+                if (simd_lane_id == 0) {
+                    local_inv[0] =
+                        metal::precise::rsqrt(acc / 2816.0f + 1e-06f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            """
+        }
+        return """
             if (simd_group_id == 0) {
                 local_sums[simd_lane_id] = 0.0f;
             }
@@ -6851,12 +6872,40 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            """
+    }()
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v1"
+            + nbSuffix,
+        inputNames: ["x", "w"],
+        outputNames: ["out", "xSums"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            \(finalNormRiEnabled ? "" : "threadgroup float local_inv[1];")
+            threadgroup float local_sums[32];
+            threadgroup float quad_sums[704];
+
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+
+            // Exact `rms_single_row<T, 4>` reduction for axis 2816.
+            float acc = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                const float xi = x[base + i];
+                acc += xi * xi;
+            }
+            acc = simd_sum(acc);
+            \(combine)
 
             T outv[4];
             for (int i = 0; i < 4; ++i) {
                 // Preserve the stock RMSNorm's BF16 boundary exactly.
                 outv[i] = w[wbase + i]
-                    * static_cast<T>((float)x[base + i] * local_inv[0]);
+                    * static_cast<T>((float)x[base + i] * \(finalNormRiEnabled ? "inv" : "local_inv[0]"));
                 out[base + i] = outv[i];
             }
 
@@ -6909,6 +6958,8 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             produced: outputs[1], for: outputs[0])
         else { return nil }
         CBv2EngageMark.once("final-norm-mma-xsum")
+        if finalNormNbEnabled { CBv2EngageMark.once("final-norm-nb") }
+        if finalNormRiEnabled { CBv2EngageMark.once("final-norm-ri") }
         return (outputs[0], sums)
     }
 }

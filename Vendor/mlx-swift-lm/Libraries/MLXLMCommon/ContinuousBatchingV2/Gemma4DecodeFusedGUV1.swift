@@ -14,14 +14,18 @@ public enum Gemma4DecodeFusedGUV1 {
     /// so the rarely-taken wide paths may be taxing the 86% that never run them.
     /// This compiles OUT every impl above the cap.
     /// DEFAULT 2. Measured single-worker under realistic top-8-of-128 routing:
-    ///   cap4 (incumbent) 0.002927 s/token, cap2 0.002660 = **+9.12%**, zero
+    ///   cap4 0.002927 s/token, cap2 0.002660 = **+9.12%**, zero
     ///   overlap across five alternating passes, tokens bit-identical.
     /// Runs of three or more are only 14% of runs, but the triple and quad
     /// impls inline into the same kernel, so their registers were charged to
     /// the 86% of threadgroups that never execute them.
-    /// `DARKBLOOM_GEMMA4_GU_RUN_CAP=4` restores the incumbent.
+    /// Tip `30909ca` / jacklightChen `d4c5ad7` had promoted the default to 4
+    /// as one retained mechanism in a multi-receipt stack (exact-parent floor
+    /// retention, not an independent win). This candidate restores default 2
+    /// as a single-lever experiment against that tip.
+    /// `DARKBLOOM_GEMMA4_GU_RUN_CAP=4` restores the tip/`d4c5ad7` default.
     static let runCap: Int = {
-        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_RUN_CAP"] ?? "4"
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_RUN_CAP"] ?? "2"
         return Int(raw).map { min(max($0, 1), 4) } ?? 2
     }()
 

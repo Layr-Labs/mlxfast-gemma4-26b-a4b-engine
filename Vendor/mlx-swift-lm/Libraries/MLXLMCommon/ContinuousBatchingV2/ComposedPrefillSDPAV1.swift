@@ -242,16 +242,16 @@ enum CBv2ComposedPrefillSDPAV1 {
         return queries.reshaped([B, nKVHeads, nRepeats, queries.dim(2), queryDim])
     }
 
-    /// The fast.cpp SDPA fallback, minus the identity query scale.
+    /// The unchanged BF16 QK and causal-mask stage of the composed fallback.
     /// Returns nil when this call is not provably that graph.
     /// `queryPlaneSlice` is this block's view of `queryPlane(...)` when the
     /// caller could hoist it; nil means reshape here instead.
-    static func attend(
+    static func prepareScores(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, L: Int, kL: Int, window: Int?,
         bidirectional: Bool, sinks: MLXArray?,
         queryPlaneSlice: MLXArray? = nil
-    ) -> MLXArray? {
+    ) -> (scores: MLXArray, values: MLXArray)? {
         guard enabled, scale == 1.0, sinks == nil, !bidirectional else { return nil }
         // Decode (L == 1) and every MTP verify width (L in 2...8) keep the
         // stock path: this rider is the prompt plane only.
@@ -323,6 +323,27 @@ enum CBv2ComposedPrefillSDPAV1 {
             scores = MLX.where(causalMask(L: L, kL: kL), scores, bfloat16LowestScalar)
         }
 
+        return (scores, v)
+    }
+
+    static func attend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, L: Int, kL: Int, window: Int?,
+        bidirectional: Bool, sinks: MLXArray?,
+        queryPlaneSlice: MLXArray? = nil
+    ) -> MLXArray? {
+        guard let stage = prepareScores(
+            queries: queries, keys: keys, values: values,
+            scale: scale, L: L, kL: kL, window: window,
+            bidirectional: bidirectional, sinks: sinks,
+            queryPlaneSlice: queryPlaneSlice)
+        else { return nil }
+        var scores = stage.scores
+        let v = stage.values
+        let B = queries.dim(0)
+        let nQHeads = queries.dim(1)
+        let nRepeats = nQHeads / keys.dim(1)
+        let valueDim = values.dim(3)
         var output: MLXArray
         if let fused = CBv2PrefillAttnTrafficV1.attend(scores: scores, values: v) {
             // PREFILL-ATTN-TRAFFIC (at1): the softmax is applied by the P.V
@@ -860,12 +881,11 @@ enum CBv2PrefillAttnTrafficV1 {
         )
     }
 
-    /// `matmul(softmax(scores, axis: -1, precise: true), values)` with the
-    /// probabilities never materialized, or nil to keep the incumbent pair.
+    /// The incumbent per-row softmax statistics and launch geometry.
     /// `scores` is the row-contiguous `[.., L, kL]` score rectangle of one
     /// query block, `values` the `[.., kL, D]` operand the incumbent
     /// `matmul` takes.
-    static func attend(scores: MLXArray, values: MLXArray) -> MLXArray? {
+    static func statistics(scores: MLXArray, values: MLXArray) -> MLXArray? {
         guard enabled, CBv2PrefillSoftmaxVecV1.enabled, let statsKernel else { return nil }
         guard scores.dtype == .bfloat16, values.dtype == .bfloat16 else { return nil }
         guard scores.ndim >= 2, values.ndim == scores.ndim else { return nil }
@@ -901,6 +921,14 @@ enum CBv2PrefillAttnTrafficV1 {
             outputShapes: [statsShape],
             outputDTypes: [.bfloat16]
         )[0]
+        return stats
+    }
+
+    static func attend(scores: MLXArray, values: MLXArray) -> MLXArray? {
+        guard let stats = statistics(scores: scores, values: values) else { return nil }
+        let axisSize = scores.dim(-1)
+        let D = values.dim(-1)
+        let nRows = scores.size / axisSize
         // The column view of the carrier: row stride 4, column stride 0 once
         // addmm broadcasts it over the D output columns -- the signature.
         let carrier = stats[.ellipsis, 0 ..< 1]

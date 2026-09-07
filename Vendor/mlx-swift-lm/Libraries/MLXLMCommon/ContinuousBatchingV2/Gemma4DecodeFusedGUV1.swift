@@ -21,7 +21,10 @@ public enum Gemma4DecodeFusedGUV1 {
     /// the 86% of threadgroups that never execute them.
     /// `DARKBLOOM_GEMMA4_GU_RUN_CAP=4` restores the incumbent.
     static let runCap: Int = {
-        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_RUN_CAP"] ?? "4"
+        // Tip cc24d37f/ca154ce left the env fallback at "4" while the docblock
+        // above still says DEFAULT 2 (local +9.12% vs cap4, bit-identical).
+        // Restore the documented default; DARKBLOOM_GEMMA4_GU_RUN_CAP=4 kills.
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_RUN_CAP"] ?? "2"
         return Int(raw).map { min(max($0, 1), 4) } ?? 2
     }()
 

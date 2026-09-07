@@ -4725,15 +4725,93 @@ private enum Gemma4FusedLayerGlue {
             }
     """
 
+    /// Pair the two independent reductions in the active deferred tail.
+    /// Keep their arithmetic trees; share only the publication barrier.
+    private static let deferredPairedRmsEnabled: Bool = {
+        guard tgBarrierHalveEnabled else { return false }
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DEFERRED_PAIRED_RMS_V1"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let deferredPairedRmsSuffix: String =
+        deferredPairedRmsEnabled ? "_dpr1" : ""
+
+    private static func deferredPairedRmsSource(
+        _ source: String, chained: Bool
+    ) -> String {
+        guard deferredPairedRmsEnabled else { return source }
+        var result = source
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(
+            rmsReduce("a", into: "local_inv[0]", plane: tbPlane(0)),
+            with: "")
+        let pair = """
+            threadgroup float local_sums_pair_b[32];
+            {
+                float acc_a = 0;
+                float acc_e = 0;
+                for (int i = 0; i < 4; i++) {
+                    float xa = (float)a[base + i];
+                    float xe = (float)expertv[i];
+                    acc_a += xa * xa;
+                    acc_e += xe * xe;
+                }
+                acc_a = simd_sum(acc_a);
+                acc_e = simd_sum(acc_e);
+                if (simd_lane_id == 0) {
+                    local_sums[simd_group_id] = acc_a;
+                    local_sums_pair_b[simd_group_id] = acc_e;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                acc_a = simd_sum(
+                    simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
+                acc_e = simd_sum(
+                    simd_lane_id < 22 ? local_sums_pair_b[simd_lane_id] : 0.0f);
+                local_inv[0] = metal::precise::rsqrt(acc_a / 2816.0f + 1e-06f);
+                local_inv[1] = metal::precise::rsqrt(acc_e / 2816.0f + 1e-06f);
+            }
+            """
+        replaceOnce(
+            rmsReduce("expertv", into: "local_inv[1]", plane: tbPlane(1))
+                .replacingOccurrences(
+                    of: "(float)expertv[base + i]", with: "(float)expertv[i]"),
+            with: pair)
+        // Both paired planes still have readers after the shared barrier.
+        // The dependent sv stage uses the third plane. Its publication
+        // barrier orders all earlier readers before outv reuses local_sums.
+        replaceOnce(
+            rmsReduce("sv", into: "local_inv[0]", plane: tbPlane(2))
+                .replacingOccurrences(
+                    of: "(float)sv[base + i]", with: "(float)sv[i]"),
+            with: rmsReduce("sv", into: "local_inv[0]", plane: tbPlane(1))
+                .replacingOccurrences(
+                    of: "(float)sv[base + i]", with: "(float)sv[i]"))
+        if chained {
+            replaceOnce(
+                rmsReduce("outv", into: "local_inv[0]", plane: tbPlane(3))
+                    .replacingOccurrences(
+                        of: "(float)outv[base + i]", with: "(float)outv[i]"),
+                with: rmsReduce("outv", into: "local_inv[0]", plane: tbPlane(0))
+                    .replacingOccurrences(
+                        of: "(float)outv[base + i]", with: "(float)outv[i]"))
+        }
+        return result
+    }
+
     private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1_vec1"
-            + tbSuffix,
+            + tbSuffix + deferredPairedRmsSuffix,
         inputNames: [
             "a", "sorted", "inverse", "route_weights", "res",
             "w1", "w2", "w3", "s",
         ],
         outputNames: ["out"],
-        source: """
+        source: deferredPairedRmsSource("""
             const uint row = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
             const uint simd_lane_id = thread_index_in_simdgroup;
@@ -4768,7 +4846,7 @@ private enum Gemma4FusedLayerGlue {
                 const T summed = res[base + i] + normed3;
                 out[base + i] = summed * scalar;
             }
-        """,
+        """, chained: false),
         ensureRowContiguous: true
     )
 
@@ -4776,13 +4854,13 @@ private enum Gemma4FusedLayerGlue {
         MLXFast.metalKernel(
             name:
                 "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1_rs1"
-                + tbSuffix,
+                + tbSuffix + deferredPairedRmsSuffix,
             inputNames: [
                 "a", "sorted", "inverse", "route_weights", "res",
                 "w1", "w2", "w3", "s", "wn",
             ],
             outputNames: ["out", "normed", "rs"],
-            source: """
+            source: deferredPairedRmsSource("""
                 const uint row = threadgroup_position_in_grid.x;
                 const uint lid = thread_position_in_threadgroup.x;
                 const uint simd_lane_id = thread_index_in_simdgroup;
@@ -4847,7 +4925,7 @@ private enum Gemma4FusedLayerGlue {
                 if ((lid & 15u) == 0u) {
                     rs[row * 44 + (lid >> 4)] = rsv;
                 }
-            """,
+            """, chained: true),
             ensureRowContiguous: true
         )
 
@@ -4886,6 +4964,9 @@ private enum Gemma4FusedLayerGlue {
             nextInputNormWeight.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-deferred-expert-tail-chain")
+        if deferredPairedRmsEnabled {
+            CBv2EngageMark.once("glue-deferred-expert-tail-chain-paired-rms")
+        }
         let outs = deferredTailChainKernel(
             [
                 mlpOut, expertRows.sortedOutputs, expertRows.inverseOrder,
@@ -4920,6 +5001,9 @@ private enum Gemma4FusedLayerGlue {
             layerScalar.size == 1, layerScalar.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-deferred-expert-tail")
+        if deferredPairedRmsEnabled {
+            CBv2EngageMark.once("glue-deferred-expert-tail-paired-rms")
+        }
         return deferredTailKernel(
             [
                 mlpOut, expertRows.sortedOutputs, expertRows.inverseOrder,

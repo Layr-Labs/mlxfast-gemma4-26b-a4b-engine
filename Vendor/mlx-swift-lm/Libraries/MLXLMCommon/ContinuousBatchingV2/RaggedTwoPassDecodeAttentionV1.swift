@@ -98,11 +98,24 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         let positionOffsets: MLXArray
         let ropeLog2Base: MLXArray
         let ropeInverseFrequencies: MLXArray?
+        let ropeTrigValues: MLXArray?
     }
 
     private static let residentNormRopeLock = NSLock()
     nonisolated(unsafe) private static var residentNormRopeInputs:
         [ObjectIdentifier: ResidentNormRopeInputs] = [:]
+
+    /// Invariant resident-kernel gates shared with optional upstream producers.
+    /// Array shapes and ownership still require registration's per-call checks.
+    static var residentNormRopeKernelAvailable: Bool {
+        q4ResidentNormRopeEnabled && enabled && q4ResidentMergeEnabled
+            && blocks == 8 && combineColumns == 8 && combineThreads == 256
+            && CBv2WindowedSequenceKV.q4FusedMirrorWriteEnabled
+            && CBv2WindowedSequenceKV.q4BF16RingElideEnabled
+            && CBv2WindowedSequenceKV.quantEnabled
+            && !CBv2WindowedSequenceKV.quantSimulate
+            && !CBv2WindowedSequenceKV.gpuPackCheck
+    }
 
     /// Register the raw producer inputs behind an already-built exact
     /// norm+RoPE fallback. The fallback arrays remain what the generic cache
@@ -122,21 +135,13 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         ropeLog2Base: MLXArray,
         ropeInverseFrequencies: MLXArray? = nil,
         eps: Float,
-        appliedRope: Bool
+        appliedRope: Bool,
+        sharedRopeTable: CBv2SharedSlidingRopeV1.Table? = nil,
+        sharedRopeParameters: CBv2SharedSlidingRopeV1.Parameters? = nil
     ) -> Bool {
-        guard q4ResidentNormRopeEnabled,
-            appliedRope,
+        guard appliedRope,
             eps == 1.0e-6,
-            enabled,
-            q4ResidentMergeEnabled,
-            blocks == 8,
-            combineColumns == 8,
-            combineThreads == 256,
-            CBv2WindowedSequenceKV.q4FusedMirrorWriteEnabled,
-            CBv2WindowedSequenceKV.q4BF16RingElideEnabled,
-            CBv2WindowedSequenceKV.quantEnabled,
-            !CBv2WindowedSequenceKV.quantSimulate,
-            !CBv2WindowedSequenceKV.gpuPackCheck,
+            residentNormRopeKernelAvailable,
             normalizedQueries.dtype == .bfloat16,
             normalizedQueries.shape == [batch, queryHeads, 1, headDim],
             normalizedKeys.dtype == .bfloat16,
@@ -166,6 +171,13 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             return false
         }
 
+        let ropeTrigValues = sharedRopeTable?.matchingValues(
+            positionOffsets: positionOffsets,
+            parameters: sharedRopeParameters,
+            ropeLog2Base: ropeLog2Base,
+            inverseFrequencies: ropeInverseFrequencies,
+            dimensions: headDim)
+
         residentNormRopeLock.lock()
         if residentNormRopeInputs.count >= 64 {
             residentNormRopeInputs.removeAll(keepingCapacity: true)
@@ -181,7 +193,8 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 kWeight: kWeight,
                 positionOffsets: positionOffsets,
                 ropeLog2Base: ropeLog2Base,
-                ropeInverseFrequencies: ropeInverseFrequencies)
+                ropeInverseFrequencies: ropeInverseFrequencies,
+                ropeTrigValues: ropeTrigValues)
         residentNormRopeLock.unlock()
         return true
     }
@@ -3337,10 +3350,34 @@ for (int element = 0; element < values_per_lane; ++element) {
     /// every raw element is normalized once; all eight resident attention groups
     /// reuse the BF16-rounded threadgroup rows.
     private static func residentNormRopeSource(
-        withORunsum: Bool, directRope: Bool
+        withORunsum: Bool, directRope: Bool, sharedRope: Bool = false
     ) -> String {
-        let normRopePrologue = directRope
+        var normRopePrologue = directRope
             ? residentNormRopeDirectPrologue : residentNormRopeStagedPrologue
+        if sharedRope {
+            // Only replace the float32 trigonometry producer. Normalization,
+            // BF16 boundaries, Q/K rotation expressions and barriers stay exact.
+            let indent = String(repeating: " ", count: directRope ? 20 : 16)
+            let original = [
+                "const float d = static_cast<float>(pair)",
+                "    / static_cast<float>(D / 2);",
+                "const float inv_freq = ROPE_INV_FREQS",
+                "    ? rope_parameters[pair]",
+                "    : metal::exp2(-d * rope_parameters[0]);",
+                "const float theta = L * inv_freq;",
+                "const float costheta = metal::fast::cos(theta);",
+                "const float sintheta = metal::fast::sin(theta);",
+            ].joined(separator: "\n" + indent)
+            let replacement = [
+                "const size_t trig_base =",
+                "    (size_t(batch_index) * (D / 2) + size_t(pair)) * 2;",
+                "const float costheta = rope_trig[trig_base];",
+                "const float sintheta = rope_trig[trig_base + 1];",
+            ].joined(separator: "\n" + indent)
+            precondition(normRopePrologue.components(separatedBy: original).count == 2)
+            normRopePrologue = normRopePrologue.replacingOccurrences(
+                of: original, with: replacement)
+        }
         return """
                 typedef vec<T, 4> T4;
                 constexpr int simd_width = 32;
@@ -3700,6 +3737,27 @@ for (int element = 0; element < values_per_lane; ++element) {
             ensureRowContiguous: true
         )
 
+    /// Distinct source and keys preserve all four established kernels as the
+    /// fallback. Index bit 1 selects direct RoPE; bit 0 selects the O run sum.
+    private static let sharedRopeResidentKernels: [MLXFast.MLXFastKernel] =
+        (0..<4).map { index in
+            let directRope = index & 2 != 0
+            let withORunsum = index & 1 != 0
+            return MLXFast.metalKernel(
+                name: "cbv2_sliding_shared_trig_resident_d256_v1_d\(directRope ? 1 : 0)_ors\(withORunsum ? 1 : 0)\(slidingPrefetchKey)\(slidingSoftRefKey)",
+                inputNames: [
+                    "raw_queries",
+                    "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+                    "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
+                    "position_offsets", "rope_parameters", "write_fence", "rope_trig",
+                ],
+                outputNames: ["out", "fence", "k_out", "v_out"]
+                    + (withORunsum ? ["o_rs"] : []),
+                source: residentNormRopeSource(
+                    withORunsum: withORunsum, directRope: directRope, sharedRope: true),
+                ensureRowContiguous: true)
+        }
+
     /// KVQ-PORT: `attendRing` reading the packed 8-bit mirror instead of the
     /// bf16 ring, with the result CONSUMED by pass B exactly as the stock
     /// road consumes it. This is the separate-write road only: the promoted
@@ -3845,7 +3903,7 @@ for (int element = 0; element < values_per_lane; ++element) {
             if let normRope = takeResidentNormRope(
                 queries: queries, keys: newKeys, values: newValues)
             {
-                let residentInputs =
+                var residentInputs =
                     [normRope.rawQueries] + mirrors + [
                         startArray,
                         normRope.rawKeys,
@@ -3856,6 +3914,15 @@ for (int element = 0; element < values_per_lane; ++element) {
                         normRope.ropeInverseFrequencies ?? normRope.ropeLog2Base,
                         previousWriteFence,
                     ]
+                let sharedRopeKernel: MLXFast.MLXFastKernel?
+                if let ropeTrigValues = normRope.ropeTrigValues {
+                    residentInputs.append(ropeTrigValues)
+                    let index = (q4ResidentDirectRopeEnabled ? 2 : 0)
+                        + (oRunsumFoldEnabled ? 1 : 0)
+                    sharedRopeKernel = sharedRopeResidentKernels[index]
+                } else {
+                    sharedRopeKernel = nil
+                }
                 let residentTemplate: [(String, any KernelTemplateArg)] = [
                     ("T", normRope.rawQueries.dtype),
                     ("D", headDim),
@@ -3876,9 +3943,9 @@ for (int element = 0; element < values_per_lane; ++element) {
                 let resident: [MLXArray]
                 let oRunsum: MLXArray?
                 if oRunsumFoldEnabled {
-                    let kernel = q4ResidentDirectRopeEnabled
+                    let kernel = sharedRopeKernel ?? (q4ResidentDirectRopeEnabled
                         ? portQuantFusedWriteResidentNormRopeDirectORunsumKernel
-                        : portQuantFusedWriteResidentNormRopeORunsumKernel
+                        : portQuantFusedWriteResidentNormRopeORunsumKernel)
                     resident = kernel(
                         residentInputs,
                         template: residentTemplate,
@@ -3891,9 +3958,9 @@ for (int element = 0; element < values_per_lane; ++element) {
                     oRunsum = resident[4]
                     CBv2EngageMark.once("o-runsum-resident-fold")
                 } else {
-                    let kernel = q4ResidentDirectRopeEnabled
+                    let kernel = sharedRopeKernel ?? (q4ResidentDirectRopeEnabled
                         ? portQuantFusedWriteResidentNormRopeDirectKernel
-                        : portQuantFusedWriteResidentNormRopeKernel
+                        : portQuantFusedWriteResidentNormRopeKernel)
                     resident = kernel(
                         residentInputs,
                         template: residentTemplate,
@@ -3913,6 +3980,9 @@ for (int element = 0; element < values_per_lane; ++element) {
                 CBv2EngageMark.once("kvq4-fused-live-write")
                 CBv2EngageMark.once("kvq4-resident-merge")
                 CBv2EngageMark.once("kvq4-resident-norm-rope")
+                if sharedRopeKernel != nil {
+                    CBv2EngageMark.once("shared-sliding-rope")
+                }
                 if q4ResidentDirectRopeEnabled {
                     CBv2EngageMark.once("kvq4-resident-direct-rope")
                 }
@@ -4300,6 +4370,11 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Producer eligibility uses exactly the invariant full consumer gates.
+    static var normRopeKernelAvailable: Bool {
+        normRopeFoldEnabled && enabled && storeDispatchEnabled
+    }
+
     /// NORMROPE-D512 carrier. The three normalized arrays are held weakly:
     /// the entry is only honoured while the exact objects the producer built
     /// are still alive, so an address reused by a later array can never match
@@ -4314,6 +4389,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let kWeight: MLXArray
         let positionOffsets: MLXArray
         let ropeFrequencies: MLXArray
+        let ropeTrigValues: MLXArray?
     }
 
     private static let fullNormRopeLock = NSLock()
@@ -4340,7 +4416,9 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         positionOffsets: MLXArray,
         ropeFrequencies: MLXArray,
         eps: Float,
-        appliedRope: Bool
+        appliedRope: Bool,
+        sharedRopeTable: CBv2SharedFullRopeV1.Table? = nil,
+        sharedRopeParameters: CBv2SharedFullRopeV1.Parameters? = nil
     ) -> Bool {
         guard normRopeFoldEnabled,
             enabled,
@@ -4368,6 +4446,9 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             ropeFrequencies.shape == [headDim / 2]
         else { return false }
 
+        let ropeTrigValues = sharedRopeTable?.matchingValues(
+            positionOffsets: positionOffsets, parameters: sharedRopeParameters,
+            ropeFrequencies: ropeFrequencies, dimensions: headDim)
         fullNormRopeLock.lock()
         if fullNormRopeInputs.count >= 64 {
             fullNormRopeInputs.removeAll(keepingCapacity: true)
@@ -4382,7 +4463,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 qWeight: qWeight,
                 kWeight: kWeight,
                 positionOffsets: positionOffsets,
-                ropeFrequencies: ropeFrequencies)
+                ropeFrequencies: ropeFrequencies, ropeTrigValues: ropeTrigValues)
         fullNormRopeLock.unlock()
         return true
     }
@@ -6078,6 +6159,48 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         """,
         ensureRowContiguous: true)
 
+    /// Keep the original source and key available for exact A/B evaluation.
+    private static let normLivePartialsEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_NORM_LIVE_PARTIALS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static func normLivePartialsSource(_ source: String) -> String {
+        guard normLivePartialsEnabled else { return source }
+        let original = """
+            threadgroup float partials[32];
+            threadgroup float inverse_rms;
+            threadgroup T rounded[D];
+            if (simd_group == 0) partials[lane] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) partials[simd_group] = sum;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group == 0) {
+                sum = simd_sum(partials[lane]);
+                if (lane == 0) {
+                    inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        """
+        let optimized = """
+            threadgroup float partials[32];
+            threadgroup T rounded[D];
+            // Four live SIMD partials. The other 28 combine operands remain +0.0f,
+            // supplied in registers without a shared zero-fill pass.
+            if (lane == 0) partials[simd_group] = sum;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // Every group repeats the identical 32-lane combine. This kernel never
+            // overwrites partials, so no reader can race a later reduction writer.
+            sum = simd_sum(lane < D / reads / 32 ? partials[lane] : 0.0f);
+            const float inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+        """
+        precondition(source.components(separatedBy: original).count == 2)
+        return source.replacingOccurrences(of: original, with: optimized)
+    }
+
     /// NORMROPE-D512: the WRITE-022 store dispatch with the full layers' Q/K
     /// RMSNorm + RoPE folded in, so the standalone
     /// `gemma4_b8_qkv_rms_norm_rope_v2_vec1` dispatch leaves the chain.
@@ -6102,16 +6225,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// of `L * inv_freq`, and the same two rotation expressions. The ring
     /// slot receives the K row the standalone kernel would have handed the
     /// incumbent store, so dispatches 1...3 read identical bytes.
-    private static let ringStoreNormRopeKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1",
-        inputNames: [
-            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
-            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-            "params", "raw_queries", "raw_keys", "q_weight", "k_weight",
-            "position_offsets", "rope_freqs", "write_fence",
-        ],
-        outputNames: ["fence", "q_out", "k_out", "v_out"],
-        source: """
+    private static let ringStoreNormRopeSource = normLivePartialsSource("""
             constexpr int D = 512;
             constexpr int KV_ROWS = 16;
             constexpr int Q_HEADS = 16;
@@ -6235,8 +6349,52 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             if (z == 0 && lid == 0) {
                 fence[0] = write_fence[0] + 1;
             }
-        """,
+        """)
+
+    private static func sharedFullRopeSource(_ source: String) -> String {
+        let original = """
+                const float L = static_cast<float>(position_offsets[batch_index]);
+                for (int i = 0; i < reads; ++i) {
+                    const int pair = lid * reads + i;
+                    const float inv_freq = 1.0f / rope_freqs[pair];
+                    const float theta = L * inv_freq;
+                    const float costheta = metal::fast::cos(theta);
+                    const float sintheta = metal::fast::sin(theta);
+        """
+        let replacement = """
+                for (int i = 0; i < reads; ++i) {
+                    const int pair = lid * reads + i;
+                    const int trig_index = (batch_index * (D / 2) + pair) * 2;
+                    const float costheta = rope_trig[trig_index];
+                    const float sintheta = rope_trig[trig_index + 1];
+        """
+        precondition(source.components(separatedBy: original).count == 2)
+        return source.replacingOccurrences(of: original, with: replacement)
+    }
+
+    private static func makeRingStoreNormRopeKernel(
+        sharedRope: Bool
+    ) -> MLXFast.MLXFastKernel {
+        MLXFast.metalKernel(
+        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1"
+            + (normLivePartialsEnabled ? "_partials_v1" : "")
+            + (sharedRope ? "_sharedrope_v1" : ""),
+        inputNames: [
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "params", "raw_queries", "raw_keys", "q_weight", "k_weight",
+            "position_offsets", sharedRope ? "rope_trig" : "rope_freqs", "write_fence",
+        ],
+        outputNames: ["fence", "q_out", "k_out", "v_out"],
+        source: sharedRope
+            ? sharedFullRopeSource(ringStoreNormRopeSource) : ringStoreNormRopeSource,
         ensureRowContiguous: true)
+    }
+
+    private static let ringStoreNormRopeKernel =
+        makeRingStoreNormRopeKernel(sharedRope: false)
+    private static let sharedRingStoreNormRopeKernel =
+        makeRingStoreNormRopeKernel(sharedRope: true)
 
     /// WRITE-022 kill switch: `DARKBLOOM_GEMMA4_D512_STORE_DISPATCH=0` falls
     /// back to the v2 fold (and its own switch falls back to the append path).
@@ -6334,7 +6492,9 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             let normRope = takeFullNormRope(
                 queries: queries, keys: keys, values: values)
         {
-            let stored = ringStoreNormRopeKernel(
+            let storeKernel = normRope.ropeTrigValues != nil
+                ? sharedRingStoreNormRopeKernel : ringStoreNormRopeKernel
+            let stored = storeKernel(
                 keyBuffers + valueBuffers + [
                     paramsArray,
                     normRope.rawQueries,
@@ -6342,7 +6502,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     normRope.qWeight,
                     normRope.kWeight,
                     normRope.positionOffsets,
-                    normRope.ropeFrequencies,
+                    normRope.ropeTrigValues ?? normRope.ropeFrequencies,
                     previousWriteFence,
                 ],
                 template: template,

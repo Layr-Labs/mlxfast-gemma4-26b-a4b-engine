@@ -2361,6 +2361,8 @@ private class Gemma4Attention: Module {
     let usesSharedKV: Bool
     let scale: Float
     let qkvRopeParameters: Gemma4QKVRopeParameters
+    let sharedSlidingRopeParameters: CBv2SharedSlidingRopeV1.Parameters?
+    let sharedFullRopeParameters: CBv2SharedFullRopeV1.Parameters?
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear?
@@ -2420,33 +2422,47 @@ private class Gemma4Attention: Module {
         // RoPE: sliding uses the base route; full attention reuses the exact
         // proportional frequency table (including +inf pass-through pairs).
         if isSliding {
+            self.sharedFullRopeParameters = nil
             self.rope = initializeRope(
                 dims: effectiveHeadDim, base: config.slidingRopeTheta, traditional: false,
                 scalingConfig: nil, maxPositionEmbeddings: nil)
-            let log2Base = MLXArray([log2f(config.slidingRopeTheta)])
+            let sharedParameters = CBv2SharedSlidingRopeV1.makeParameters(
+                log2BaseValue: log2f(config.slidingRopeTheta), dimensions: effectiveHeadDim)
+            self.sharedSlidingRopeParameters = sharedParameters
             self.qkvRopeParameters = Gemma4QKVRopeParameters(
-                log2Base: log2Base,
+                log2Base: sharedParameters.log2Base,
                 frequencies: MLXArray([Float.infinity]), usesFrequencies: false,
-                inverseFrequencies: CBv2RaggedTwoPassDecodeAttentionV1
-                    .makeBaseRopeInverseFrequencies(
-                        log2Base: log2Base, dimensions: effectiveHeadDim))
+                inverseFrequencies: sharedParameters.inverseFrequencies)
         } else {
-            let fullRope = initializeRope(
-                dims: effectiveHeadDim, base: config.fullRopeTheta, traditional: false,
-                scalingConfig: [
-                    "type": .string("proportional"),
-                    "partial_rotary_factor": .float(config.fullPartialRotaryFactor),
-                ],
-                maxPositionEmbeddings: nil)
-            guard let proportional = fullRope as? ProportionalRoPE,
-                let frequencies = proportional.frequencyTable
-            else {
-                preconditionFailure("Gemma4 full-attention RoPE requires a frequency table")
+            self.sharedSlidingRopeParameters = nil
+            if let sharedParameters = CBv2SharedFullRopeV1.makeParameters(
+                dimensions: effectiveHeadDim, base: config.fullRopeTheta,
+                partialRotaryFactor: config.fullPartialRotaryFactor)
+            {
+                self.sharedFullRopeParameters = sharedParameters
+                self.rope = sharedParameters.rope
+                self.qkvRopeParameters = Gemma4QKVRopeParameters(
+                    log2Base: MLXArray([Float.zero]), frequencies: sharedParameters.frequencies,
+                    usesFrequencies: true, inverseFrequencies: nil)
+            } else {
+                self.sharedFullRopeParameters = nil
+                let fullRope = initializeRope(
+                    dims: effectiveHeadDim, base: config.fullRopeTheta, traditional: false,
+                    scalingConfig: [
+                        "type": .string("proportional"),
+                        "partial_rotary_factor": .float(config.fullPartialRotaryFactor),
+                    ],
+                    maxPositionEmbeddings: nil)
+                guard let proportional = fullRope as? ProportionalRoPE,
+                    let frequencies = proportional.frequencyTable
+                else {
+                    preconditionFailure("Gemma4 full-attention RoPE requires a frequency table")
+                }
+                self.rope = proportional
+                self.qkvRopeParameters = Gemma4QKVRopeParameters(
+                    log2Base: MLXArray([Float.zero]), frequencies: frequencies,
+                    usesFrequencies: true, inverseFrequencies: nil)
             }
-            self.rope = proportional
-            self.qkvRopeParameters = Gemma4QKVRopeParameters(
-                log2Base: MLXArray([Float.zero]), frequencies: frequencies,
-                usesFrequencies: true, inverseFrequencies: nil)
         }
 
         super.init()
@@ -2545,7 +2561,9 @@ private class Gemma4Attention: Module {
         v2SharedSource: (any CBv2AttendingLayerCache)? = nil,
         outputStart: Int = 0,
         useLastQueryPrefill: Bool = false,
-        carriedRunsum: MLXArray? = nil
+        carriedRunsum: MLXArray? = nil,
+        sharedSlidingRopeTable: CBv2SharedSlidingRopeV1.Table? = nil,
+        sharedFullRopeTable: CBv2SharedFullRopeV1.Table? = nil
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // ContinuousBatchingV2: the layer cache owns both the KV update and
         // the attention computation (no masks, no padding — see
@@ -2556,7 +2574,9 @@ private class Gemma4Attention: Module {
                 x, layerCache: layerCacheV2, source: v2SharedSource,
                 sharedKV: sharedKV, positionOffset: positionOffset,
                 outputStart: outputStart, useLastQueryPrefill: useLastQueryPrefill,
-                carriedRunsum: carriedRunsum)
+                carriedRunsum: carriedRunsum,
+                sharedSlidingRopeTable: sharedSlidingRopeTable,
+                sharedFullRopeTable: sharedFullRopeTable)
         }
         precondition(
             outputStart == 0 && !useLastQueryPrefill,
@@ -2696,7 +2716,9 @@ private class Gemma4Attention: Module {
         positionOffset: Gemma4.PositionOffset?,
         outputStart: Int = 0,
         useLastQueryPrefill: Bool = false,
-        carriedRunsum: MLXArray? = nil
+        carriedRunsum: MLXArray? = nil,
+        sharedSlidingRopeTable: CBv2SharedSlidingRopeV1.Table? = nil,
+        sharedFullRopeTable: CBv2SharedFullRopeV1.Table? = nil
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         let (B, L) = (x.dim(0), x.dim(1))
         precondition(
@@ -2888,7 +2910,9 @@ private class Gemma4Attention: Module {
                 positionOffsets: capturedOffsets,
                 ropeLog2Base: qkvRopeParameters.log2Base,
                 ropeInverseFrequencies: qkvRopeParameters.inverseFrequencies,
-                eps: config.rmsNormEps, appliedRope: appliedRope)
+                eps: config.rmsNormEps, appliedRope: appliedRope,
+                sharedRopeTable: sharedSlidingRopeTable,
+                sharedRopeParameters: sharedSlidingRopeParameters)
         } else if vProj == nil, qkvRopeParameters.usesFrequencies {
             // NORMROPE-D512: the full layers' store dispatch takes the raw
             // k-eq-v projections and normalizes/rotates them once itself; a
@@ -2899,7 +2923,9 @@ private class Gemma4Attention: Module {
                 qWeight: qNorm.weight, kWeight: kNorm.weight,
                 positionOffsets: capturedOffsets,
                 ropeFrequencies: qkvRopeParameters.frequencies,
-                eps: config.rmsNormEps, appliedRope: appliedRope)
+                eps: config.rmsNormEps, appliedRope: appliedRope,
+                sharedRopeTable: sharedFullRopeTable,
+                sharedRopeParameters: sharedFullRopeParameters)
         }
 
         let outputDType = queries.dtype
@@ -5936,7 +5962,9 @@ public class Gemma4DecoderLayer: Module {
         isExpertPrefill: Bool = false,
         glueChain: Gemma4GlueChainBox? = nil,
         nextInputLayernormWeight: MLXArray? = nil,
-        enableAttentionBranchPrefix: Bool = false
+        enableAttentionBranchPrefix: Bool = false,
+        sharedSlidingRopeTable: CBv2SharedSlidingRopeV1.Table? = nil,
+        sharedFullRopeTable: CBv2SharedFullRopeV1.Table? = nil
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // Prompt-path narrowing (CBv2 only): attention and every K/V write
         // still cover the full chunk; only the token-local work AFTER
@@ -5990,7 +6018,9 @@ public class Gemma4DecoderLayer: Module {
         let (attnOut, kvPair, attnPositionOffset) = selfAttn(
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
-            useLastQueryPrefill: useLastQueryPrefill, carriedRunsum: carriedRunsum)
+            useLastQueryPrefill: useLastQueryPrefill, carriedRunsum: carriedRunsum,
+            sharedSlidingRopeTable: sharedSlidingRopeTable,
+                sharedFullRopeTable: sharedFullRopeTable)
         // PREFIX-001: only build the joined producer when the ZIP consumer is
         // guaranteed to accept it. A nil leaves the established attention
         // residual and branch pre-norm paths untouched.
@@ -6605,8 +6635,15 @@ enum Gemma4FusedScaledEmbedding {
         embedScale: Float,
         hiddenSize: Int,
         inputNormWeight: MLXArray,
-        eps: Float
-    ) -> (hidden: MLXArray, normed: MLXArray, qkvRunsumTable: MLXArray)? {
+        eps: Float,
+        sharedRopePositionOffsets: MLXArray? = nil,
+        sharedRopeParameters: CBv2SharedSlidingRopeV1.Parameters? = nil,
+        sharedFullRopeParameters: CBv2SharedFullRopeV1.Parameters? = nil
+    ) -> (
+        hidden: MLXArray, normed: MLXArray, qkvRunsumTable: MLXArray,
+        sharedRopeTable: CBv2SharedSlidingRopeV1.Table?,
+        sharedFullRopeTable: CBv2SharedFullRopeV1.Table?
+    )? {
         guard enabled, decodeEnabled, inputNormRunsumEnabled,
             CBv2AttentionQKVMMA8V1.rsPrepassEnabled,
             tokens.dtype == .int32,
@@ -6634,22 +6671,51 @@ enum Gemma4FusedScaledEmbedding {
             biases.shape == scales.shape
         else { return nil }
 
-        let outputs = inputNormRunsumKernel(
-            [
-                tokens, weight, scales, biases,
-                embedScale.asMLXArray(dtype: .bfloat16), inputNormWeight,
-            ],
-            template: [("T", DType.bfloat16)],
-            grid: (8 * 704, 1, 1),
-            threadGroup: (704, 1, 1),
-            outputShapes: [[8, 1, hiddenSize], [8, 1, hiddenSize], [8, hiddenSize / groupSize]],
-            outputDTypes: [.bfloat16, .bfloat16, .float32]
-        )
+        let outputs: [MLXArray]
+        let sharedRopeTable: CBv2SharedSlidingRopeV1.Table?
+        let sharedFullRopeTable: CBv2SharedFullRopeV1.Table?
+        if let positionOffsets = sharedRopePositionOffsets,
+            let slidingParameters = sharedRopeParameters,
+            let fullParameters = sharedFullRopeParameters,
+            let fused = CBv2SharedFullRopeV1.makeWithInputEmbedding(
+                tokens: tokens, weight: weight, scales: scales, biases: biases,
+                embedScale: embedScale, inputNormWeight: inputNormWeight,
+                positionOffsets: positionOffsets, slidingParameters: slidingParameters,
+                fullParameters: fullParameters)
+        {
+            outputs = [fused.hidden, fused.normed, fused.qkvRunsum]
+            sharedRopeTable = fused.slidingTable
+            sharedFullRopeTable = fused.fullTable
+        } else if let positionOffsets = sharedRopePositionOffsets,
+            let parameters = sharedRopeParameters,
+            let fused = CBv2SharedSlidingRopeV1.makeWithInputEmbedding(
+                tokens: tokens, weight: weight, scales: scales, biases: biases,
+                embedScale: embedScale, inputNormWeight: inputNormWeight,
+                positionOffsets: positionOffsets, parameters: parameters)
+        {
+            outputs = [fused.hidden, fused.normed, fused.qkvRunsum]
+            sharedRopeTable = fused.table
+            sharedFullRopeTable = nil
+        } else {
+            outputs = inputNormRunsumKernel(
+                [
+                    tokens, weight, scales, biases,
+                    embedScale.asMLXArray(dtype: .bfloat16), inputNormWeight,
+                ],
+                template: [("T", DType.bfloat16)],
+                grid: (8 * 704, 1, 1),
+                threadGroup: (704, 1, 1),
+                outputShapes: [[8, 1, hiddenSize], [8, 1, hiddenSize], [8, hiddenSize / groupSize]],
+                outputDTypes: [.bfloat16, .bfloat16, .float32]
+            )
+            sharedRopeTable = nil
+            sharedFullRopeTable = nil
+        }
         guard let table = CBv2AttentionQKVMMA8V1.runsumTable(
             produced: outputs[2], for: outputs[1])
         else { return nil }
         CBv2EngageMark.once("scaled-embedding-input-norm-rs")
-        return (outputs[0], outputs[1], table)
+        return (outputs[0], outputs[1], table, sharedRopeTable, sharedFullRopeTable)
     }
 
     /// Returns the scaled hidden state, or `nil` when any pin fails — the
@@ -7055,6 +7121,60 @@ public class Gemma4TextModelInner: Module {
         let isCBv2 = fullCache.contains {
             ($0 as? (any CBv2AttendingLayerCache)) != nil
         }
+        // All-contiguous banks expose one position chain. Snapshot it before
+        // the first layer advances the chain, then reuse that same lazy array
+        // for every Q/K RoPE call in this forward.
+        let unifiedCBv2PositionOffset: Gemma4.PositionOffset? = {
+            guard isCBv2 else { return nil }
+            for case let entry? in fullCache {
+                if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
+                    return .batch(offsets + 0)
+                }
+            }
+            return nil
+        }()
+
+        // Resolve the canonical request before embedding. No cache update
+        // occurs in the embedding or PLE graph; all layers retain this snapshot.
+        let sharedSlidingRopeParameters: CBv2SharedSlidingRopeV1.Parameters? = {
+            guard isCBv2, !schedulePrefill, gemma4QKVNormRopeEnabled,
+                inputBatchSize == 8, inputLength == 1,
+                case .batch(_)? = unifiedCBv2PositionOffset,
+                let firstSliding = layers.first(where: {
+                    $0.selfAttn.isSliding && !$0.selfAttn.usesSharedKV
+                        && $0.selfAttn.effectiveHeadDim == 256
+                        && $0.selfAttn.nHeads == 16 && $0.selfAttn.nKvHeads == 8
+                })
+            else { return nil }
+            return firstSliding.selfAttn.sharedSlidingRopeParameters
+        }()
+        let sharedSlidingRopeOffsets: MLXArray? = {
+            guard sharedSlidingRopeParameters != nil,
+                case .batch(let offsets)? = unifiedCBv2PositionOffset
+            else { return nil }
+            return offsets
+        }()
+        var sharedSlidingRopeTable: CBv2SharedSlidingRopeV1.Table? = nil
+        let sharedFullRopeParameters: CBv2SharedFullRopeV1.Parameters? = {
+            guard isCBv2, !schedulePrefill, gemma4QKVNormRopeEnabled,
+                inputBatchSize == 8, inputLength == 1,
+                case .batch(_)? = unifiedCBv2PositionOffset,
+                let firstFull = layers.first(where: {
+                    !$0.selfAttn.isSliding && !$0.selfAttn.usesSharedKV
+                        && $0.selfAttn.useKeqV && $0.selfAttn.effectiveHeadDim == 512
+                        && $0.selfAttn.nHeads == 16 && $0.selfAttn.nKvHeads == 2
+                })
+            else { return nil }
+            return firstFull.selfAttn.sharedFullRopeParameters
+        }()
+        let sharedFullRopeOffsets: MLXArray? = {
+            guard sharedFullRopeParameters != nil,
+                case .batch(let offsets)? = unifiedCBv2PositionOffset
+            else { return nil }
+            return offsets
+        }()
+        var sharedFullRopeTable: CBv2SharedFullRopeV1.Table? = nil
+
         var layerZeroInputCarry:
             (source: MLXArray, normed: MLXArray, rs: MLXArray?)? = nil
 
@@ -7073,9 +7193,14 @@ public class Gemma4TextModelInner: Module {
                 embedScale: embedScale,
                 hiddenSize: config.hiddenSize,
                 inputNormWeight: firstLayer.inputLayernorm.weight,
-                eps: config.rmsNormEps)
+                eps: config.rmsNormEps,
+                sharedRopePositionOffsets: sharedSlidingRopeOffsets,
+                sharedRopeParameters: sharedSlidingRopeParameters,
+                sharedFullRopeParameters: sharedFullRopeParameters)
         {
             h = fused.hidden
+            sharedSlidingRopeTable = fused.sharedRopeTable
+            sharedFullRopeTable = fused.sharedFullRopeTable
             layerZeroInputCarry = (
                 source: fused.hidden, normed: fused.normed,
                 rs: fused.qkvRunsumTable)
@@ -7122,18 +7247,23 @@ public class Gemma4TextModelInner: Module {
             perLayerInputs = Array(repeating: nil, count: config.numHiddenLayers)
         }
 
-        // All-contiguous banks expose one position chain. Snapshot it before
-        // the first layer advances the chain, then reuse that same lazy array
-        // for every Q/K RoPE call in this forward.
-        let unifiedCBv2PositionOffset: Gemma4.PositionOffset? = {
-            guard isCBv2 else { return nil }
-            for case let entry? in fullCache {
-                if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
-                    return .batch(offsets + 0)
-                }
-            }
-            return nil
-        }()
+        // Prefer the embedding sibling output. If that producer declined,
+        // retain the independently lazy table and its established consumers.
+        if sharedSlidingRopeTable == nil,
+            let offsets = sharedSlidingRopeOffsets,
+            let parameters = sharedSlidingRopeParameters
+        {
+            sharedSlidingRopeTable = CBv2SharedSlidingRopeV1.make(
+                positionOffsets: offsets, parameters: parameters)
+        }
+
+        if sharedFullRopeTable == nil,
+            let offsets = sharedFullRopeOffsets,
+            let parameters = sharedFullRopeParameters
+        {
+            sharedFullRopeTable = CBv2SharedFullRopeV1.make(
+                positionOffsets: offsets, parameters: parameters)
+        }
 
         // Build masks: one per attention type (legacy path only). "vision"
         // overlays bidirectional access within visual spans. "all" preserves
@@ -7235,7 +7365,9 @@ public class Gemma4TextModelInner: Module {
                 enableAttentionBranchPrefix:
                     isCBv2 && !schedulePrefill
                     && inputBatchSize == 8 && inputLength == 1
-                    && !capturePreNorm && dFlashHiddenCapture == nil
+                    && !capturePreNorm && dFlashHiddenCapture == nil,
+                sharedSlidingRopeTable: sharedSlidingRopeTable,
+                sharedFullRopeTable: sharedFullRopeTable
             )
             h = out
             intermediates[idx] = (kvPair, positionOffset)

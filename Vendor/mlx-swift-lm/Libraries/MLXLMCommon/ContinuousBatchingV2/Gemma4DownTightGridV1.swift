@@ -2,7 +2,7 @@
 import Foundation
 import MLX
 
-/// Keep the incumbent span-four down-QMV arithmetic and omit its empty y groups.
+/// Keep the incumbent down-QMV arithmetic and omit its empty y groups.
 public enum Gemma4DownTightGridV1 {
     static let enabled: Bool = {
         #if os(macOS)
@@ -37,6 +37,11 @@ public enum Gemma4DownTightGridV1 {
         return 4
         #endif
     }()
+
+    /// The singleton QMV consumes one aligned eight-code packet per lane.
+    /// Fetch its two 16-bit halves with one 32-bit load, preserving the qdot.
+    static let packedWordLoads =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_PACKED_WORD_LOAD"] != "0"
 
     /// Bound to the immutable sanitized checkpoint, like the fused gate/up storage.
     public final class Storage {
@@ -77,7 +82,7 @@ public enum Gemma4DownTightGridV1 {
     }
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_down_qmv_span4_tight_zorder_v1",
+        name: "gemma4_b8_down_qmv_span4_tight_zorder_v1" + (packedWordLoads ? "_word32" : ""),
         inputNames: ["w", "scales", "biases", "x", "lhs_indices", "rhs_indices"],
         outputNames: ["y"],
         source: #"""
@@ -86,16 +91,16 @@ const uint linear = tid.y + tid.z * (352 / SPAN);
 tid.y = (linear / 64) * SPAN;
 tid.z = linear % 64;
 // Preserve assignment-fast enumeration with 352 / SPAN surviving y groups.
-// Map compact y-group g to the old survivor SPAN*g. The helper, its pair
-// elections, per-tile walk, qdot chains, SIMD reductions and stores are verbatim.
+// Map compact y-group g to the old survivor SPAN*g. Pair elections, the
+// per-tile walk, qdot arithmetic, SIMD reductions and stores are unchanged.
 gather_qmv_gemma4_down_tile<T, 64, 4, SPAN>(
     w, scales, biases, x, lhs_indices, rhs_indices, y,
     gemma4_tight_down_K, gemma4_tight_down_N, 1, 1,
     704, 2816 * 704 / 8, 2816 * 704 / 64, 2816 * 704 / 64,
     tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
 """#,
-        header: #"""
-// Copyright © 2023-2024 Apple Inc. Canonical helper bodies verified byte-identical to 093e716.
+        header: "#define DOWN_PACKED_WORD_LOAD \(packedWordLoads ? 1 : 0)\n" + #"""
+// Copyright © 2023-2024 Apple Inc. Canonical helpers with a singleton packet-load specialization.
 #include <metal_stdlib>
 #include <metal_simdgroup>
 using namespace metal;
@@ -321,6 +326,20 @@ inline U qdot(
   }
 
   else if (bits == 4) {
+#if DOWN_PACKED_WORD_LOAD
+    // Each admitted lane packet contains eight aligned 4-bit codes. Only the
+    // integer load changes: the two four-value sums and their order stay exact.
+    static_assert(values_per_thread == 8, "This kernel uses eight-value packets");
+    const uint packet = *((const device uint*)w);
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+      const uint word = (packet >> (16 * i)) & 0xffffu;
+      accum +=
+          (x_thread[4 * i] * (word & 0x000f) +
+           x_thread[4 * i + 1] * (word & 0x00f0) +
+           x_thread[4 * i + 2] * (word & 0x0f00) +
+           x_thread[4 * i + 3] * (word & 0xf000));
+    }
+#else
     const device uint16_t* ws = (const device uint16_t*)w;
     for (int i = 0; i < (values_per_thread / 4); i++) {
       accum +=
@@ -329,6 +348,7 @@ inline U qdot(
            x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
            x_thread[4 * i + 3] * (ws[i] & 0xf000));
     }
+#endif
   }
 
   else if (bits == 5) {

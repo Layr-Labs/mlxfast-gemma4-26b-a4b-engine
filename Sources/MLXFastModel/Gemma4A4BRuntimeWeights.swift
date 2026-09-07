@@ -204,6 +204,7 @@ public final class Gemma4A4BRuntimeWeightCache {
             verify: [.all]
         )
         eval(model)
+        Gemma4ExpertPrefillDequantCache.prepare(model)
         return model
     }
 

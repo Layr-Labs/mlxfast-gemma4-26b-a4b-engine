@@ -1734,6 +1734,7 @@ public class SwitchGLU: Module {
             // admission mirrors the host's sorted right-hand-side selection
             // exactly, so the split views never meet that kernel.
             if doSort, !useLhsIndices, lhsIndices == nil,
+                !Gemma4ExpertPrefillDequantCache.hasPair(gateProj, upProj),
                 x.ndim == 3, x.dim(-2) == 1, x.dim(-1) == inputDims,
                 x.dim(0) >= 16, x.dim(0) / numExperts >= 4,
                 x.dtype == .bfloat16,
@@ -2084,6 +2085,121 @@ public class SwitchLinear: Module, Quantizable {
     }
 }
 
+
+/// Immutable BF16 intermediates for large sorted expert prefill GEMMs.
+/// The quantized modules retain their original packed parameters. Small
+/// decode/verify calls use the established quantized dispatch.
+public enum Gemma4ExpertPrefillDequantCache {
+    private struct Key: Hashable {
+        let weight: ObjectIdentifier
+        let scales: ObjectIdentifier
+        let biases: ObjectIdentifier
+    }
+    private struct Entry {
+        // Retain the source arrays so their identities cannot be recycled.
+        let sources: [MLXArray]
+        let transposed: MLXArray
+    }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var entries: [Key: Entry] = [:]
+    nonisolated(unsafe) private static var reservedBytes = 0
+    private static let enabled: Bool = {
+        if let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_EXPERT_PREFILL_DEQ"] {
+            return raw == "1"
+        }
+        #if os(macOS)
+        guard #available(macOS 26.2, *),
+            ProcessInfo.processInfo.physicalMemory >= (UInt64(96) << 30)
+        else { return false }
+        // Same architecture-generation gate as metal::is_nax_available.
+        let arch = GPU.deviceInfo().architecture
+        let suffix = arch.suffix(3)
+        guard suffix.count == 3, let generation = Int(suffix.prefix(2)) else { return false }
+        return generation >= (suffix.last == "p" ? 18 : 17)
+        #else
+        return false
+        #endif
+    }()
+    private static let byteLimit: Int = {
+        let requested = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_EXPERT_PREFILL_CACHE_GIB"].flatMap(Int.init) ?? 48
+        #if os(macOS)
+        // Leave room for the packed model, its existing dense caches, KV,
+        // transient activations, and allocator slack within Metal's budget.
+        let recommended = GPU.deviceInfo().maxRecommendedWorkingSetSize
+        let reserve = UInt64(40) << 30
+        let available = recommended > reserve ? recommended - reserve : 0
+        return min(min(max(requested, 0), 48) << 30, Int(available))
+        #else
+        return 0
+        #endif
+    }()
+    private static func key(_ layer: QuantizedSwitchLinear) -> Key? {
+        guard layer.mode == .affine, layer.bits == 4, layer.groupSize == 64,
+            layer.bias == nil, layer.numExperts == 128,
+            layer.weight.dtype == .uint32, layer.weight.ndim == 3,
+            layer.scales.dtype == .bfloat16,
+            let bias = layer.biases, bias.dtype == .bfloat16,
+            layer.weight.shape == [128, layer.outputDims, layer.inputDims / 8],
+            layer.scales.shape == [128, layer.outputDims, layer.inputDims / 64],
+            bias.shape == layer.scales.shape
+        else { return nil }
+        return Key(weight: ObjectIdentifier(layer.weight),
+                   scales: ObjectIdentifier(layer.scales), biases: ObjectIdentifier(bias))
+    }
+    private static func cached(_ layer: QuantizedSwitchLinear) -> MLXArray? {
+        guard enabled, let key = key(layer) else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        return entries[key]?.transposed
+    }
+    /// Prepare after checkpoint binding, before the first request. First-fit
+    /// admission bounds retained intermediate memory; misses keep quantized GEMM.
+    public static func prepare(_ model: Module) {
+        guard enabled else { return }
+        var eligibleCount = 0
+        var eligibleBytes = 0
+        for module in model.modules() {
+            guard let layer = module as? QuantizedSwitchLinear, let key = key(layer),
+                let bias = layer.biases else { continue }
+            let bytes = 128 * layer.outputDims * layer.inputDims * 2
+            eligibleCount += 1
+            eligibleBytes += bytes
+            lock.lock()
+            let admitted = entries[key] == nil && bytes <= byteLimit - reservedBytes
+            if admitted { reservedBytes += bytes }
+            lock.unlock()
+            guard admitted else { continue }
+            let plane = dequantized(layer.weight, scales: layer.scales, biases: bias,
+                groupSize: layer.groupSize, bits: layer.bits, mode: layer.mode).swappedAxes(-1, -2)
+            eval(plane)
+            lock.lock()
+            if entries[key] == nil {
+                entries[key] = Entry(sources: [layer.weight, layer.scales, bias], transposed: plane)
+            } else { reservedBytes -= bytes }
+            lock.unlock()
+        }
+        lock.lock(); let count = entries.count, bytes = reservedBytes; lock.unlock()
+        FileHandle.standardError.write(Data(
+            "[expert-prefill-deq] cached \(count) planes, \(bytes) bytes; eligible \(eligibleCount) planes, \(eligibleBytes) bytes; limit \(byteLimit)\n".utf8))
+    }
+    static func hasPair(_ gate: SwitchLinear, _ up: SwitchLinear) -> Bool {
+        guard let g = gate as? QuantizedSwitchLinear,
+            let u = up as? QuantizedSwitchLinear else { return false }
+        return cached(g) != nil && cached(u) != nil
+    }
+    static func apply(_ layer: QuantizedSwitchLinear, _ x: MLXArray,
+                      indices: MLXArray, lhs: MLXArray?, sorted: Bool) -> MLXArray? {
+        guard enabled, sorted, lhs == nil, x.dtype == .bfloat16,
+            x.ndim == 3, x.dim(1) == 1, x.dim(0) >= 512,
+            x.dim(2) == layer.inputDims, let plane = cached(layer) else { return nil }
+        CBv2EngageMark.once("expert-prefill-dequant-gemm")
+        CBv2EngageMark.once(layer.inputDims == 704
+            ? "expert-prefill-dequant-down" : "expert-prefill-dequant-gateup")
+        return MLX.gatherMM(x, plane, lhsIndices: nil,
+            rhsIndices: indices, sortedIndices: true)
+    }
+}
+
 public class QuantizedSwitchLinear: SwitchLinear, Quantized {
     @ModuleInfo(key: "scales") var scales: MLXArray
     @ModuleInfo(key: "biases") var biases: MLXArray?
@@ -2116,6 +2232,8 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
         _ x: MLXArray, _ indices: MLXArray, lhsIndices: MLXArray? = nil,
         sortedIndices: Bool = false
     ) -> MLXArray {
+        if let result = Gemma4ExpertPrefillDequantCache.apply(
+            self, x, indices: indices, lhs: lhsIndices, sorted: sortedIndices) { return result }
         var result = MLX.gatherQuantizedMM(
             x,
             self.weight,

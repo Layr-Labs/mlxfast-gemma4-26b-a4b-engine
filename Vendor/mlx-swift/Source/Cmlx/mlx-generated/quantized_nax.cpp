@@ -1108,7 +1108,9 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
           NAXTile<T, TM, TK> Atile;
           NAXTile<T, TN, TK> Btile;
 
+#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
           volatile int compiler_barrier;
+#endif
 
           if constexpr (kAlignedM.value) {
             Atile.load(x + kk1, K);
@@ -1125,7 +1127,9 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
               Btile,
               metal::bool_constant<transpose_b>{});
 
+#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
           (void)compiler_barrier;
+#endif
         }
 
         x += BK;
@@ -1242,7 +1246,9 @@ METAL_FUNC void qmm_n_nax_tgp_impl(
       NAXTile<T, TM, TK> Atile;
       NAXTile<T, TK, TN> Btile;
 
+#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
       volatile int compiler_barrier;
+#endif
 
       Atile.load(x + kk1, K);
       Btile.template load<T, BN_padded, 1>(Ws + tn + kk1 * ldb_tgp);
@@ -1254,7 +1260,9 @@ METAL_FUNC void qmm_n_nax_tgp_impl(
           Btile,
           metal::bool_constant<transpose_b>{});
 
+#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
       (void)compiler_barrier;
+#endif
     }
 
     x += BK;

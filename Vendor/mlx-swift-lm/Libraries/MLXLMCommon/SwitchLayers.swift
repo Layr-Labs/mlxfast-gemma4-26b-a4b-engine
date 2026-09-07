@@ -1453,11 +1453,9 @@ public class SwitchGLU: Module {
         tightDownContract = false
     }
 
-    private func resolveTightDownStorage(
-        xShape: [Int], xDType: DType, indices: MLXArray, sorted: Bool
-    ) -> Gemma4DownTightGridV1.Storage? {
+    private func tightDecodeDown(_ x: MLXArray, _ indices: MLXArray, sorted: Bool, partials: MLXArray? = nil) -> MLXArray? {
         guard Gemma4DownTightGridV1.enabled, sorted, let storage = tightDownStorage,
-            Gemma4DownTightGridV1.Storage.admits(xShape: xShape, xDType: xDType, indices: indices)
+            Gemma4DownTightGridV1.Storage.admits(x: x, indices: indices)
         else { return nil }
         if !tightDownResolved {
             tightDownResolved = true
@@ -1471,14 +1469,7 @@ public class SwitchGLU: Module {
             }
         }
         guard tightDownContract else { return nil }
-        return storage
-    }
-
-    private func tightDecodeDown(_ x: MLXArray, _ indices: MLXArray, sorted: Bool) -> MLXArray? {
-        guard let storage = resolveTightDownStorage(
-            xShape: x.shape, xDType: x.dtype, indices: indices, sorted: sorted)
-        else { return nil }
-        return storage.call(x: x, lhsIndices: switchDownIdentity64, indices: indices)
+        return storage.call(x: x, lhsIndices: switchDownIdentity64, indices: indices, partials: partials)
     }
 
     private var fusedGateUpStorage: SwitchGateUpFusedStorage?
@@ -1614,7 +1605,8 @@ public class SwitchGLU: Module {
     private func projectExperts(
         _ x: MLXArray, _ indices: MLXArray,
         sortedPlane: SwitchSortedPlaneProducer? = nil,
-        routeTable: SwitchRouteTable? = nil
+        routeTable: SwitchRouteTable? = nil,
+        activationSums: Gemma4DecodeFusedGUV1.ActivationSums? = nil
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
         let useLhsIndices =
             indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
@@ -1696,20 +1688,10 @@ public class SwitchGLU: Module {
             let lhsIndices, lhsIndices.dtype == .uint32,
             let fused = fusedGateUpDispatch()
         {
-            if Gemma4DownTightGridV1.compiledGateUpAvailable,
-                let down = resolveTightDownStorage(
-                    xShape: Gemma4DecodeFusedGUV1.outputShape,
-                    xDType: Gemma4DecodeFusedGUV1.outputDType, indices: idx, sorted: true),
-                let output = down.callCompiledGateUp(
-                    x: x, storage: fused.storage, lhs: lhsIndices,
-                    rhs: idx, downLHS: switchDownIdentity64)
-            {
-                return (output, inverseOrder, true)
-            }
             let activated = Gemma4DecodeFusedGUV1.call(
-                x: x, storage: fused.storage, lhs: lhsIndices, rhs: idx)
-            let output = tightDecodeDown(activated, idx, sorted: true)
-                ?? downProj(activated, idx, lhsIndices: switchDownIdentity64, sortedIndices: true)
+                x: x, storage: fused.storage, lhs: lhsIndices, rhs: idx, sums: activationSums)
+            let output = tightDecodeDown(activated.values, idx, sorted: true, partials: activated.downPartials)
+                ?? downProj(activated.values, idx, lhsIndices: switchDownIdentity64, sortedIndices: true)
             return (output, inverseOrder, true)
         }
 
@@ -1917,7 +1899,8 @@ public class SwitchGLU: Module {
         weights: MLXArray,
         fuseSortedReduction: Bool,
         isProductionPrefill: Bool = true,
-        routeTable: SwitchRouteTable? = nil
+        routeTable: SwitchRouteTable? = nil,
+        activationSums: Gemma4DecodeFusedGUV1.ActivationSums? = nil
     ) -> DeferredWeightedExpertRows? {
         let isEightRowDecode =
             !isProductionPrefill && x.dim(0) == 8 && indices.size == 64
@@ -1925,7 +1908,7 @@ public class SwitchGLU: Module {
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else { return nil }
 
-        let projected = projectExperts(x, indices, routeTable: routeTable)
+        let projected = projectExperts(x, indices, routeTable: routeTable, activationSums: activationSums)
         guard projected.sorted,
             let inverseOrder = projected.inverseOrder,
             projected.output.ndim == 3,

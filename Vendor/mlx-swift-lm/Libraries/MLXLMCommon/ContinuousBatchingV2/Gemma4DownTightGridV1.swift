@@ -38,30 +38,6 @@ public enum Gemma4DownTightGridV1 {
         #endif
     }()
 
-    /// The singleton QMV consumes one aligned eight-code packet per lane.
-    /// Fetch its two 16-bit halves with one 32-bit load, preserving the qdot.
-    static let packedWordLoads =
-        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_PACKED_WORD_LOAD"] != "0"
-
-    private static let compiledGateUpEnabled =
-        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_COMPILED_GU_DOWN"] != "0"
-
-    /// Check the task-local stream on every attempt, outside the trace.
-    static var compiledGateUpAvailable: Bool {
-        compiledGateUpEnabled && StreamOrDevice.default == .gpu
-    }
-
-    // One identity across layers. Every tensor, including both projections' weights
-    // and the shared RHS, is substituted from the current explicit arguments.
-    private static let compiledGateUpDown: @Sendable ([MLXArray]) -> [MLXArray] =
-        MLX.compile(shapeless: false) { inputs in
-            let activated = Gemma4DecodeFusedGUV1.call(
-                [inputs[0], inputs[1], inputs[2], inputs[6], inputs[7], inputs[8]])
-            return [Gemma4DownTightGridV1.call(
-                [inputs[3], inputs[4], inputs[5], activated, inputs[9], inputs[8]],
-                span: tileSpan)]
-        }
-
     /// Bound to the immutable sanitized checkpoint, like the fused gate/up storage.
     public final class Storage {
         private let weight: MLXArray
@@ -79,51 +55,42 @@ public enum Gemma4DownTightGridV1 {
         }
 
         static func admits(x: MLXArray, indices: MLXArray) -> Bool {
-            admits(xShape: x.shape, xDType: x.dtype, indices: indices)
-        }
-
-        static func admits(xShape: [Int], xDType: DType, indices: MLXArray) -> Bool {
-            xDType == .bfloat16 && xShape == [64, 1, 704]
+            x.dtype == .bfloat16 && x.shape == [64, 1, 704]
                 && indices.dtype == .uint32 && indices.shape == [64]
         }
 
         /// The caller supplies the incumbent identity LHS and sorted RHS keys.
-        func call(x: MLXArray, lhsIndices: MLXArray, indices: MLXArray) -> MLXArray {
-            call(x: x, lhsIndices: lhsIndices, indices: indices, span: tileSpan)
+        func call(x: MLXArray, lhsIndices: MLXArray, indices: MLXArray,
+            partials: MLXArray? = nil) -> MLXArray {
+            call(x: x, lhsIndices: lhsIndices, indices: indices, span: tileSpan, partials: partials)
         }
 
         func call(
-            x: MLXArray, lhsIndices: MLXArray, indices: MLXArray, span: Int
+            x: MLXArray, lhsIndices: MLXArray, indices: MLXArray, span: Int, partials: MLXArray? = nil
         ) -> MLXArray {
-            Gemma4DownTightGridV1.call(
-                [weight, scales, biases, x, lhsIndices, indices], span: span)
-        }
-
-        /// The caller has checked compiledGateUpAvailable and both projection
-        /// contracts. Storage is read here, never captured by the compiled body.
-        func callCompiledGateUp(
-            x: MLXArray, storage: SwitchGateUpFusedStorage, lhs: MLXArray,
-            rhs: MLXArray, downLHS: MLXArray
-        ) -> MLXArray? {
-            Gemma4DownTightGridV1.compiledGateUpDown(
-                [storage.weight, storage.scales, storage.biases, weight, scales, biases,
-                 x, lhs, rhs, downLHS]).first
+            let useSums = Gemma4DecodeFusedGUV1.activationSumsEnabled
+                && Self.admits(x: x, indices: indices)
+                && lhsIndices.dtype == .uint32 && lhsIndices.shape == [64]
+                && partials?.dtype == .float32 && partials?.shape == [64, 176]
+            var inputs = [weight, scales, biases, x, lhsIndices, indices]
+            if useSums, let partials { inputs.append(partials) }
+            if useSums { CBv2EngageMark.once("moe-down-activation-sums") }
+            return (useSums ? sumsKernel : kernel)(
+                inputs,
+                template: [("T", DType.bfloat16), ("SPAN", span)],
+                grid: (32, (352 / span) * 2, 64), threadGroup: (32, 2, 1),
+                outputShapes: [[64, 1, 2816]], outputDTypes: [.bfloat16]
+            )[0]
         }
     }
 
-    /// Raw launch for callers that already passed the tight-DOWN contract.
-    static func call(_ inputs: [MLXArray], span: Int) -> MLXArray {
-        kernel(
-            inputs,
-            template: [("T", DType.bfloat16), ("SPAN", span)],
-            grid: (32, (352 / span) * 2, 64), threadGroup: (32, 2, 1),
-            outputShapes: [[64, 1, 2816]], outputDTypes: [.bfloat16]
-        )[0]
-    }
+    private static let kernel = makeKernel(useSums: false)
+    private static let sumsKernel = makeKernel(useSums: true)
 
-    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_down_qmv_span4_tight_zorder_v1" + (packedWordLoads ? "_word32" : ""),
-        inputNames: ["w", "scales", "biases", "x", "lhs_indices", "rhs_indices"],
+    private static func makeKernel(useSums: Bool) -> MLXFast.MLXFastKernel {
+        MLXFast.metalKernel(
+        name: "gemma4_b8_down_qmv_span4_tight_zorder_v1" + (useSums ? "_sums" : ""),
+        inputNames: ["w", "scales", "biases", "x", "lhs_indices", "rhs_indices"] + (useSums ? ["packetSums"] : []),
         outputNames: ["y"],
         source: #"""
 uint3 tid = threadgroup_position_in_grid;
@@ -132,15 +99,15 @@ tid.y = (linear / 64) * SPAN;
 tid.z = linear % 64;
 // Preserve assignment-fast enumeration with 352 / SPAN surviving y groups.
 // Map compact y-group g to the old survivor SPAN*g. The helper, its pair
-// elections, per-tile walk, qdot chains, SIMD reductions and stores are verbatim.
-gather_qmv_gemma4_down_tile<T, 64, 4, SPAN>(
+// elections, per-tile walk, qdot chains, SIMD reductions and stores are retained.
+gather_qmv_gemma4_down_tile<T, 64, 4, SPAN>(x, SUMS_INPUT,
     w, scales, biases, x, lhs_indices, rhs_indices, y,
     gemma4_tight_down_K, gemma4_tight_down_N, 1, 1,
     704, 2816 * 704 / 8, 2816 * 704 / 64, 2816 * 704 / 64,
     tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
-"""#,
-        header: "#define DOWN_PACKED_WORD_LOAD \(packedWordLoads ? 1 : 0)\n" + #"""
-// Copyright © 2023-2024 Apple Inc. Canonical helper bodies verified byte-identical to 093e716.
+"""#.replacingOccurrences(of: "SUMS_INPUT", with: useSums ? "packetSums" : "nullptr"),
+        header: "#define USE_SUMS \(useSums ? 1 : 0)\n" + #"""
+// Copyright © 2023-2024 Apple Inc. Canonical helpers from 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
 using namespace metal;
@@ -159,7 +126,7 @@ inline constexpr short get_bytes_per_pack() {
 }
 
 template <typename T, typename U, int values_per_thread, int bits>
-inline U load_vector(const device T* x, thread U* x_thread) {
+inline U load_vector(const device T* x, thread U* x_thread, const device T* xBase, const device float* activationSums) {
   static_assert(
       bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
@@ -193,8 +160,16 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   }
 
   else if (bits == 4) {
+#if USE_SUMS
+    static_assert(values_per_thread == 8, "Activation table requires full eight-value packets");
+    const auto partial = (x - xBase) / 4;
+    sum += activationSums[partial];
+    sum += activationSums[partial + 1];
+#endif
     for (int i = 0; i < values_per_thread; i += 4) {
+#if !USE_SUMS
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+#endif
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 16.0f;
       x_thread[i + 2] = x[i + 2] / 256.0f;
@@ -366,20 +341,6 @@ inline U qdot(
   }
 
   else if (bits == 4) {
-#if DOWN_PACKED_WORD_LOAD
-    // Each admitted lane packet contains eight aligned 4-bit codes. Only the
-    // integer load changes: the two four-value sums and their order stay exact.
-    static_assert(values_per_thread == 8, "This kernel uses eight-value packets");
-    const uint packet = *((const device uint*)w);
-    for (int i = 0; i < (values_per_thread / 4); i++) {
-      const uint word = (packet >> (16 * i)) & 0xffffu;
-      accum +=
-          (x_thread[4 * i] * (word & 0x000f) +
-           x_thread[4 * i + 1] * (word & 0x00f0) +
-           x_thread[4 * i + 2] * (word & 0x0f00) +
-           x_thread[4 * i + 3] * (word & 0xf000));
-    }
-#else
     const device uint16_t* ws = (const device uint16_t*)w;
     for (int i = 0; i < (values_per_thread / 4); i++) {
       accum +=
@@ -388,7 +349,6 @@ inline U qdot(
            x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
            x_thread[4 * i + 3] * (ws[i] & 0xf000));
     }
-#endif
   }
 
   else if (bits == 5) {
@@ -578,7 +538,7 @@ inline void qdot_affine4_pair_word(
 }
 
 template <typename T, int group_size, int bits>
-METAL_FUNC void qmv_impl(
+METAL_FUNC void qmv_impl(const device T* xBase, const device float* activationSums,
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
@@ -629,7 +589,7 @@ METAL_FUNC void qmv_impl(
 
     int k = 0;
     for (; k <= in_vec_size - block_size; k += block_size) {
-      U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+      U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread, xBase, activationSums);
 
       for (int row = 0;
            row < results_per_simdgroup && out_row + row < out_vec_size;
@@ -692,7 +652,7 @@ METAL_FUNC void qmv_impl(
 
     int k = 0;
     for (; k <= in_vec_size - block_size; k += block_size) {
-      U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+      U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread, xBase, activationSums);
 
       for (int row = 0; row < results_per_simdgroup; row++) {
         auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
@@ -722,7 +682,7 @@ METAL_FUNC void qmv_impl(
       if (tail_values % values_per_thread == 0) {
         const uint active_tail_lanes = uint(tail_values / values_per_thread);
         if (simd_lid < active_tail_lanes) {
-          U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+          U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread, xBase, activationSums);
 
           for (int row = 0; row < results_per_simdgroup; row++) {
             auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
@@ -767,7 +727,7 @@ METAL_FUNC void qmv_impl(
 }
 
 template <typename T, const int group_size, const int bits>
-METAL_FUNC void qmv_affine4_g64_pair_impl(
+METAL_FUNC void qmv_affine4_g64_pair_impl(const device T* xBase, const device float* activationSums,
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
@@ -816,8 +776,8 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
       bias_local[row] = biases[row * in_vec_size_g];
     }
 
-    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
-    float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread, xBase, activationSums);
+    float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread, xBase, activationSums);
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       float dot0;
@@ -849,9 +809,9 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     }
 
     float sum0 =
-        load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+        load_vector<T, float, values_per_thread, 4>(x0, x0_thread, xBase, activationSums);
     float sum1 =
-        load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+        load_vector<T, float, values_per_thread, 4>(x1, x1_thread, xBase, activationSums);
     for (int row = 0; row < results_per_simdgroup; row++) {
       float dot0;
       float dot1;
@@ -873,7 +833,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
 }
 
 template <typename T, int group_size, int bits, int span>
-METAL_FUNC void gather_qmv_gemma4_down_tile(
+METAL_FUNC void gather_qmv_gemma4_down_tile(const device T* xBase, const device float* activationSums,
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
@@ -933,7 +893,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     for (int t = 0; t < gemma4_down_tile_span; t++) {
       uint3 tile_tid = tid;
       tile_tid.y = tid.y + uint(t);
-      qmv_affine4_g64_pair_impl<T, group_size, bits>(
+      qmv_affine4_g64_pair_impl<T, group_size, bits>(xBase, activationSums,
           tile_w,
           tile_scales,
           tile_biases,
@@ -951,7 +911,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
+    qmv_impl<T, group_size, bits>(xBase, activationSums,
         tile_w,
         tile_scales,
         tile_biases,
@@ -969,4 +929,5 @@ constant int gemma4_tight_down_K=704;
 constant int gemma4_tight_down_N=2816;
 """#,
         ensureRowContiguous: true)
+    }
 }

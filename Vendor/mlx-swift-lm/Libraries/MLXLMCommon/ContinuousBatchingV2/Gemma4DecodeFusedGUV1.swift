@@ -23,18 +23,72 @@ public enum Gemma4DecodeFusedGUV1 {
         return Int(raw).map { min(max($0, 1), 4) } ?? 2
     }()
 
+    /// GU-LONGSPLIT. `runCap` sits at 2 for a register reason, not a bandwidth
+    /// one: the triple and quad stream impls inline into the same kernel, so
+    /// their allocation is charged to every threadgroup including the 86% that
+    /// never take them. The cost of that trade is paid in DRAM. A run of three
+    /// reads the expert's 1.98 MB gate|up plane twice under cap 2 where one
+    /// read would serve it, and a run of four reads it twice as well.
+    ///
+    /// Splitting the dispatch pays the register bill without paying the byte
+    /// bill. A first kernel, compiled at cap 4, owns only the runs of three or
+    /// more and writes just those rows. The main kernel stays compiled at cap 2
+    /// -- byte-identical register profile to the incumbent -- and carries those
+    /// rows through from the first kernel's output instead of recomputing them.
+    /// Each kernel gets its own allocation.
+    ///
+    /// At top-8-of-128 over eight streams the run-length distribution is
+    /// binomial(8, 1/16) per expert, so per layer the wide runs cost 2.79
+    /// plane reads under cap 2 against 1.40 shared, out of 53.0 reads in total.
+    /// `DARKBLOOM_GEMMA4_GU_LONG_SPLIT=0` restores the single dispatch.
+    static let longSplit = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_LONG_SPLIT"] != "0"
+
     static func call(x: MLXArray, storage: SwitchGateUpFusedStorage,
         lhs: MLXArray, rhs: MLXArray) -> MLXArray {
-        kernel([storage.weight, storage.scales, storage.biases, x, lhs, rhs],
+        if longSplit, runCap == 2 {
+            let wide = longRunKernel(
+                [storage.weight, storage.scales, storage.biases, x, lhs, rhs],
+                grid: (32, 176 * 2, 8), threadGroup: (32, 2, 1),
+                outputShapes: [[64, 1, 704]], outputDTypes: [.bfloat16])[0]
+            return shortRunKernel(
+                [storage.weight, storage.scales, storage.biases, x, lhs, rhs, wide],
+                grid: (32, 176 * 2, 64), threadGroup: (32, 2, 1),
+                outputShapes: [[64, 1, 704]], outputDTypes: [.bfloat16])[0]
+        }
+        return kernel([storage.weight, storage.scales, storage.biases, x, lhs, rhs],
             grid: (32, 176 * 2, 64), threadGroup: (32, 2, 1),
             outputShapes: [[64, 1, 704]], outputDTypes: [.bfloat16])[0]
     }
 
-    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    private static let kernel: MLXFast.MLXFastKernel = makeKernel(
         name: "gemma4_b8_decode_gateup_geglu_threadgroup_v1",
         inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"],
-        outputNames: ["y"],
-        source: #"""
+        runCap: runCap, body: incumbentBody)
+
+    /// Runs of three or more only. Compiled at cap 4 so the triple and quad
+    /// stream impls are reachable; nothing else in the dispatch touches them.
+    private static let longRunKernel: MLXFast.MLXFastKernel = makeKernel(
+        name: "gemma4_b8_decode_gateup_geglu_threadgroup_v1_wide",
+        inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"],
+        runCap: 4, body: longRunBody)
+
+    /// Runs of one and two, plus a four-element carry of the wide kernel's rows.
+    private static let shortRunKernel: MLXFast.MLXFastKernel = makeKernel(
+        name: "gemma4_b8_decode_gateup_geglu_threadgroup_v1_narrow",
+        inputNames: ["w", "scales", "biases", "x", "lhs", "rhs", "yb"],
+        runCap: 2, body: shortRunBody)
+
+    private static func makeKernel(
+        name: String, inputNames: [String], runCap: Int, body: String
+    ) -> MLXFast.MLXFastKernel {
+        MLXFast.metalKernel(
+            name: name, inputNames: inputNames, outputNames: ["y"],
+            source: body,
+            header: "#define GU_RUN_CAP \(runCap)\n" + headerBody + fullRunHelper,
+            ensureRowContiguous: true)
+    }
+
+    private static let incumbentBody = #"""
 uint3 tid=threadgroup_position_in_grid;
 uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
 
@@ -61,8 +115,106 @@ uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
         y[(false ? 64*1408:0)+row*704+hidden]=gemma4_geglu_compiled_tape(g,u);
     }
 
-"""#,
-        header: "#define GU_RUN_CAP \(runCap)\n" + #"""
+"""#
+
+    private static let shortRunBody = #"""
+uint3 tid=threadgroup_position_in_grid;
+uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
+
+    const uint linear=tid.y+tid.z*(176/guPairs);tid.y=linear/64;tid.z=linear%64;
+    const uint assignment=tid.z;
+    const uint localSg=sg&1u, localColumn=(sg/2)*4;
+    const uint column=tid.y*(4*guPairs)+localColumn;
+    // Uniform across the threadgroup: every thread here shares one assignment.
+    if(gu_long_run(rhs,assignment)){
+        if(localSg==0u && lane<4u){const uint carry=assignment*704+column+lane;y[carry]=yb[carry];}
+        return;
+    }
+    const ExpertRun run=expert_run(rhs,assignment);
+    if(!run.leader)return;
+    const uint packedRow=(column/16)*32+column%16+(localSg==1 ? 16:0)-localSg*4;
+    const uint expertBase=run.expert*1408;
+    threadgroup bfloat tile[4*8*guPairs];
+    threadgroup bfloat* scratch=tile+(localSg==1 ? 4*guPairs:0)+localColumn-localSg*4;
+    uint3 mathTid=tid;mathTid.y=0;
+    tg_execute_projection<bfloat>(w+(expertBase+packedRow)*352,scales+(expertBase+packedRow)*44,biases+(expertBase+packedRow)*44,
+        x,lhs,scratch,8*guPairs,guSliceN,assignment,run.count,mathTid,localSg,lane);
+    // BF16 closes remain explicit; only the scratch address space changes.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if((sg&1u)==0 && lane<run.count*4){
+        const uint localRow=lane/4, hidden=column+lane%4;
+        const uint row=assignment+localRow, localHidden=localColumn+lane%4;
+        const bfloat g=tile[localRow*8*guPairs+localHidden];
+        const bfloat u=tile[localRow*8*guPairs+4*guPairs+localHidden];
+        y[row*704+hidden]=gemma4_geglu_compiled_tape(g,u);
+    }
+"""#
+
+    private static let longRunBody = #"""
+uint3 tid=threadgroup_position_in_grid;
+uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
+
+    // Eight assignments per threadgroup, so the dispatch is 176 x 8 = 1408
+    // threadgroups rather than 176 x 64. At binomial(8, 1/16) routing only 1.38
+    // runs per layer reach length three, so all but a handful of threadgroups
+    // do nothing but the loop-free reject below and this keeps that cheap.
+    const uint linear=tid.y+tid.z*176u;tid.y=linear/8u;tid.z=linear%8u;
+    const uint localSg=sg&1u, localColumn=(sg/2)*4;
+    const uint column=tid.y*(4*guPairs)+localColumn;
+    const uint packedRow=(column/16)*32+column%16+(localSg==1 ? 16:0)-localSg*4;
+    threadgroup bfloat tile[4*8*guPairs];
+    threadgroup bfloat* scratch=tile+(localSg==1 ? 4*guPairs:0)+localColumn-localSg*4;
+    uint3 mathTid=tid;mathTid.y=0;
+    for(uint slot=0u;slot<8u;++slot){
+        // Every branch in this loop reads only `rhs` and `slot`, so it is
+        // uniform across the threadgroup and the barriers stay collective.
+        const uint assignment=tid.z*8u+slot;
+        if(!gu_long_run(rhs,assignment))continue;
+        const uint word=rhs[assignment];
+        uint offset=0u;
+        for(uint p=assignment;p>0u;--p){if(rhs[p-1]!=word)break;++offset;}
+        if((offset&3u)!=0u)continue;
+        uint len=offset+1u;
+        while(assignment+(len-offset)<64u && rhs[assignment+len-offset]==word)++len;
+        const uint wideCount=min(4u,len-offset);
+        const uint expertBase=word*1408;
+        tg_execute_projection<bfloat>(w+(expertBase+packedRow)*352,scales+(expertBase+packedRow)*44,biases+(expertBase+packedRow)*44,
+            x,lhs,scratch,8*guPairs,guSliceN,assignment,wideCount,mathTid,localSg,lane);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if((sg&1u)==0 && lane<wideCount*4u){
+            const uint localRow=lane/4, hidden=column+lane%4;
+            const uint row=assignment+localRow, localHidden=localColumn+lane%4;
+            const bfloat g=tile[localRow*8*guPairs+localHidden];
+            const bfloat u=tile[localRow*8*guPairs+4*guPairs+localHidden];
+            y[row*704+hidden]=gemma4_geglu_compiled_tape(g,u);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+"""#
+
+    private static let fullRunHelper = #"""
+
+// True when `assignment` sits in a run of three or more identical route words.
+// Loop-free on purpose: the short kernel evaluates it on all 64 assignments and
+// the wide kernel evaluates it as its only reject test, so it is on the hot
+// path of both dispatches. Every position of a run of three or more has two
+// same-expert neighbours inside one of these three windows, and no position of
+// a run of one or two has any of them.
+METAL_FUNC bool gu_long_run(const device uint* rhs,uint assignment) {
+    const uint word=rhs[assignment];
+    // EXPERT_PREFIX_BOUNDS packs the offset and the bound into the route word,
+    // so two assignments on one expert do not compare equal. Report false and
+    // leave every assignment to the incumbent capped path.
+    if((word&0x80000000u)!=0u)return false;
+    const bool p1=assignment>=1u && rhs[assignment-1]==word;
+    const bool p2=assignment>=2u && rhs[assignment-2]==word;
+    const bool n1=assignment+1u<64u && rhs[assignment+1]==word;
+    const bool n2=assignment+2u<64u && rhs[assignment+2]==word;
+    return (p1&&p2)||(p1&&n1)||(n1&&n2);
+}
+"""#
+
+    private static let headerBody = #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helpers from 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -1146,6 +1298,5 @@ METAL_FUNC void tg_execute_projection(const device uint* w,const device T* scale
 #endif
 }
 
-"""#,
-        ensureRowContiguous: true)
+"""#
 }

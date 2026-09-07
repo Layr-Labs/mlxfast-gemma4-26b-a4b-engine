@@ -949,17 +949,27 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
   }
 #endif
+  // DOWN-RUN-CAP-1: 见文件顶部 GU_RUN_CAP 的实测（cap4->cap2 +9.12%，逐位相同）：
+  // 内联的少数派臂把寄存器摊到所有 threadgroup 上。down 平面 79% 的 run 长度为 1，
+  // pair 臂是少数派。翻 0 逐字还原下面的 pair 选举。
+#ifndef DARKBLOOM_GEMMA4_DOWN_RUN_CAP1_V1
+#define DARKBLOOM_GEMMA4_DOWN_RUN_CAP1_V1 1
+#endif
+#if !DARKBLOOM_GEMMA4_DOWN_RUN_CAP1_V1
   // Odd positions are produced by the immediately preceding pair leader.
   if ((run_offset & 1) != 0) {
     return;
   }
+#endif
   const device uint32_t* tile_w = w + expert * w_stride;
   const device T* tile_scales = scales + expert * s_stride;
   const device T* tile_biases = biases + expert * b_stride;
   const device T* tile_x0 =
       x + lhs_indices[assignment * lhs_stride] * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;
-#if DOWN_TAGGED_ROUTE
+#if DARKBLOOM_GEMMA4_DOWN_RUN_CAP1_V1
+  const bool has_pair = false;
+#elif DOWN_TAGGED_ROUTE
   const bool has_pair = (((route_word >> 14) & 0x3fu) + 1u) > 1u;
 #else
   const bool has_pair = expert_prefix_bounds

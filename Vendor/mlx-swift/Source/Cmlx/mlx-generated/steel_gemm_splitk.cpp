@@ -14,6 +14,67 @@ const char* steel_gemm_splitk() {
 // Copyright © 2024 Apple Inc.
 
 using namespace mlx::steel;
+// DARKBLOOM GEMMA4 SPLIT-K MERGE UNROLL.
+// The host's plain split-K selector emits power-of-two partition counts. The
+// common counts take a fixed-stride straight-line merge; arbitrary counts keep
+// the original loop. This changes no accumulation order. Set the macro to 0
+// to restore the incumbent dynamic loop. Engage mark: split-k-merge-unroll.
+#ifndef DARKBLOOM_GEMMA4_SPLITK_MERGE_UNROLL
+#define DARKBLOOM_GEMMA4_SPLITK_MERGE_UNROLL 1
+#endif
+template <int Count, typename AccT>
+inline void gemma4_splitk_merge_fixed(
+    const device AccT* C_split, size_t stride, thread AccT& out) {
+  const_for_loop<0, Count, 1>([&](auto index) {
+    out += C_split[stride * index.value];
+  });
+}
+
+template <typename AccT>
+inline AccT gemma4_splitk_merge(
+    const device AccT* C_split, int k_partitions, int partition_stride) {
+  AccT out = 0;
+#if DARKBLOOM_GEMMA4_SPLITK_MERGE_UNROLL
+  const size_t stride = size_t(partition_stride);
+  switch (k_partitions) {
+    case 1:
+      gemma4_splitk_merge_fixed<1>(C_split, stride, out);
+      break;
+    case 2:
+      gemma4_splitk_merge_fixed<2>(C_split, stride, out);
+      break;
+    case 4:
+      gemma4_splitk_merge_fixed<4>(C_split, stride, out);
+      break;
+    case 8:
+      gemma4_splitk_merge_fixed<8>(C_split, stride, out);
+      break;
+    case 16:
+      gemma4_splitk_merge_fixed<16>(C_split, stride, out);
+      break;
+    case 32:
+      gemma4_splitk_merge_fixed<32>(C_split, stride, out);
+      break;
+    default: {
+      size_t offset = 0;
+      for (int i = 0; i < k_partitions; i++) {
+        out += C_split[offset];
+        offset += partition_stride;
+      }
+      break;
+    }
+  }
+#else
+  size_t offset = 0;
+  for (int i = 0; i < k_partitions; i++) {
+    out += C_split[offset];
+    offset += partition_stride;
+  }
+#endif
+  return out;
+}
+
+
 
 ///////////////////////////////////////////////////////////////////////////////
 // GEMM kernels
@@ -193,13 +254,7 @@ template <
   D += gid.x + gid.y * size_t(ldd);
   C_split += gid.x + gid.y * size_t(ldd);
 
-  size_t offset = 0;
-  AccT out = 0;
-
-  for (int i = 0; i < k_partitions; i++) {
-    out += C_split[offset];
-    offset += partition_stride;
-  }
+  AccT out = gemma4_splitk_merge(C_split, k_partitions, partition_stride);
 
   // Write output
   D[0] = Epilogue::apply(out);
@@ -226,13 +281,7 @@ template <
   D += gid.x + gid.y * size_t(ldd);
   C_split += gid.x + gid.y * size_t(ldd);
 
-  size_t offset = 0;
-  AccT out = 0;
-
-  for (int i = 0; i < k_partitions; i++) {
-    out += C_split[offset];
-    offset += partition_stride;
-  }
+  AccT out = gemma4_splitk_merge(C_split, k_partitions, partition_stride);
 
   // Write output
   Epilogue op(alpha, beta);

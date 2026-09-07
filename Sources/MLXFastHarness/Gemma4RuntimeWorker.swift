@@ -1314,10 +1314,24 @@ extension Gemma4Runtime {
                 stopTokens: stopTokens)
             state.dflashFreeRunSession = dflashSession
             state.freeRunSeedTokenCount = seedTokens.count
+            // The echo names BOTH draft sources and caps at the WIDEST
+            // rectangle this session can put in front of the verifier, which
+            // is what `rectangularCap` claims to be. A DFlash round's block
+            // comes from `draftBlock` at `depth + 1` OR, once
+            // `DFlashCycleProposalPolicy` has installed a cycle, from the
+            // cycle itself at the wide block — the same
+            // `Swift.max(depth + 1, cycleProposalBlockSize)` the session
+            // constructs its policy with, read from the session's own
+            // constant so the two cannot drift. Echoing `depth + 1` alone
+            // would understate the widest verify this route runs.
+            let cycleWideBlockSize = Swift.max(
+                depth + 1,
+                RuntimeWorkerDFlashFreeRunSession.cycleProposalBlockSize)
             state.freeRunConfigEcho = (
-                source: "DFlashDraftModel.draftBlock(blockSize: depth + 1)",
+                source: "DFlashDraftModel.draftBlock(blockSize: depth + 1) "
+                    + "| DFlashCycleProposalPolicy(wide: \(cycleWideBlockSize))",
                 mode: "dflash_greedy_block",
-                cap: depth + 1,
+                cap: cycleWideBlockSize,
                 depth: depth
             )
             return dflashSession.seedToken

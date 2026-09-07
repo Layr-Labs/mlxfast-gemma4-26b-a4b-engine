@@ -175,6 +175,38 @@ public struct DFlashCopiedTargetRollbackState: DFlashTargetRollbackState {
     }
 }
 
+/// Whether every cache in `cache` will STILL be rollable-back by trimming once
+/// the round about to run has written `plannedWriteCount` positions into it.
+///
+/// THE RING SEAM, and why the width has to be part of the question. A
+/// `RotatingKVCache` is trimmable exactly while `offset < maxSize`: once the
+/// ring wraps, rolling the offset back would need the entries the wrap just
+/// overwrote, and those are the oldest rows still inside the window. That rule
+/// is correct rather than conservative — a wrapped cache must be rolled back by
+/// snapshot and replay.
+///
+/// A DFlash round asks the question BEFORE the verify forward and acts on it
+/// AFTER, and a verify writes a whole `[1, blockSize]` rectangle in between. So
+/// the round that starts one position short of the ring and ends past it is
+/// trimmable when the snapshot decision is taken and untrimmable when the
+/// rollback runs. Asking `canTrimPromptCache` alone at the top of the round
+/// therefore skips the snapshot for precisely the round that needs it, and a
+/// rejected token in that round has nowhere to roll back to. Taking the width
+/// into account is what closes that window.
+///
+/// A cache that declares no `maxSize` never wraps, so its `isTrimmable` answer
+/// stands on its own.
+public func dflashCacheIsTrimmableAfterWriting(
+    _ cache: [KVCache], plannedWriteCount: Int
+) -> Bool {
+    let width = Swift.max(0, plannedWriteCount)
+    return cache.allSatisfy { entry in
+        guard entry.isTrimmable else { return false }
+        guard let maxSize = entry.maxSize else { return true }
+        return entry.offset + width < maxSize
+    }
+}
+
 /// Minimal target surface a DFlash drafter needs from a loaded target model.
 ///
 /// Keep this in MLXLLM rather than MLXSpeculative so model implementations
@@ -208,7 +240,13 @@ public protocol DFlashTargetModel: LLMModel {
 /// Hybrid targets can conform to this protocol to avoid baking their cache
 /// details into the DFlash generation loop.
 public protocol DFlashTargetCacheRollbackProvider: DFlashTargetModel {
-    func makeDFlashCacheRollbackState(cache: [KVCache]) -> (any DFlashTargetRollbackState)?
+    /// `plannedWriteCount` is the number of positions the round is about to
+    /// write before it asks for a rollback (a greedy round's `blockSize`). A
+    /// provider that rolls back by trimming MUST take it into account: see
+    /// `dflashCacheIsTrimmableAfterWriting`.
+    func makeDFlashCacheRollbackState(
+        cache: [KVCache], plannedWriteCount: Int
+    ) -> (any DFlashTargetRollbackState)?
 
     func rollbackDFlashCache(
         _ cache: inout [KVCache],
@@ -250,11 +288,20 @@ extension DFlashTargetModel {
         )
     }
 
+    /// Snapshot the target cache unless the round can still be rolled back by
+    /// trimming AFTER it has written `plannedWriteCount` positions.
+    ///
+    /// The width is load-bearing, not decoration: without it the one round that
+    /// starts inside its ring and ends past it gets no snapshot and cannot
+    /// trim, and any rejected token in that round fails the run with
+    /// `untrimmableCache`. See `dflashCacheIsTrimmableAfterWriting`.
     public func makeDefaultDFlashCacheRollbackState(
-        cache: [KVCache]
+        cache: [KVCache],
+        plannedWriteCount: Int
     ) -> (any DFlashTargetRollbackState)? {
-        canTrimPromptCache(cache) ? nil : DFlashCopiedTargetRollbackState(
-            cache: cache.map { $0.copy() })
+        dflashCacheIsTrimmableAfterWriting(cache, plannedWriteCount: plannedWriteCount)
+            ? nil
+            : DFlashCopiedTargetRollbackState(cache: cache.map { $0.copy() })
     }
 
     public func rollbackDFlashCacheUsingDefault(
@@ -271,12 +318,17 @@ extension DFlashTargetModel {
             return acceptedHidden
         }
 
+        // Trimming is the cheap rollback and keeps the hidden the verify
+        // already produced, so it stays the first choice whenever the rejected
+        // tail is still inside every cache's window.
         if canTrimPromptCache(cache) {
             let trimmed = trimPromptCache(cache, numTokens: rejectedTokenCount)
-            guard trimmed == rejectedTokenCount else {
-                throw DFlashTargetError.untrimmableCache
+            if trimmed == rejectedTokenCount {
+                return acceptedHidden
             }
-            return acceptedHidden
+            // A SHORT trim leaves the caches at an offset no caller can reason
+            // about. Fall through to the snapshot, which discards the partial
+            // trim with the rest of the round rather than compounding it.
         }
 
         guard let copiedState = state as? DFlashCopiedTargetRollbackState else {

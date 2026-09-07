@@ -1,6 +1,6 @@
 # Gemma 4 DFlash on main: target-verified cycle proposals
 
-Status: Proposal. Implemented and measured on branch `perf/gemma4-dflash-cycle-proposals` (not merged); blocked by the open issues in docs/benchmarks/gemma4-b1-humaneval-2026-09-02.md.
+Status: Implemented in this branch; measured — see docs/benchmarks/gemma4-b1-humaneval-2026-09-02.md.
 Supersedes the exact-verifier study (PR #2097, which stays as the record of that road).
 Acceptance is HumanEval parity, not bit-exactness (David, 2026-09-02).
 
@@ -103,9 +103,11 @@ never narrows below an ordinary round.
 
 ### 4. `DFlashDraftModel.submissionDraftDepth`
 
-Left at 1. It is only the fallback for non-wire callers; the benchmark and benchd always pass an
-explicit depth through `RuntimeWorkerSpecRegistry.resolveDFlashDepth`, and that resolved value is
-both echoed and executed.
+Raised from 1 to 15, the drafter checkpoint's own ceiling (commit `125dc37`). It is only the
+fallback for non-wire callers; the benchmark and benchd always pass an explicit depth through
+`RuntimeWorkerSpecRegistry.resolveDFlashDepth`, and that resolved value is both echoed and
+executed. The constant mattered anyway because the resolver clamps to it: at 1 a requested
+`--dflash-depth 15` was silently measured at depth 1 (benchmark note, open issue 4).
 
 ### 5. Tests: `Tests/MLXFastTests/DFlashCycleProposalPolicyTests.swift` (+296, 13 tests)
 
@@ -191,21 +193,38 @@ is an engine/research branch as it stands, not a submittable surface.
 
 ## Gates (in order; each needs the GPU lock through the guard)
 
-Numbers are placeholders until each gate runs.
+All gate numbers below are from the HumanEval-164 receipts in
+`docs/benchmarks/receipts/humaneval-2026-09-02/` (batch 1, greedy, EvalPlus 0.3.1, 768 max
+tokens, M5 Max). "Aggregate decode" is defined in the benchmark note's header.
 
-* **G0 -- main baseline, batch 1, 1K Python prompt.** Serial tok/s + digest; stock DFlash
-  D1/D3/D15 tok/s and positional mismatches vs main's serial.
-  Serial: _TBD_ tok/s, digest _TBD_. D1 _TBD_ / D3 _TBD_ / D15 _TBD_ tok/s, mismatches _TBD_.
-* **G1 -- quality reference.** HumanEval-164 pass@1 of main serial via the worker driver
-  (EvalPlus 0.3.1, greedy, 768 max tokens). ~15 min GPU. Result: _TBD_.
-* **G2 -- the measurement.** 1K-prompt tok/s for serial vs D\<ordinary\> vs D\<ordinary\>+cycle;
-  mismatches vs main serial; token-level agreement rate on the HumanEval generations; and the
-  cycle-round share (`cycleRoundsRun / roundsRun`). Result: _TBD_.
-* **G3 -- acceptance.** HumanEval-164 pass@1 of the DFlash+cycle route. Pass = within 2 problems
-  of G1 with no systematic failure class (per-problem diff reviewed). This is David's stated
-  acceptance bar. Result: _TBD_.
-* **G4 -- ship.** Push `perf/gemma4-dflash-cycle-proposals`, open a PR to main, mark ready for
-  review. Only on David's word; nothing is pushed from the implementation session.
+* **G0 -- main baseline, batch 1, 1K Python prompt.** NOT RUN, and RETIRED as a gate. Both
+  main's serial route (111.4 tok/s) and the exact-verifier branch's serial route (114.9 tok/s)
+  produce degenerate repetition on that prompt, so throughput measured there is the cycle policy
+  measured against its own premise. Benchmark note section 5 states why; HumanEval replaces it.
+* **G1 -- quality reference.** Main serial, worker `c2f81b7e`: base pass@1 **0.945 (155/164)**,
+  plus **0.909 (149/164)**, 82,505 generated tokens, **108.3 tok/s** aggregate decode, 0
+  generation failures. Receipt `serial-main-164-receipt.json`.
+* **G2 -- the measurement.** Read on HumanEval rather than the 1K prompt. Fixed worker
+  `48ad1418` at depth 15 + cycle: **136.2 tok/s** aggregate decode vs 108.3 serial (**1.26x**),
+  81,280 generated tokens, **5.18 tokens per verified round**, per-problem speedup median
+  **1.33x** (p10 1.02x, p90 1.64x, max 2.24x, min 0.65x, slower than serial on 12 of 163).
+  Token-level agreement with serial: **43 of 164** completions are token-identical.
+  Cycle-round share is NOT measured -- the worker emits no `cycleRoundsRun` counter and the
+  eval driver collects none, and at depth 15 the ordinary block and the wide cycle block are
+  both 16, so acceptance lengths cannot separate them either. Receipt
+  `dflash-cycle-d15-fixed-164-receipt.json`.
+* **G3 -- acceptance. PASS.** DFlash+cycle base pass@1 **0.933 (153/164)**, plus **0.902
+  (148/164)**: 2 base problems below G1, at the stated band. Per-problem diff reviewed, no
+  systematic failure class -- HumanEval/149 and /159 are near-tie argmax divergences that
+  produced wrong code, /147 is the same drift producing correct code, and /143 is a driver
+  artifact (its stop re-run hit the driver's attempt limit and scored an empty completion;
+  `engine_error_retries` is 0 on that row). Excluding the artifact, base is 154 -- 1 below G1.
+  Separately, the eleven problems that aborted before the fix all complete with **8/11 base and
+  8/11 plus, identical to serial on those problems**, zero `untrimmableCache` aborts and zero
+  engine-error retries, at 121.6 vs 106.7 tok/s. Receipt
+  `dflash-cycle-d15-fixed-11-receipt.json`.
+* **G4 -- ship.** Push `perf/gemma4-dflash-cycle-proposals-r2`, open a PR to main, mark ready for
+  review. NOT DONE. Only on David's word; nothing is pushed from the implementation session.
 
 ### Driving the 1K-prompt benchmark
 
@@ -220,6 +239,11 @@ physical width any more -- ordinary rounds run `depth + 1`, cycle rounds run 16 
 width field would have to be reported per round, not per run.
 
 ## Expected outcome, stated up front
+
+Written before G1-G3 ran. The second bullet is WRONG as stated: DFlash at depth 15 lands at
+**1.26x serial** on HumanEval, not "roughly serial or below". The speedup there comes from the
+neural drafter at the raised depth, not from the cycle policy, so the "cycle proposals only"
+fallback in that bullet is not the shipped default -- both arms stay on. See the Gates section.
 
 * On the 1K Python prompt (period-18 loop), the cycle route should approach the branch's
   203 tok/s if main's rectangular verify at width 16 is not slower than the branch's exact C16.

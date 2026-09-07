@@ -107,6 +107,48 @@ def test_select_task_ids():
         driver.select_task_ids(ids[:10], 20)
 
 
+def test_parse_task_ids_reads_a_comma_separated_list():
+    assert driver.parse_task_ids("HumanEval/94, HumanEval/123") == [
+        "HumanEval/94",
+        "HumanEval/123",
+    ]
+    # Order is the caller's, not the dataset's.
+    assert driver.parse_task_ids("HumanEval/9,HumanEval/2") == [
+        "HumanEval/9",
+        "HumanEval/2",
+    ]
+    with pytest.raises(ValueError):
+        driver.parse_task_ids(" , ")
+    with pytest.raises(ValueError, match="repeats"):
+        driver.parse_task_ids("HumanEval/1,HumanEval/1")
+
+
+def test_select_explicit_task_ids_refuses_an_unknown_problem():
+    ids = [f"HumanEval/{i}" for i in range(164)]
+    assert driver.select_explicit_task_ids(ids, ["HumanEval/123", "HumanEval/94"]) == [
+        "HumanEval/123",
+        "HumanEval/94",
+    ]
+    with pytest.raises(ValueError, match="unknown"):
+        driver.select_explicit_task_ids(ids, ["HumanEval/900"])
+    with pytest.raises(ValueError):
+        driver.select_explicit_task_ids(ids[:10], ["HumanEval/1"])
+
+
+def test_task_ids_and_n_are_mutually_exclusive(tmp_path):
+    with pytest.raises(SystemExit, match="pass one"):
+        driver.main(
+            [
+                "--route", "dflash",
+                "--label", "t",
+                "--n", "20",
+                "--task-ids", "HumanEval/94",
+                "--out-dir", str(tmp_path),
+                "--fake-worker", str(FAKE_WORKER),
+            ]
+        )
+
+
 def test_summarize_scores_requires_base_and_plus():
     results = {
         "eval": {
@@ -213,6 +255,7 @@ def _run(
     max_tokens: int = 768,
     extra: list[str] | None = None,
     label: str = "t",
+    n: int | None = 20,
 ) -> dict:
     config_path = tmp_path / "fake.json"
     config_path.write_text(
@@ -231,11 +274,12 @@ def _run(
     argv = [
         "--route", route,
         "--label", label,
-        "--n", "20",
         "--max-tokens", str(max_tokens),
         "--out-dir", str(tmp_path),
         "--fake-worker", str(FAKE_WORKER),
     ]
+    if n is not None:
+        argv += ["--n", str(n)]
     if route == "dflash":
         argv += ["--dflash-depth", "15"]
     argv += extra or []
@@ -460,23 +504,79 @@ def test_dflash_truncates_when_no_stop_token_is_committed(
     assert receipt["totals"]["worker_respawns"] == 0
 
 
-def test_dflash_records_a_failed_generation_on_an_unrecognised_error():
-    """A non-early-EOS failure is recorded once, never retried in a loop."""
+class _ScriptedHandle:
+    """A `WorkerHandle` stand-in that replays queued `free_decode_run` outcomes.
 
-    class _Broken:
-        def __init__(self):
-            self.spawns = 1
-            self.restarts = []
-            self.worker = object()
+    Each entry is either an error string (that run fails) or a token list (that
+    run succeeds, returning those tokens after the seed).
+    """
 
-        def request(self, body):
-            return {"ok": False, "error": "invalidInput(\"boom\")"}
+    def __init__(self, seed_token: int, runs: list):
+        self.seed_token = seed_token
+        self.runs = list(runs)
+        self.spawns = 1
+        self.restarts: list[dict] = []
+        self.worker = object()
+        self.counts: list[int] = []
 
-        def restart(self, *, reason, task_id=None):
-            self.spawns += 1
-            self.restarts.append({"reason": reason, "task_id": task_id})
+    def request(self, body):
+        if body["kind"] == "free_decode_begin":
+            return {
+                "ok": True,
+                "seed_token": self.seed_token,
+                "effective_spec": {"mode": "dflash"},
+            }
+        assert body["kind"] == "free_decode_run"
+        self.counts.append(int(body["count"]))
+        outcome = self.runs.pop(0)
+        if isinstance(outcome, str):
+            return {"ok": False, "error": outcome}
+        return {
+            "ok": True,
+            "tokens": list(outcome),
+            "acceptance_lengths": [1] * len(outcome),
+        }
 
-    handle = _Broken()
+    def restart(self, *, reason, task_id=None):
+        self.spawns += 1
+        self.restarts.append({"reason": reason, "task_id": task_id})
+
+
+def _stop_error(position: int, n: int) -> str:
+    return (
+        f"free_decode_run dflash leg committed stop token 106 at committed "
+        f"position {position} of N={n}; the leg is invalid (a paired leg must "
+        f"reach N or both legs must stop)"
+    )
+
+
+def test_dflash_retries_an_engine_error_once_on_a_fresh_worker():
+    """`untrimmableCache` is worth one identical retry, not an instant failure."""
+
+    handle = _ScriptedHandle(7, ["untrimmableCache", [8, 9, 106]])
+    outcome = driver.generate_dflash(
+        handle,
+        seed_tokens=[1, 2, 3],
+        max_tokens=768,
+        stop_ids={106},
+        depth=1,
+        task_id="HumanEval/94",
+    )
+    assert outcome["failed"] is False
+    assert outcome["stopped_on"] == 106
+    assert outcome["engine_error_retries"] == 1
+    # The retry is the IDENTICAL request, on a fresh process.
+    assert handle.counts == [767, 767]
+    assert [a["count"] for a in outcome["attempts"]] == [767, 767]
+    assert [a["error"] for a in outcome["attempts"]] == ["untrimmableCache", None]
+    assert handle.spawns == 2
+    assert handle.restarts[0]["task_id"] == "HumanEval/94"
+
+
+def test_dflash_records_a_failed_generation_after_the_one_retry():
+    """A non-early-EOS failure gets one retry, then is recorded -- never looped."""
+
+    handle = _ScriptedHandle(7, ['invalidInput("boom")', 'invalidInput("boom")'])
     outcome = driver.generate_dflash(
         handle,
         seed_tokens=[1, 2, 3],
@@ -488,8 +588,158 @@ def test_dflash_records_a_failed_generation_on_an_unrecognised_error():
     assert outcome["failed"] is True
     assert outcome["tokens"] == []
     assert outcome["respawned"] is True
-    assert handle.spawns == 2
+    assert outcome["engine_error_retries"] == 1
+    assert len(outcome["attempts"]) == 2
+    assert handle.spawns == 3
     assert handle.restarts[0]["task_id"] == "HumanEval/0"
+
+
+def test_dflash_reruns_again_when_the_stop_position_moves():
+    """HumanEval/112, depth-15 receipt: 453 at N=474, then 452 at N=453.
+
+    A narrower N reshapes the last blocks, and a DFlash block verify is not
+    bit-identical to a width-1 step, so the reported stop position can move. One
+    re-run is not always enough.
+    """
+
+    handle = _ScriptedHandle(
+        7,
+        [_stop_error(453, 474), _stop_error(452, 453), [1] * 450 + [106]],
+    )
+    outcome = driver.generate_dflash(
+        handle,
+        seed_tokens=[1, 2, 3],
+        max_tokens=768,
+        stop_ids={106},
+        depth=15,
+        task_id="HumanEval/112",
+        hint_tokens=475,
+    )
+    assert outcome["failed"] is False
+    assert outcome["stopped_on"] == 106
+    assert handle.counts == [474, 453, 452]
+    assert outcome["rerun"] is True
+    assert outcome["rerun_position"] == 452
+    assert len(outcome["tokens"]) == 452
+
+
+def test_dflash_stops_rerunning_at_a_count_it_already_tried():
+    """Two positions that point at each other must not loop forever."""
+
+    handle = _ScriptedHandle(
+        7,
+        [_stop_error(400, 767), _stop_error(767, 400), 'unreachable'],
+    )
+    outcome = driver.generate_dflash(
+        handle,
+        seed_tokens=[1, 2, 3],
+        max_tokens=768,
+        stop_ids={106},
+        depth=1,
+        task_id="HumanEval/0",
+    )
+    assert outcome["failed"] is True
+    assert handle.counts == [767, 400]
+
+
+def test_dflash_records_a_short_rerun_rather_than_raising():
+    """The depth-15 abort: a re-run that lands with no stop token in it.
+
+    That used to fall through the attempt queue and raise
+    ``AssertionError: dflash attempt loop exhausted without a verdict``, which
+    took the whole 164-problem run down at problem 143. The tokens are real
+    output, just short, so they are recorded as a truncated generation.
+    """
+
+    handle = _ScriptedHandle(7, [_stop_error(400, 767), [1] * 399])
+    outcome = driver.generate_dflash(
+        handle,
+        seed_tokens=[1, 2, 3],
+        max_tokens=768,
+        stop_ids={106},
+        depth=1,
+        task_id="HumanEval/112",
+    )
+    assert outcome["failed"] is False
+    assert outcome["truncated"] is True
+    assert outcome["stopped_on"] is None
+    assert len(outcome["tokens"]) == 400
+
+
+def test_dflash_records_a_restart_failure_rather_than_raising():
+    class _NoRestart(_ScriptedHandle):
+        def restart(self, *, reason, task_id=None):
+            raise RuntimeError("worker hello failed")
+
+    handle = _NoRestart(7, ["untrimmableCache"])
+    outcome = driver.generate_dflash(
+        handle,
+        seed_tokens=[1, 2, 3],
+        max_tokens=768,
+        stop_ids={106},
+        depth=1,
+        task_id="HumanEval/94",
+    )
+    assert outcome["failed"] is True
+    assert "worker restart failed" in outcome["failure"]
+    assert outcome["respawned"] is False
+
+
+def test_task_ids_runs_only_the_named_problems(tmp_path, monkeypatch, code_tokens):
+    receipt = _run(
+        tmp_path,
+        monkeypatch,
+        route="dflash",
+        tokens=code_tokens,
+        stop_ids=[0, 1, 50, 106],
+        max_tokens=6,
+        n=None,
+        extra=["--task-ids", "HumanEval/94,HumanEval/3"],
+    )
+    assert [row["task_id"] for row in receipt["rows"]] == [
+        "HumanEval/94",
+        "HumanEval/3",
+    ]
+    assert receipt["n"] == 2
+    assert receipt["dataset"]["task_ids_requested"] == [
+        "HumanEval/94",
+        "HumanEval/3",
+    ]
+    assert receipt["dataset"]["selection"].startswith("explicit")
+    # The samples file holds only what ran; padding to all 164 is the scoring
+    # step's job (`write_scoring_file`), which only runs under --score.
+    samples = [
+        json.loads(line)
+        for line in (tmp_path / "t-samples.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert [row["task_id"] for row in samples] == ["HumanEval/94", "HumanEval/3"]
+
+
+def test_one_problems_worker_failure_does_not_abort_the_run(
+    tmp_path, monkeypatch, code_tokens
+):
+    """A RuntimeError on one problem is that problem's verdict, not the run's."""
+
+    real = driver.generate_dflash
+    seen = {"calls": 0}
+
+    def flaky(handle, **kwargs):
+        seen["calls"] += 1
+        if seen["calls"] == 3:
+            raise RuntimeError("runtime worker closed stdout")
+        return real(handle, **kwargs)
+
+    monkeypatch.setattr(driver, "generate_dflash", flaky)
+    receipt = _run(tmp_path, monkeypatch, route="dflash", tokens=code_tokens,
+                   stop_ids=[0, 1, 50, 106], max_tokens=6)
+    assert len(receipt["rows"]) == 20
+    failed = [row for row in receipt["rows"] if row["generation_failed"]]
+    assert len(failed) == 1
+    assert failed[0]["task_id"] == receipt["rows"][2]["task_id"]
+    assert "closed stdout" in failed[0]["failure"]
+    assert receipt["totals"]["generation_failures"] == 1
+    assert receipt["status"] == "generated"
 
 
 def test_free_run_count_ceiling_is_enforced_client_side():

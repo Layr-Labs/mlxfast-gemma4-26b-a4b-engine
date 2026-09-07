@@ -904,6 +904,297 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   }
 }
 
+// --- DOWN-RUN-QUAD 移植：以下三个函数逐字取自 quantized.h（gate/up 平面
+// 的 RUN-QUAD 已在用它们），此处只是让 tight-grid 的 self-contained 源码
+// 也能引用。算术一字未改。
+template <typename U, int values_per_thread>
+inline U qdot_affine4_registered_word(
+    uint packed_word,
+    const thread U* x_thread,
+    U scale,
+    U bias,
+    U sum) {
+  static_assert(values_per_thread == 8, "Word load expects eight 4-bit values");
+  const uint packed0 = packed_word & 0xffffu;
+  const uint packed1 = packed_word >> 16;
+  U accum =
+      (x_thread[0] * (packed0 & 0x000f) +
+       x_thread[1] * (packed0 & 0x00f0) +
+       x_thread[2] * (packed0 & 0x0f00) +
+       x_thread[3] * (packed0 & 0xf000));
+  accum +=
+      (x_thread[4] * (packed1 & 0x000f) +
+       x_thread[5] * (packed1 & 0x00f0) +
+       x_thread[6] * (packed1 & 0x0f00) +
+       x_thread[7] * (packed1 & 0xf000));
+  return scale * accum + sum * bias;
+}
+
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    const device T* x2,
+    const device T* x3,
+    device T* y0,
+    device T* y1,
+    device T* y2,
+    device T* y3,
+    const int in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 8;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x_thread[values_per_thread];
+  thread uint packed[results_per_simdgroup];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+  thread float result2[results_per_simdgroup] = {0};
+  thread float result3[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  x2 += simd_lid * values_per_thread;
+  x3 += simd_lid * values_per_thread;
+  y0 += out_row;
+  y1 += out_row;
+  y2 += out_row;
+  y3 += out_row;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] =
+          *((const device uint*)(ws + row * in_vec_size_w));
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result3[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+
+    ws += block_size / 2;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+    x2 += block_size;
+    x3 += block_size;
+  }
+
+  const int remaining = clamp(
+      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
+      0,
+      values_per_thread);
+  if (remaining > 0) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] =
+          *((const device uint*)(ws + row * in_vec_size_w));
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x3, x_thread, remaining);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result3[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+    result2[row] = simd_sum(result2[row]);
+    result3[row] = simd_sum(result3[row]);
+    if (simd_lid == 0) {
+      y0[row] = static_cast<T>(result0[row]);
+      y1[row] = static_cast<T>(result1[row]);
+      y2[row] = static_cast<T>(result2[row]);
+      y3[row] = static_cast<T>(result3[row]);
+    }
+  }
+}
+
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    const device T* x2,
+    device T* y0,
+    device T* y1,
+    device T* y2,
+    const int in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 8;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x_thread[values_per_thread];
+  thread uint packed[results_per_simdgroup];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+  thread float result2[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  x2 += simd_lid * values_per_thread;
+  y0 += out_row;
+  y1 += out_row;
+  y2 += out_row;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] =
+          *((const device uint*)(ws + row * in_vec_size_w));
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+
+    ws += block_size / 2;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+    x2 += block_size;
+  }
+
+  const int remaining = clamp(
+      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
+      0,
+      values_per_thread);
+  if (remaining > 0) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] =
+          *((const device uint*)(ws + row * in_vec_size_w));
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+    result2[row] = simd_sum(result2[row]);
+    if (simd_lid == 0) {
+      y0[row] = static_cast<T>(result0[row]);
+      y1[row] = static_cast<T>(result1[row]);
+      y2[row] = static_cast<T>(result2[row]);
+    }
+  }
+}
+
 template <typename T, int group_size, int bits, int span>
 METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device uint32_t* w,
@@ -949,8 +1240,16 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
   }
 #endif
-  // Odd positions are produced by the immediately preceding pair leader.
-  if ((run_offset & 1) != 0) {
+  // DOWN-RUN-QUAD: gate/up 平面早已按 run_offset % 4 选 leader，一份权重流
+  // 服务最多四个同 expert 的 assignment；down 平面还停在 % 2，于是长度 3 的
+  // run 要两份流（pair + single）、长度 4 也要两份（pair + pair）。这里给
+  // down 平面同样的选举。翻 0 逐字还原上面的 pair 选举。
+#ifndef DARKBLOOM_GEMMA4_DOWN_RUN_QUAD_V1
+#define DARKBLOOM_GEMMA4_DOWN_RUN_QUAD_V1 1
+#endif
+  constexpr uint down_run_span =
+      (DARKBLOOM_GEMMA4_DOWN_RUN_QUAD_V1 != 0) ? 4u : 2u;
+  if ((run_offset & (down_run_span - 1u)) != 0) {
     return;
   }
   const device uint32_t* tile_w = w + expert * w_stride;
@@ -960,32 +1259,57 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
       x + lhs_indices[assignment * lhs_stride] * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;
 #if DOWN_TAGGED_ROUTE
-  const bool has_pair = (((route_word >> 14) & 0x3fu) + 1u) > 1u;
+  uint run_len = min(down_run_span, ((route_word >> 14) & 0x3fu) + 1u);
 #else
-  const bool has_pair = expert_prefix_bounds
-      ? (((route_word >> 14) & 0x3fu) + 1u) > 1u
-      : assignment + 1 < 64 &&
-          rhs_indices[(assignment + 1) * rhs_stride] == expert;
+  uint run_len = 1;
+  if (expert_prefix_bounds) {
+    run_len = min(down_run_span, ((route_word >> 14) & 0x3fu) + 1u);
+  } else {
+    while (run_len < down_run_span && assignment + run_len < 64 &&
+           rhs_indices[(assignment + run_len) * rhs_stride] == expert) {
+      run_len++;
+    }
+  }
 #endif
-  if (has_pair) {
+  if (run_len > 1) {
     const device T* tile_x1 =
         x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
     device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+    if (run_len == 2) {
+      for (int t = 0; t < gemma4_down_tile_span; t++) {
+        uint3 tile_tid = tid;
+        tile_tid.y = tid.y + uint(t);
+        qmv_affine4_g64_pair_impl<T, group_size, bits>(
+            tile_w, tile_scales, tile_biases, tile_x0, tile_x1,
+            tile_y0, tile_y1, in_vec_size, tile_tid, simd_gid, simd_lid);
+      }
+      return;
+    }
+    const device T* tile_x2 =
+        x + lhs_indices[(assignment + 2) * lhs_stride] * x_stride;
+    device T* tile_y2 = y + (assignment + 2) * out_vec_size;
+    if (run_len == 3) {
+      for (int t = 0; t < gemma4_down_tile_span; t++) {
+        uint3 tile_tid = tid;
+        tile_tid.y = tid.y + uint(t);
+        qmv_affine4_g64_triple_stream_impl<T, group_size, bits>(
+            tile_w, tile_scales, tile_biases, tile_x0, tile_x1, tile_x2,
+            tile_y0, tile_y1, tile_y2, in_vec_size, tile_tid,
+            simd_gid, simd_lid);
+      }
+      return;
+    }
+    const device T* tile_x3 =
+        x + lhs_indices[(assignment + 3) * lhs_stride] * x_stride;
+    device T* tile_y3 = y + (assignment + 3) * out_vec_size;
     for (int t = 0; t < gemma4_down_tile_span; t++) {
       uint3 tile_tid = tid;
       tile_tid.y = tid.y + uint(t);
-      qmv_affine4_g64_pair_impl<T, group_size, bits>(
-          tile_w,
-          tile_scales,
-          tile_biases,
-          tile_x0,
-          tile_x1,
-          tile_y0,
-          tile_y1,
-          in_vec_size,
-          tile_tid,
-          simd_gid,
-          simd_lid);
+      qmv_affine4_g64_quad_stream_impl<T, group_size, bits>(
+          tile_w, tile_scales, tile_biases,
+          tile_x0, tile_x1, tile_x2, tile_x3,
+          tile_y0, tile_y1, tile_y2, tile_y3,
+          in_vec_size, tile_tid, simd_gid, simd_lid);
     }
     return;
   }

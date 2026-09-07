@@ -192,10 +192,12 @@ public enum Gemma4PrefillGlueV1 {
 
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
+            // GLUE-VEC4: one vec<T,4> load in place of four scalar reads of the same run.
+            const vec<T, 4> xvec = *((const device vec<T, 4>*)(x + base));
             float xv[GLUE_NREADS];
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                xv[i] = static_cast<float>(x[base + i]);
+                xv[i] = static_cast<float>(xvec[i]);
             }
 
             const float inv = glue_inv_rms(
@@ -289,10 +291,12 @@ public enum Gemma4PrefillGlueV1 {
 
                 const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
+                // GLUE-VEC4: one vec<T,4> load in place of four scalar reads of the same run.
+                const vec<T, 4> xvec = *((const device vec<T, 4>*)(x + base));
                 float xv[GLUE_NREADS];
                 #pragma clang loop unroll(full)
                 for (int i = 0; i < GLUE_NREADS; i++) {
-                    xv[i] = static_cast<float>(x[base + i]);
+                    xv[i] = static_cast<float>(xvec[i]);
                 }
 
                 const float inv = glue_inv_rms(
@@ -386,10 +390,12 @@ public enum Gemma4PrefillGlueV1 {
 
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
+            // GLUE-VEC4: one vec<T,4> load in place of four scalar reads of the same run.
+            const vec<T, 4> xvec = *((const device vec<T, 4>*)(x + base));
             float xv[GLUE_NREADS];
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                xv[i] = static_cast<float>(x[base + i]);
+                xv[i] = static_cast<float>(xvec[i]);
             }
 
             // One sum-of-squares serves both weights: the two stock kernels
@@ -397,13 +403,17 @@ public enum Gemma4PrefillGlueV1 {
             const float inv = glue_inv_rms(
                 xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            // GLUE-VEC4: two vector stores in place of eight scalar ones.
+            vec<T, 4> o1vec, o2vec;
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T scaled = static_cast<T>(xv[i] * inv);
-                out1[base + i] = w1[j] * scaled;
-                out2[base + i] = w2[j] * scaled;
+                o1vec[i] = w1[j] * scaled;
+                o2vec[i] = w2[j] * scaled;
             }
+            *((device vec<T, 4>*)(out1 + base)) = o1vec;
+            *((device vec<T, 4>*)(out2 + base)) = o2vec;
             """,
         header: kernelHeader,
         ensureRowContiguous: true
@@ -475,21 +485,26 @@ public enum Gemma4PrefillGlueV1 {
 
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
+            // GLUE-VEC4: one vec<T,4> load in place of four scalar reads of the same run.
+            const vec<T, 4> xvec = *((const device vec<T, 4>*)(x + base));
             float xv[GLUE_NREADS];
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                xv[i] = static_cast<float>(x[base + i]);
+                xv[i] = static_cast<float>(xvec[i]);
             }
 
             const float inv = glue_inv_rms(
                 xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            // GLUE-VEC4: accumulate the run in a vector, store it once.
+            vec<T, 4> ovec;
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T scaled = static_cast<T>(xv[i] * inv);
-                out[base + i] = w[j] * scaled;
+                ovec[i] = w[j] * scaled;
             }
+            *((device vec<T, 4>*)(out + base)) = ovec;
             """,
         header: kernelHeader,
         ensureRowContiguous: true
@@ -568,10 +583,12 @@ public enum Gemma4PrefillGlueV1 {
 
                 const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
+                // GLUE-VEC4: one vec<T,4> load in place of four scalar reads of the same run.
+                const vec<T, 4> xvec = *((const device vec<T, 4>*)(x + base));
                 float xv[GLUE_NREADS];
                 #pragma clang loop unroll(full)
                 for (int i = 0; i < GLUE_NREADS; i++) {
-                    xv[i] = static_cast<float>(x[base + i]);
+                    xv[i] = static_cast<float>(xvec[i]);
                 }
 
                 const float inv = glue_inv_rms(
@@ -618,7 +635,7 @@ public enum Gemma4PrefillGlueV1 {
     /// each integer changes; the normalized values and store order do not.
     private static let preNormScatterThreadgroupIndexKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_prefill_glue_prenorm_scatter_2816_idx_tgcache_v4",
+            name: "gemma4_prefill_glue_prenorm_scatter_2816_idx_tgcache_vec4_v5",
             inputNames: ["x", "w", "inverse"],
             outputNames: ["out"],
             source: """
@@ -643,10 +660,12 @@ public enum Gemma4PrefillGlueV1 {
 
                 const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
+                // GLUE-VEC4: one vec<T,4> load in place of four scalar reads of the same run.
+                const vec<T, 4> xvec = *((const device vec<T, 4>*)(x + base));
                 float xv[GLUE_NREADS];
                 #pragma clang loop unroll(full)
                 for (int i = 0; i < GLUE_NREADS; i++) {
-                    xv[i] = static_cast<float>(x[base + i]);
+                    xv[i] = static_cast<float>(xvec[i]);
                 }
 
                 const float inv = glue_inv_rms(
@@ -660,14 +679,20 @@ public enum Gemma4PrefillGlueV1 {
                     normed[i] = w[j] * scaled;
                 }
 
+                // SCATTER-VEC4: the run is GLUE_NREADS = 4 contiguous elements, i.e. exactly
+                // vec<T, 4>. obase is a multiple of four (GLUE_AXIS 2816 and lid * 4 both are), so the
+                // cast sits at the same eight-byte alignment the tail chain's vec<T, 4> casts require.
+                // Same values, same addresses, same order; only the store width changes.
+                vec<T, 4> normed_v;
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    normed_v[i] = normed[i];
+                }
                 #pragma clang loop unroll(full)
                 for (uint k = 0; k < 8; ++k) {
                     const size_t pos = size_t(cached_positions[k]);
                     const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
-                    #pragma clang loop unroll(full)
-                    for (int i = 0; i < GLUE_NREADS; i++) {
-                        out[obase + i] = normed[i];
-                    }
+                    *((device vec<T, 4>*)(out + obase)) = normed_v;
                 }
                 """,
             header: kernelHeader,
@@ -693,10 +718,12 @@ public enum Gemma4PrefillGlueV1 {
 
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
+            // GLUE-VEC4: one vec<T,4> load in place of four scalar reads of the same run.
+            const vec<T, 4> xvec = *((const device vec<T, 4>*)(x + base));
             float xv[GLUE_NREADS];
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                xv[i] = static_cast<float>(x[base + i]);
+                xv[i] = static_cast<float>(xvec[i]);
             }
 
             const float inv = glue_inv_rms(

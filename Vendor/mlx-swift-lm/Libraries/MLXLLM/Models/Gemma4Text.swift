@@ -927,14 +927,89 @@ private let gemma4QKVNormRopeEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// QKVNORM-RI. The four QKV RMSNorm kernels publish their per-simdgroup
+/// partials, barrier, have ONE simdgroup combine them, have ONE lane store the
+/// normalizer to threadgroup memory, and then barrier a second time so the
+/// other simdgroups of the row can read it back. The sliding-pack `pg2` kernel
+/// in this file already runs the other form: after the publish barrier every
+/// simdgroup of the row runs that same combine and keeps the result in a
+/// register, so the store and the second barrier are unnecessary. This applies
+/// that form to the remaining four.
+///
+/// It is bit-identical, not merely close. `simd_sum` returns one value to every
+/// lane and is a deterministic function of its 32 operands; every simdgroup
+/// evaluates it after the publish barrier over byte-identical partials, and the
+/// lanes at or above the row's simdgroup count take the literal `0.0f` the
+/// incumbent's first simdgroup took. The reduction tree, the operand order, the
+/// `metal::precise::rsqrt(sum / D + 1e-6)` and every downstream expression are
+/// untouched, which matters because `setFastMathEnabled(false)` means the
+/// compiler will not reassociate on our behalf either.
+///
+/// Nothing else reads or writes `partials` after the publish barrier, so the
+/// removed barrier orders no other access. The threadgroup `rounded` plane is
+/// still fenced by its own barrier before the RoPE reads it.
+private let gemma4QKVNormRiEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_QKVNORM_RI"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// `CustomKernel::eval_gpu` caches compiled pipelines by name, so the two
+/// emissions must never share one.
+private let gemma4QKVNormRiSuffix: String = gemma4QKVNormRiEnabled ? "_ri1" : ""
+
+private func gemma4QKVNormRi(_ source: String) -> String {
+    guard gemma4QKVNormRiEnabled else { return source }
+    var result = source
+    func replaceOnce(_ old: String, with new: String) {
+        precondition(result.components(separatedBy: old).count == 2)
+        result = result.replacingOccurrences(of: old, with: new)
+    }
+    if result.contains("partials[simd_group]") {
+        replaceOnce("    threadgroup float inverse_rms;\n", with: "")
+        replaceOnce("""
+                if (simd_group == 0) {
+                    sum = simd_sum(lane < (D / 128) ? partials[lane] : 0.0f);
+                    if (lane == 0) {
+                        inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            """, with: """
+                sum = simd_sum(lane < (D / 128) ? partials[lane] : 0.0f);
+                const float inverse_rms =
+                    metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+            """)
+        return result
+    }
+    replaceOnce("    threadgroup float inv_rms[RPT];\n", with: "")
+    replaceOnce("""
+            if (row_simd == 0) {
+                sum = simd_sum(lane < (D / 128) ? partials[slot][lane] : 0.0f);
+                if (lane == 0) {
+                    inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        """, with: """
+            sum = simd_sum(lane < (D / 128) ? partials[slot][lane] : 0.0f);
+            const float row_inv_rms =
+                metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+        """)
+    replaceOnce("inverse_rms = inv_rms[slot];", with: "inverse_rms = row_inv_rms;")
+    return result
+}
+
 private let gemma4QKVNormKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_qkv_rms_norm_rope_v2_vec1_nb1",
+        name: "gemma4_b8_qkv_rms_norm_rope_v2_vec1_nb1"
+        + gemma4QKVNormRiSuffix,
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base", "rope_freqs",
     ],
     outputNames: ["q_out", "k_out", "v_out"],
-    source: """
+    source: gemma4QKVNormRi("""
         typedef vec<T, 4> T4;
         constexpr uint reads = 4;
         const uint row = threadgroup_position_in_grid.x;
@@ -1057,7 +1132,7 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
                 output_row[pair + D / 2] = static_cast<T>(rx2);
             }
         }
-    """,
+    """),
     ensureRowContiguous: true
 )
 
@@ -1079,13 +1154,14 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
 /// threadgroup, and each row keeps its own 64 threads and its own two
 /// simdgroups, so the reduction tree is the stock one row for row.
 private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_v2_nb1",
+    name: "gemma4_qkv_rms_norm_head_major_v2_nb1"
+        + gemma4QKVNormRiSuffix,
     inputNames: [
         "q", "k", "q_weight", "k_weight",
         "position_offsets", "rope_freqs",
     ],
     outputNames: ["q_out", "k_out", "v_out"],
-    source: """
+    source: gemma4QKVNormRi("""
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
         const uint tid = thread_position_in_threadgroup.x;
@@ -1199,7 +1275,7 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
                 output_row[pair + D / 2] = static_cast<T>(rx2);
             }
         }
-    """,
+    """),
     ensureRowContiguous: true
 )
 
@@ -1275,13 +1351,14 @@ private func gemma4FusedQKVNormHeadMajor(
 /// staging boundary. Structure extends the head-major twin; rotation is a
 /// line-for-line transcription of rope.metal's base path.
 private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_sliding_v1_nb1",
+    name: "gemma4_qkv_rms_norm_head_major_sliding_v1_nb1"
+        + gemma4QKVNormRiSuffix,
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base",
     ],
     outputNames: ["q_out", "k_out", "v_out"],
-    source: """
+    source: gemma4QKVNormRi("""
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
         const uint tid = thread_position_in_threadgroup.x;
@@ -1394,7 +1471,7 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
                 output_row[pair + D / 2] = static_cast<T>(rx2);
             }
         }
-    """,
+    """),
     ensureRowContiguous: true
 )
 
@@ -1413,13 +1490,14 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
 /// allocation. The mirror is therefore the pack kernel's output byte for
 /// byte, computed without re-reading the 67 MB of K/V it packs.
 private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_sliding_pack_pg1_nb1",
+    name: "gemma4_qkv_rms_norm_head_major_sliding_pack_pg1_nb1"
+        + gemma4QKVNormRiSuffix,
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base",
     ],
     outputNames: ["q_out", "k_out", "v_out", "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7"],
-    source: """
+    source: gemma4QKVNormRi("""
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
         constexpr uint mirror_row_words = D / 8 + D / 64;
@@ -1597,7 +1675,7 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
                     uint32_t(as_type<ushort>(hs)) | (uint32_t(as_type<ushort>(hb)) << 16);
             }
         }
-    """,
+    """),
     ensureRowContiguous: true
 )
 

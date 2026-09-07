@@ -997,7 +997,7 @@ private let routeCsortPrefillScatterKernel: MLXFast.MLXFastKernel = MLXFast.meta
 /// disjoint position bits; the barrier makes the final words visible before
 /// any rank is read. Tail positions never set a bit or write an output.
 private let routeCsortPrefillBitsetScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "mlx_lm_route_csort128_scatter_bitset_v1",
+    name: "mlx_lm_route_csort128_scatter_bitset_ne_v2",
     inputNames: ["keys", "block_offset"],
     outputNames: ["row_order", "sorted_keys", "inverse_order"],
     source: """
@@ -1009,8 +1009,11 @@ private let routeCsortPrefillBitsetScatterKernel: MLXFast.MLXFastKernel = MLXFas
         const uint n = keys_shape[0];
         const uint idx = b * BLOCK + k;
         // Each bit names one input position; equal keys occupy distinct bits.
-        threadgroup atomic_uint bitsets[WIDTH * WORDS];
-        for (uint i = k; i < WIDTH * WORDS; i += BLOCK) {
+        // Admission proves keys < NE. Compact only scratch; block offsets
+        // retain the histogram's WIDTH stride.
+        constexpr uint SCRATCH_WIDTH = (uint)NE;
+        threadgroup atomic_uint bitsets[SCRATCH_WIDTH * WORDS];
+        for (uint i = k; i < SCRATCH_WIDTH * WORDS; i += BLOCK) {
             atomic_store_explicit(&bitsets[i], 0u, memory_order_relaxed);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1018,7 +1021,7 @@ private let routeCsortPrefillBitsetScatterKernel: MLXFast.MLXFastKernel = MLXFas
         const uint word = k / 32u;
         const uint bit = k & 31u;
         if (idx < n) {
-            atomic_fetch_or_explicit(&bitsets[word * WIDTH + key], 1u << bit, memory_order_relaxed);
+            atomic_fetch_or_explicit(&bitsets[word * SCRATCH_WIDTH + key], 1u << bit, memory_order_relaxed);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (idx < n) {
@@ -1026,9 +1029,9 @@ private let routeCsortPrefillBitsetScatterKernel: MLXFast.MLXFastKernel = MLXFas
             // The current-word mask is valid even when bit is zero or 31.
             uint rank = 0u;
             for (uint w = 0; w < word; ++w) {
-                rank += popcount(atomic_load_explicit(&bitsets[w * WIDTH + key], memory_order_relaxed));
+                rank += popcount(atomic_load_explicit(&bitsets[w * SCRATCH_WIDTH + key], memory_order_relaxed));
             }
-            rank += popcount(atomic_load_explicit(&bitsets[word * WIDTH + key], memory_order_relaxed)
+            rank += popcount(atomic_load_explicit(&bitsets[word * SCRATCH_WIDTH + key], memory_order_relaxed)
                 & ((1u << bit) - 1u));
             const uint pos = block_offset[b * WIDTH + key] + rank;
             row_order[pos] = idx / uint(M);
@@ -1112,7 +1115,7 @@ private func routeCountingSortPrefill(
     if useBitset { CBv2EngageMark.once("route-csort-prefill-bitset") }
     let outputs = scatter(
         [indices, offsets],
-        template: [("M", m)],
+        template: [("M", m), ("NE", numExperts)],
         grid: (blocks * width, 1, 1),
         threadGroup: (width, 1, 1),
         outputShapes: [[n], [n], [n]],

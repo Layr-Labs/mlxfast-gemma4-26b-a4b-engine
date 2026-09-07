@@ -33,7 +33,10 @@ public enum Gemma4DecodeFusedGUV1 {
 
     /// Raw launch for callers that already passed the fused-GU contract.
     static func call(_ inputs: [MLXArray], taggedRoute: Bool = false) -> MLXArray {
-        (taggedRoute ? kernelTagged : kernelGeneral)(inputs,
+        if taggedRoute, runCap == 2, Gemma4GroupedAffineMXUV1.enabled {
+            return Gemma4GroupedAffineMXUV1.call(inputs)
+        }
+        return (taggedRoute ? kernelTagged : kernelGeneral)(inputs,
             grid: (32, 176 * 2, 64), threadGroup: (32, 2, 1),
             outputShapes: [outputShape], outputDTypes: [outputDType])[0]
     }

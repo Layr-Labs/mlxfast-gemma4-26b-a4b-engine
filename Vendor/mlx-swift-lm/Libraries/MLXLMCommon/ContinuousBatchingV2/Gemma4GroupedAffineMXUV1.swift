@@ -1,0 +1,1941 @@
+// Copyright © 2025 Apple Inc. Canonical NAX fragment helpers are embedded below.
+// Group-affine decode experiment: retain packed four-bit weights and BF16-quad
+// input sums. Matrix hardware computes integer-code dot products per group64;
+// affine scales and biases are applied afterward in float32. This regroups
+// float32 sums and therefore requires the model token-tolerance gate.
+import Foundation
+import MLX
+import MLXFast
+
+enum Gemma4GroupedAffineMXUV1 {
+    private enum Mode { case disabled, scalar, mxu }
+    private static let mode: Mode = {
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GROUP_AFFINE_MXU"]
+        if raw == "0" { return .disabled }
+        // Numerical reference only, for local model checks on pre-M5 hardware.
+        if raw == "scalar" { return .scalar }
+        #if os(macOS)
+        guard #available(macOS 26.2, *) else { return .disabled }
+        let suffix = GPU.deviceInfo().architecture.suffix(3)
+        guard suffix.count == 3, let generation = Int(suffix.prefix(2)),
+              generation >= (suffix.last == "p" ? 18 : 17)
+        else { return .disabled }
+        return .mxu
+        #else
+        return .disabled
+        #endif
+    }()
+    static var enabled: Bool { mode != .disabled }
+
+    static func call(_ inputs: [MLXArray]) -> MLXArray {
+        CBv2EngageMark.once(mode == .mxu ? "group-affine-mxu-gu" : "group-affine-scalar-gu")
+        return kernel(inputs, grid: (44 * 32, 64, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[64, 1, 704]], outputDTypes: [.bfloat16])[0]
+    }
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: mode == .mxu ? "gemma4_group_affine_mxu_gu_v1" : "gemma4_group_affine_scalar_gu_v1",
+        inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"], outputNames: ["y"],
+        source: body,
+        header: (mode == .mxu ? "#define USE_NAX 1\n" + naxHeader : "#define USE_NAX 0\n" + scalarHeader),
+        ensureRowContiguous: true)
+
+    private static let body = #"""
+uint lane=thread_index_in_simdgroup;
+uint3 tid=threadgroup_position_in_grid;
+
+ constexpr uint K=2816, N=1408, GROUPS=44;
+ const uint assignment=tid.y, tile=tid.x;
+ if(assignment>=64 || tile>=44) return;
+ const uint word=rhs[assignment];
+ if(((word>>8)&63u)&1u) return;
+ const uint count=min(2u,((word>>14)&63u)+1u),expert=word&255u;
+ const short2 coord=BaseNAXFrag::get_coord();
+ const uint output_row=uint(coord.y);
+ float gate[4]={0.0f},up[4]={0.0f};
+ const uint packed_row=tile*32;
+ for(uint group=0;group<GROUPS;++group) {
+  const uint bias_row=lane/16, quad=lane%16;
+  float bias_sum=0.0f;
+  if(bias_row<count) {
+   const device bfloat16_t* q=x+lhs[assignment+bias_row]*K+group*64+quad*4;
+   const bfloat16_t a=bfloat16_t(q[0]+q[1]);
+   const bfloat16_t b=bfloat16_t(a+q[2]);
+   bias_sum=float(bfloat16_t(b+q[3]));
+  }
+  for(ushort s=1;s<16;s<<=1) bias_sum += simd_shuffle_xor(bias_sum,s);
+  const float bsum0=simd_shuffle(bias_sum,ushort(0));
+  const float bsum1=simd_shuffle(bias_sum,ushort(16));
+#if USE_NAX
+  NAXTile<float,1,2> products;
+  products.clear();
+  for(uint part=0;part<4;++part) {
+   NAXTile<bfloat16_t,1,1> a;
+   NAXTile<bfloat16_t,2,1> b;
+   for(short r=0;r<2;++r) {
+    const uint row=uint(coord.y+r*8);
+    for(short c=0;c<4;++c) {
+     const uint col=group*64+part*16+uint(coord.x+c);
+     a.frag_at(0,0)[r*4+c]=row<count ? x[lhs[assignment+row]*K+col] : bfloat16_t(0.0f);
+    }
+   }
+   for(short nn=0;nn<2;++nn) {
+    for(short r=0;r<2;++r) {
+     const uint row=packed_row+uint(nn*16+coord.y+r*8);
+     for(short c=0;c<4;++c) {
+      const uint col=group*64+part*16+uint(coord.x+c);
+      const uint packed=w[(size_t(expert)*N+row)*(K/8)+col/8];
+      b.frag_at(nn,0)[r*4+c]=bfloat16_t(float((packed >> ((col%8)*4))&15u));
+     }
+    }
+   }
+   tile_matmad_nax(products,a,metal::bool_constant<false>{},b,metal::bool_constant<true>{});
+  }
+#endif
+  if(output_row<count) {
+   const float bsum=output_row==0 ? bsum0:bsum1;
+   for(uint c=0;c<4;++c) {
+    const uint gate_row=packed_row+uint(coord.x)+c,up_row=gate_row+16;
+#if USE_NAX
+    const float gdot=products.frag_at(0,0)[c];
+    const float udot=products.frag_at(0,1)[c];
+#else
+    float gdot=0.0f,udot=0.0f;
+    for(uint j=0;j<64;++j) {
+     const uint k=group*64+j;
+     const float a=float(x[lhs[assignment+output_row]*K+k]);
+     const uint gw=w[(size_t(expert)*N+gate_row)*(K/8)+k/8];
+     const uint uw=w[(size_t(expert)*N+up_row)*(K/8)+k/8];
+     gdot += a*float((gw>>((k%8)*4))&15u);
+     udot += a*float((uw>>((k%8)*4))&15u);
+    }
+#endif
+    const size_t gi=(size_t(expert)*N+gate_row)*GROUPS+group;
+    const size_t ui=(size_t(expert)*N+up_row)*GROUPS+group;
+    gate[c] += float(scales[gi])*gdot + float(biases[gi])*bsum;
+    up[c] += float(scales[ui])*udot + float(biases[ui])*bsum;
+   }
+  }
+ }
+ // Re-evaluate values close to a BF16 midpoint with the incumbent
+ // eight-value lane chain and its SIMD reduction. The margin is an
+ // empirical fidelity guard, not a proven universal FP error bound.
+ uint pending=0u;
+ if(output_row<count) {
+  for(uint c=0;c<4;++c) {
+   if(abs(int(as_type<uint>(gate[c])&65535u)-32768)<=2048 || fabs(gate[c]) < 0x1p-6f || !isfinite(gate[c])) pending |= 1u<<c;
+   if(abs(int(as_type<uint>(up[c])&65535u)-32768)<=2048 || fabs(up[c]) < 0x1p-6f || !isfinite(up[c])) pending |= 1u<<(c+4);
+  }
+ }
+ while(simd_any(pending!=0u)) {
+  uint owner[4], component[4], column[4], source_row[4];
+  uint picked=0;
+  for(uint j=0;j<4;++j) {
+   const uint who=simd_min(pending!=0u ? lane:32u);
+   if(who==32u) break;
+   const uint selected=ctz(simd_shuffle(pending,ushort(who)));
+   owner[j]=who;component[j]=selected;
+   column[j]=packed_row+simd_shuffle(uint(coord.x),ushort(who))+(selected%4)+(selected>=4 ? 16:0);
+   const uint selected_row=simd_shuffle(output_row,ushort(who));
+   source_row[j]=lhs[assignment+selected_row];
+   if(lane==who) pending &= ~(1u<<selected);
+   picked++;
+  }
+  float exact[4]={0.0f};
+  for(uint k=0;k<K;k+=256) {
+   for(uint j=0;j<picked;++j) {
+    const device bfloat16_t* xp=x+source_row[j]*K+k+lane*8;
+    float xt[8];
+    float sum=0.0f;
+    for(uint q=0;q<8;q+=4) {
+     sum += xp[q]+xp[q+1]+xp[q+2]+xp[q+3];
+     xt[q]=float(xp[q]);xt[q+1]=xp[q+1]/16.0f;
+     xt[q+2]=xp[q+2]/256.0f;xt[q+3]=xp[q+3]/4096.0f;
+    }
+    const size_t base=size_t(expert)*N+column[j];
+    const uint packed=w[base*(K/8)+k/8+lane];
+    const uint low=packed&65535u, high=packed>>16;
+    float accum=(xt[0]*(low&15u)+xt[1]*(low&240u)+xt[2]*(low&3840u)+xt[3]*(low&61440u));
+    accum += (xt[4]*(high&15u)+xt[5]*(high&240u)+xt[6]*(high&3840u)+xt[7]*(high&61440u));
+    const size_t si=base*GROUPS+k/64+lane/8;
+    exact[j] += float(scales[si])*accum+sum*float(biases[si]);
+   }
+  }
+  for(uint j=0;j<picked;++j) {
+   const float value=simd_sum(exact[j]);
+   if(lane==owner[j]) {
+    if(component[j]<4) gate[component[j]]=value;
+    else up[component[j]-4]=value;
+   }
+  }
+ }
+ if(output_row<count) {
+  for(uint c=0;c<4;++c) {
+   y[(assignment+output_row)*704+tile*16+uint(coord.x)+c]=
+    gemma4_dense_geglu_compiled_tape(bfloat16_t(gate[c]),bfloat16_t(up[c]));
+  }
+ }
+
+"""#
+
+    private static let scalarHeader = #"""
+#include <metal_stdlib>
+using namespace metal;
+namespace mlx::steel {
+struct BaseNAXFrag {
+ static short2 get_coord() {
+    const ushort simd_lane_id = __metal_get_thread_index_in_simdgroup(ushort());
+    const short qid = simd_lane_id >> 2;
+    const short fm = ((qid & 4) | ((simd_lane_id >> 1) & 3));
+    const short fn = ((qid & 2) | (simd_lane_id & 1)) * 4;
+    return short2{fn, fm};
+ }
+};
+}
+template <typename T>
+inline T gemma4_dense_geglu_compiled_tape(T gate, T up) {
+  const T cubic_0 = static_cast<T>(static_cast<T>(0.044715f) * gate);
+  const T cubic_1 = static_cast<T>(cubic_0 * gate);
+  const T cubic_2 = static_cast<T>(cubic_1 * gate);
+  const T inner = static_cast<T>(gate + cubic_2);
+  const T scaled =
+      static_cast<T>(static_cast<T>(0.7978845608028654f) * inner);
+  const T curved = metal::precise::tanh(scaled);
+  const T shifted = static_cast<T>(static_cast<T>(1.0f) + curved);
+  const T half_gate = static_cast<T>(static_cast<T>(0.5f) * gate);
+  const T gelu = static_cast<T>(half_gate * shifted);
+  return static_cast<T>(gelu * up);
+}
+using namespace mlx::steel;
+
+"""#
+
+    private static let naxHeader = #"""
+
+// Copyright © 2025 Apple Inc.
+
+// Auto generated source for mlx/backend/metal/kernels/steel/gemm/gemm_nax.h
+
+///////////////////////////////////////////////////////////////////////////////
+// Contents from "mlx/backend/metal/kernels/steel/defines.h"
+///////////////////////////////////////////////////////////////////////////////
+
+#line 1 "mlx/backend/metal/kernels/steel/defines.h"
+// Copyright © 2024 Apple Inc.
+
+
+#define STEEL_CONST static constant constexpr const
+#define STEEL_PRAGMA_UNROLL _Pragma("clang loop unroll(full)")
+#define STEEL_PRAGMA_NO_UNROLL _Pragma("clang loop unroll(disable)")
+
+///////////////////////////////////////////////////////////////////////////////
+// Contents from "/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v17.5.188.0.9CLJ6d/Metal.xctoolchain/usr/metal/32023/lib/clang/32023.883/include/metal/__exec/units.h"
+///////////////////////////////////////////////////////////////////////////////
+
+#line 1 "/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v17.5.188.0.9CLJ6d/Metal.xctoolchain/usr/metal/32023/lib/clang/32023.883/include/metal/__exec/units.h"
+
+///////////////////////////////////////////////////////////////////////////////
+// Contents from "mlx/backend/metal/kernels/steel/utils/type_traits.h"
+///////////////////////////////////////////////////////////////////////////////
+
+#line 1 "mlx/backend/metal/kernels/steel/utils/type_traits.h"
+// Copyright © 2024 Apple Inc.
+
+
+#include <metal_stdlib>
+
+#pragma METAL internals : enable
+
+namespace metal {
+
+template <typename T>
+struct is_empty : metal::bool_constant<__is_empty(T)> {};
+
+#ifdef __cpp_variable_templates
+template <typename T>
+constexpr constant bool is_empty_v = is_empty<T>::value;
+#endif
+
+template <typename... Ts>
+struct make_void {
+  typedef void type;
+};
+
+template <typename... Ts>
+using void_t = typename make_void<Ts...>::type;
+
+template <class T>
+struct is_static : metal::bool_constant<is_empty<remove_cv_t<T>>::value> {};
+
+template <typename T>
+struct pointer_element {};
+
+template <typename T>
+struct pointer_element<thread T*> {
+  using type = remove_cv_t<T>;
+};
+template <typename T>
+struct pointer_element<device T*> {
+  using type = remove_cv_t<T>;
+};
+template <typename T>
+struct pointer_element<constant T*> {
+  using type = remove_cv_t<T>;
+};
+template <typename T>
+struct pointer_element<threadgroup T*> {
+  using type = remove_cv_t<T>;
+};
+
+template <typename T>
+using pointer_element_t = typename pointer_element<remove_cv_t<T>>::type;
+
+} // namespace metal
+
+#pragma METAL internals : disable
+
+///////////////////////////////////////////////////////////////////////////////
+// Contents from "mlx/backend/metal/kernels/steel/utils/integral_constant.h"
+///////////////////////////////////////////////////////////////////////////////
+
+#line 1 "mlx/backend/metal/kernels/steel/utils/integral_constant.h"
+// Copyright © 2024 Apple Inc.
+
+
+#include <metal_stdlib>
+
+#pragma METAL internals : enable
+
+namespace mlx {
+namespace steel {
+
+///////////////////////////////////////////////////////////////////////////////
+// Integral constant with casting
+///////////////////////////////////////////////////////////////////////////////
+
+template <typename T, T v>
+struct integral_constant {
+  static constexpr constant T value = v;
+  using value_type = T;
+  using type = integral_constant;
+
+  METAL_FUNC constexpr operator value_type() const noexcept {
+    return value;
+  }
+};
+
+template <bool B>
+using bool_constant = integral_constant<bool, B>;
+using true_type = bool_constant<true>;
+using false_type = bool_constant<false>;
+
+template <class T>
+struct is_integral : bool_constant<metal::is_integral<T>::value> {};
+
+template <class T, T v>
+struct is_integral<integral_constant<T, v>>
+    : bool_constant<metal::is_integral<T>::value> {};
+
+template <typename T>
+constexpr constant bool is_integral_v = is_integral<T>::value;
+
+template <int val>
+using Int = integral_constant<int, val>;
+
+///////////////////////////////////////////////////////////////////////////////
+// Binary Operators on Integral constants
+///////////////////////////////////////////////////////////////////////////////
+
+#define integral_const_binop(__op__, __operator__)          \
+  template <typename T, T tv, typename U, U uv>             \
+  METAL_FUNC constexpr auto __operator__(                   \
+      integral_constant<T, tv>, integral_constant<U, uv>) { \
+    constexpr auto res = tv __op__ uv;                      \
+    return integral_constant<decltype(res), res>{};         \
+  }
+
+integral_const_binop(+, operator+);
+integral_const_binop(-, operator-);
+integral_const_binop(*, operator*);
+integral_const_binop(/, operator/);
+
+integral_const_binop(==, operator==);
+integral_const_binop(!=, operator!=);
+integral_const_binop(<, operator<);
+integral_const_binop(>, operator>);
+integral_const_binop(<=, operator<=);
+integral_const_binop(>=, operator>=);
+
+integral_const_binop(&&, operator&&);
+integral_const_binop(||, operator||);
+
+template <typename T, typename = metal::enable_if_t<!is_integral_v<T>>>
+METAL_FUNC constexpr auto operator||(true_type, T) {
+  return true_type{};
+}
+template <typename T, typename = metal::enable_if_t<!is_integral_v<T>>>
+METAL_FUNC constexpr auto operator||(T, true_type) {
+  return true_type{};
+}
+
+template <typename T, typename = metal::enable_if_t<!is_integral_v<T>>>
+METAL_FUNC constexpr auto operator&&(false_type, T) {
+  return false_type{};
+}
+
+template <typename T, typename = metal::enable_if_t<!is_integral_v<T>>>
+METAL_FUNC constexpr auto operator&&(T, false_type) {
+  return false_type{};
+}
+
+// Dispatch utilities
+template <typename F>
+void dispatch_bool(bool v, F f) {
+  if (v) {
+    f(true_type{});
+  } else {
+    f(false_type{});
+  }
+}
+
+template <int start, int stop, int step, typename F>
+constexpr void const_for_loop(F f) {
+  if constexpr (start < stop) {
+    constexpr auto idx = Int<start>{};
+    f(idx);
+    const_for_loop<start + step, stop, step, F>(f);
+  }
+}
+
+#undef integral_const_binop
+
+///////////////////////////////////////////////////////////////////////////////
+// Reduction operators
+///////////////////////////////////////////////////////////////////////////////
+
+template <typename T>
+METAL_FUNC constexpr T sum(T x) {
+  return x;
+}
+
+template <typename T, typename... Us>
+METAL_FUNC constexpr auto sum(T x, Us... us) {
+  return x + sum(us...);
+}
+
+} // namespace steel
+} // namespace mlx
+
+#pragma METAL internals : disable
+
+///////////////////////////////////////////////////////////////////////////////
+// Contents from "mlx/backend/metal/kernels/steel/gemm/nax.h"
+///////////////////////////////////////////////////////////////////////////////
+
+#line 1 "mlx/backend/metal/kernels/steel/gemm/nax.h"
+// Copyright © 2025 Apple Inc.
+
+
+#include <metal_simdgroup>
+#include <metal_simdgroup_matrix>
+#include <metal_stdlib>
+
+
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+using namespace metal;
+
+///////////////////////////////////////////////////////////////////////////////
+// MMA helper
+///////////////////////////////////////////////////////////////////////////////
+
+namespace mlx {
+namespace steel {
+
+///////////////////////////////////////////////////////////////////////////////
+// NAX Steel with new tiles
+///////////////////////////////////////////////////////////////////////////////
+
+struct BaseNAXFrag {
+  STEEL_CONST short kFragRows = 16;
+  STEEL_CONST short kFragCols = 16;
+
+  STEEL_CONST short kElemsPerFrag = (kFragRows * kFragCols) / 32;
+
+  STEEL_CONST short kElemRows = 2;
+  STEEL_CONST short kElemCols = 4;
+
+  STEEL_CONST short kElemRowsJump = 8;
+
+  static_assert(
+      kElemRows * kElemCols == kElemsPerFrag,
+      "MMAFrag shape is not consistent with MMAFrag size");
+
+  template <typename U>
+  using dtype_frag_t = typename metal::vec<U, kElemsPerFrag>;
+
+  METAL_FUNC static short2 get_coord() {
+    const ushort simd_lane_id = __metal_get_thread_index_in_simdgroup(ushort());
+    const short qid = simd_lane_id >> 2;
+    const short fm = ((qid & 4) | ((simd_lane_id >> 1) & 3));
+    const short fn = ((qid & 2) | (simd_lane_id & 1)) * 4;
+    return short2{fn, fm};
+  }
+
+  METAL_FUNC static short2 get_coord(short idx) {
+    const ushort simd_lane_id = __metal_get_thread_index_in_simdgroup(ushort());
+    const short qid = simd_lane_id >> 2;
+    const short fm = ((qid & 4) | ((simd_lane_id >> 1) & 3)) + (idx >> 2) * 8;
+    const short fn = ((qid & 2) | (simd_lane_id & 1)) * 4 + idx % 4;
+    return short2{fn, fm};
+  }
+
+  template <
+      typename T,
+      typename SrcPtrType,
+      typename StrX,
+      typename StrY,
+      typename OffX = Int<0>,
+      typename OffY = Int<0>>
+  METAL_FUNC static constexpr void load(
+      thread dtype_frag_t<T>& dst,
+      SrcPtrType src,
+      StrX str_x,
+      StrY str_y,
+      OffX off_x = {},
+      OffY off_y = {}) {
+    const short2 sc = get_coord();
+    src += sc.y * str_x + sc.x * str_y;
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      const auto r = off_x + i * kElemRowsJump;
+      const auto c = off_y;
+
+      if constexpr (metal::is_same_v<StrY, Int<1>>) {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < kElemCols; j++) {
+          dst[i * kElemCols + j] = static_cast<T>(src[r * str_x + c + j]);
+        }
+      } else {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < kElemCols; j++) {
+          dst[i * kElemCols + j] =
+              static_cast<T>(src[r * str_x + (c + j) * str_y]);
+        }
+      }
+    }
+  }
+
+  template <
+      typename T,
+      typename SrcPtrType,
+      typename StrX,
+      typename StrY,
+      typename LimX,
+      typename OffX = Int<0>,
+      typename OffY = Int<0>>
+  METAL_FUNC static constexpr void load_rows(
+      thread dtype_frag_t<T>& dst,
+      SrcPtrType src,
+      StrX str_x,
+      StrY str_y,
+      LimX lim_x,
+      OffX off_x = {},
+      OffY off_y = {}) {
+    const short2 sc = get_coord();
+    src += sc.y * str_x + sc.x * str_y;
+    auto lx = lim_x - sc.y;
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      const auto r = off_x + i * kElemRowsJump;
+      const auto c = off_y;
+
+      if (r < lx) {
+        if constexpr (metal::is_same_v<StrY, Int<1>>) {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < kElemCols; j++) {
+            dst[i * kElemCols + j] = static_cast<T>(src[r * str_x + (c + j)]);
+          }
+        } else {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < kElemCols; j++) {
+            dst[i * kElemCols + j] =
+                static_cast<T>(src[r * str_x + (c + j) * str_y]);
+          }
+        }
+
+      } else {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < kElemCols; j++) {
+          dst[i * kElemCols + j] = T(0);
+        }
+      }
+    }
+  }
+
+  template <
+      typename T,
+      typename SrcPtrType,
+      typename StrX,
+      typename StrY,
+      typename LimX,
+      typename LimY,
+      typename OffX = Int<0>,
+      typename OffY = Int<0>>
+  METAL_FUNC static constexpr void load_safe(
+      thread dtype_frag_t<T>& dst,
+      SrcPtrType src,
+      StrX str_x,
+      StrY str_y,
+      LimX lim_x,
+      LimY lim_y,
+      OffX off_x = {},
+      OffY off_y = {}) {
+    const short2 sc = get_coord();
+    src += sc.y * str_x + sc.x * str_y;
+    auto lx = lim_x - sc.y;
+    auto ly = lim_y - sc.x;
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      const auto r = off_x + i * kElemRowsJump;
+      const auto c = off_y;
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < kElemCols; j++) {
+        if ((r < lx) && ((c + j) < ly)) {
+          dst[i * kElemCols + j] =
+              static_cast<T>(src[r * str_x + (c + j) * str_y]);
+        } else {
+          dst[i * kElemCols + j] = T(0);
+        }
+      }
+    }
+  }
+
+  template <
+      typename T,
+      typename DstPtrType,
+      typename StrX,
+      typename StrY,
+      typename OffX = Int<0>,
+      typename OffY = Int<0>>
+  METAL_FUNC static constexpr void store(
+      const thread dtype_frag_t<T>& src,
+      DstPtrType dst,
+      StrX str_x,
+      StrY str_y,
+      OffX off_x = {},
+      OffY off_y = {}) {
+    using U = pointer_element_t<DstPtrType>;
+
+    const short2 sc = get_coord();
+    dst += sc.y * str_x + sc.x * str_y;
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      const auto r = off_x + i * kElemRowsJump;
+      const auto c = off_y;
+
+      if constexpr (metal::is_same_v<StrY, Int<1>>) {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < kElemCols; j++) {
+          dst[r * str_x + c + j] = static_cast<U>(src[i * kElemCols + j]);
+        }
+      } else {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < kElemCols; j++) {
+          dst[r * str_x + (c + j) * str_y] =
+              static_cast<U>(src[i * kElemCols + j]);
+        }
+      }
+    }
+  }
+
+  template <
+      typename T,
+      typename DstPtrType,
+      typename StrX,
+      typename StrY,
+      typename LimX,
+      typename OffX = Int<0>,
+      typename OffY = Int<0>>
+  METAL_FUNC static constexpr void store_rows(
+      const thread dtype_frag_t<T>& src,
+      DstPtrType dst,
+      StrX str_x,
+      StrY str_y,
+      LimX lim_x,
+      OffX off_x = {},
+      OffY off_y = {}) {
+    using U = pointer_element_t<DstPtrType>;
+
+    const short2 sc = get_coord();
+    dst += sc.y * str_x + sc.x * str_y;
+    auto lx = lim_x - sc.y;
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      const auto r = off_x + i * kElemRowsJump;
+      const auto c = off_y;
+
+      if (r < lx) {
+        if constexpr (metal::is_same_v<StrY, Int<1>>) {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < kElemCols; j++) {
+            dst[r * str_x + c + j] = static_cast<U>(src[i * kElemCols + j]);
+          }
+        } else {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < kElemCols; j++) {
+            dst[r * str_x + (c + j) * str_y] =
+                static_cast<U>(src[i * kElemCols + j]);
+          }
+        }
+      }
+    }
+  }
+
+  template <
+      typename T,
+      typename DstPtrType,
+      typename StrX,
+      typename StrY,
+      typename LimX,
+      typename LimY,
+      typename OffX = Int<0>,
+      typename OffY = Int<0>>
+  METAL_FUNC static constexpr void store_safe(
+      const thread dtype_frag_t<T>& src,
+      DstPtrType dst,
+      StrX str_x,
+      StrY str_y,
+      LimX lim_x,
+      LimY lim_y,
+      OffX off_x = {},
+      OffY off_y = {}) {
+    using U = pointer_element_t<DstPtrType>;
+
+    const short2 sc = get_coord();
+    dst += sc.y * str_x + sc.x * str_y;
+    auto lx = lim_x - sc.y;
+    auto ly = lim_y - sc.x;
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      const auto r = off_x + i * kElemRowsJump;
+      const auto c = off_y;
+
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < kElemCols; j++) {
+        if (r < lx && (c + j) < ly) {
+          dst[r * str_x + (c + j) * str_y] =
+              static_cast<U>(src[i * kElemCols + j]);
+        }
+      }
+    }
+  }
+
+  template <
+      typename T,
+      typename DstPtrType,
+      typename StrX,
+      typename StrY,
+      typename StartX,
+      typename StopX,
+      typename StartY,
+      typename StopY,
+      typename OffX = Int<0>,
+      typename OffY = Int<0>>
+  METAL_FUNC static constexpr void store_slice(
+      const thread dtype_frag_t<T>& src,
+      DstPtrType dst,
+      StrX str_x,
+      StrY str_y,
+      StartX start_x,
+      StopX stop_x,
+      StartY start_y,
+      StopY stop_y,
+      OffX off_x = Int<0>{},
+      OffY off_y = Int<0>{}) {
+    using U = pointer_element_t<DstPtrType>;
+
+    const short2 sc = get_coord();
+
+    const_for_loop<0, kElemRows, 1>([&](auto idx_row) {
+      const auto r = off_x + idx_row * Int<kElemRowsJump>{};
+      if (r >= stop_x - sc.y || r < start_x - sc.y) {
+        return;
+      }
+
+      const_for_loop<0, kElemCols, 1>([&](auto idx_col) {
+        const auto c = off_y + idx_col;
+        if (c >= stop_y - sc.x || c < start_y - sc.x) {
+          return;
+        }
+
+        const auto src_idx = idx_row * Int<kElemCols>{} + idx_col;
+        dst[(r + sc.y) * str_x + (c + sc.x) * str_y] =
+            static_cast<U>(src[src_idx]);
+      });
+    });
+  }
+
+  template <typename Op, typename T>
+  METAL_FUNC static constexpr void row_reduce(
+      thread const dtype_frag_t<T>& inp_vals,
+      thread T* reduced_vals) {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      T thr_reduce = Op::apply(
+          Op::apply(inp_vals[i * kElemCols + 0], inp_vals[i * kElemCols + 1]),
+          Op::apply(inp_vals[i * kElemCols + 2], inp_vals[i * kElemCols + 3]));
+
+      T qgr_reduce = simd_shuffle_xor(thr_reduce, ushort(1));
+      qgr_reduce = Op::apply(thr_reduce, qgr_reduce);
+
+      T sgr_reduce = simd_shuffle_xor(qgr_reduce, ushort(8));
+      sgr_reduce = Op::apply(qgr_reduce, sgr_reduce);
+
+      reduced_vals[i] = Op::apply(reduced_vals[i], sgr_reduce);
+    }
+  }
+
+  template <typename Op, typename T>
+  METAL_FUNC static constexpr void row_bin_op(
+      thread dtype_frag_t<T>& inp_vals,
+      thread T* row_vals) {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < kElemCols; j++) {
+        inp_vals[i * kElemCols + j] =
+            Op::apply(inp_vals[i * kElemCols + j], row_vals[i]);
+      }
+    }
+  }
+
+  template <
+      typename CType,
+      typename AType,
+      typename BType,
+      bool transpose_a = false,
+      bool transpose_b = false>
+  METAL_FUNC static constexpr void mma(
+      thread dtype_frag_t<CType>& Cn0,
+      thread dtype_frag_t<CType>& Cn1,
+      const thread dtype_frag_t<AType>& A,
+      metal::bool_constant<transpose_a>,
+      const thread dtype_frag_t<BType>& Bn0,
+      const thread dtype_frag_t<BType>& Bn1,
+      metal::bool_constant<transpose_b>) {
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        16,
+        32,
+        16,
+        transpose_a,
+        transpose_b,
+        true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+
+    // Create matmul op
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
+
+    // Create matmul operands in registers
+    auto ct_a =
+        gemm_op
+            .template get_left_input_cooperative_tensor<AType, BType, CType>();
+    auto ct_b =
+        gemm_op
+            .template get_right_input_cooperative_tensor<AType, BType, CType>();
+
+    // Create matmul output in register
+    auto ct_c = gemm_op.template get_destination_cooperative_tensor<
+        decltype(ct_a),
+        decltype(ct_b),
+        CType>();
+
+    // Load A in to left operand registers
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      ct_a[i] = A[i];
+    }
+
+    // Load B into right operand registers
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      ct_b[i] = Bn0[i];
+      ct_b[kElemsPerFrag + i] = Bn1[i];
+    }
+
+    // Load C into output registers (op handles accumulation)
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      ct_c[i] = Cn0[i];
+      ct_c[kElemsPerFrag + i] = Cn1[i];
+    }
+
+    // Do matmul
+    gemm_op.run(ct_a, ct_b, ct_c);
+
+    // Copy out results
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      Cn0[i] = ct_c[i];
+      Cn1[i] = ct_c[kElemsPerFrag + i];
+    }
+  }
+
+  template <
+      typename CType,
+      typename AType,
+      typename BType,
+      bool transpose_a = false,
+      bool transpose_b = false>
+  METAL_FUNC static constexpr void mma(
+      thread dtype_frag_t<CType>& Cm0,
+      thread dtype_frag_t<CType>& Cm1,
+      const thread dtype_frag_t<AType>& Am0,
+      const thread dtype_frag_t<AType>& Am1,
+      metal::bool_constant<transpose_a>,
+      const thread dtype_frag_t<BType>& B,
+      metal::bool_constant<transpose_b>) {
+    // Create Matmul descriptor
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        16,
+        32,
+        16,
+        transpose_a,
+        transpose_b,
+        true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+
+    // Create matmul op
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
+
+    // Create matmul operands in registers
+    auto ct_a =
+        gemm_op
+            .template get_left_input_cooperative_tensor<AType, BType, CType>();
+    auto ct_b =
+        gemm_op
+            .template get_right_input_cooperative_tensor<AType, BType, CType>();
+
+    // Create matmul output in register
+    auto ct_c = gemm_op.template get_destination_cooperative_tensor<
+        decltype(ct_a),
+        decltype(ct_b),
+        CType>();
+
+    // Load A in to left operand registers
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      ct_a[i] = Am0[i];
+      ct_a[kElemsPerFrag + i] = Am1[i];
+    }
+
+    // Load B into right operand registers
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      ct_b[i] = B[i];
+    }
+
+    // Load C into output registers (op handles accumulation)
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      ct_c[i] = Cm0[i];
+      ct_c[kElemsPerFrag + i] = Cm1[i];
+    }
+
+    // Do matmul
+    gemm_op.run(ct_a, ct_b, ct_c);
+
+    // Copy out results
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      Cm0[i] = ct_c[i];
+      Cm1[i] = ct_c[kElemsPerFrag + i];
+    }
+  }
+};
+
+template <
+    typename T,
+    short kTileRows_,
+    short kTileCols_,
+    class NAXFrag_ = BaseNAXFrag>
+struct NAXTile {
+  using NAXFrag_t = NAXFrag_;
+  using elem_type = T;
+
+  STEEL_CONST short kFragRows = NAXFrag_t::kFragRows;
+  STEEL_CONST short kFragCols = NAXFrag_t::kFragCols;
+  STEEL_CONST short kElemsPerFrag = NAXFrag_t::kElemsPerFrag;
+
+  STEEL_CONST short kTileRows = kTileRows_;
+  STEEL_CONST short kTileCols = kTileCols_;
+
+  STEEL_CONST short kRows = kTileRows * kFragRows;
+  STEEL_CONST short kCols = kTileCols * kFragCols;
+
+  STEEL_CONST short kNumFrags = kTileRows * kTileCols;
+  STEEL_CONST short kElemsPerTile = kNumFrags * kElemsPerFrag;
+
+  STEEL_CONST short kFragThrRows = NAXFrag_t::kElemRows;
+  STEEL_CONST short kFragThrCols = NAXFrag_t::kElemCols;
+  STEEL_CONST short kFragRowsJump = NAXFrag_t::kElemRowsJump;
+
+  STEEL_CONST short kRowsPerThread = kTileRows * NAXFrag_t::kElemRows;
+  STEEL_CONST short kColsPerThread = kTileCols * NAXFrag_t::kElemCols;
+
+  typedef typename NAXFrag_t::template dtype_frag_t<T> frag_type;
+
+  frag_type val_frags[kNumFrags]; // = {frag_type(0)};
+
+  METAL_FUNC NAXTile() thread {}
+
+  METAL_FUNC constexpr void clear() {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kNumFrags; ++i) {
+      val_frags[i] = frag_type(0);
+    }
+  }
+
+  METAL_FUNC constexpr thread frag_type& frag_at(const short i, const short j) {
+    return val_frags[i * kTileCols + j];
+  }
+
+  METAL_FUNC constexpr const thread frag_type& frag_at(
+      const short i,
+      const short j) const {
+    return val_frags[i * kTileCols + j];
+  }
+
+  template <int i, int j>
+  METAL_FUNC constexpr thread frag_type& frag_at() {
+    return val_frags[i * kTileCols + j];
+  }
+
+  template <int i, int j>
+  METAL_FUNC constexpr const thread frag_type& frag_at() const {
+    return val_frags[i * kTileCols + j];
+  }
+
+  template <bool transpose>
+  METAL_FUNC constexpr thread frag_type&
+  frag_at(const short i, const short j, metal::bool_constant<transpose>) {
+    if constexpr (transpose) {
+      return frag_at(j, i);
+    } else {
+      return frag_at(i, j);
+    }
+  }
+
+  template <bool transpose>
+  METAL_FUNC constexpr const thread frag_type&
+  frag_at(const short i, const short j, metal::bool_constant<transpose>) const {
+    if constexpr (transpose) {
+      return frag_at(j, i);
+    } else {
+      return frag_at(i, j);
+    }
+  }
+
+  template <int i, int j, bool transpose>
+  METAL_FUNC constexpr thread frag_type& frag_at() {
+    if constexpr (transpose) {
+      return frag_at<j, i>();
+    } else {
+      return frag_at<i, j>();
+    }
+  }
+
+  template <int i, int j, bool transpose>
+  METAL_FUNC constexpr const thread frag_type& frag_at() const {
+    if constexpr (transpose) {
+      return frag_at<j, i>();
+    } else {
+      return frag_at<i, j>();
+    }
+  }
+
+  METAL_FUNC thread elem_type* elems() {
+    return reinterpret_cast<thread elem_type*>(val_frags);
+  }
+
+  METAL_FUNC const thread elem_type* elems() const {
+    return reinterpret_cast<const thread elem_type*>(val_frags);
+  }
+
+  template <typename Op>
+  METAL_FUNC void row_reduce(thread metal::vec<T, kRowsPerThread>& vals) const {
+    auto vptr = (thread T*)(&vals);
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kTileRows; ++i) {
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < kTileCols; ++j) {
+        NAXFrag_t::template row_reduce<Op>(
+            frag_at(i, j), &vptr[i * kFragThrRows]);
+      }
+    }
+  }
+
+  template <typename Op>
+  METAL_FUNC void row_bin_op(thread metal::vec<T, kRowsPerThread>& vals) {
+    auto vptr = (thread T*)(&vals);
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kTileRows; ++i) {
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < kTileCols; ++j) {
+        NAXFrag_t::template row_bin_op<Op>(
+            frag_at(i, j), &vptr[i * kFragThrRows]);
+      }
+    }
+  }
+
+  template <typename U, int str_x, int str_y>
+  METAL_FUNC void load(const threadgroup U* src) {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::load(
+            frag_at<idx_row.value, idx_col.value>(),
+            src,
+            Int<str_x>{},
+            Int<str_y>{},
+            idx_row * Int<kFragRows>{},
+            idx_col * Int<kFragCols>{});
+      });
+    });
+  }
+
+  template <typename U, int str_x, int str_y>
+  METAL_FUNC void store(threadgroup U* dst) const {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::store(
+            frag_at<idx_row.value, idx_col.value>(),
+            dst,
+            Int<str_x>{},
+            Int<str_y>{},
+            idx_row * Int<kFragRows>{},
+            idx_col * Int<kFragCols>{});
+      });
+    });
+  }
+
+  template <typename U>
+  METAL_FUNC void load(const device U* src, const int ld) {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::load(
+            frag_at<idx_row.value, idx_col.value>(),
+            src,
+            ld,
+            Int<1>{},
+            idx_row * Int<kFragRows>{},
+            idx_col * Int<kFragCols>{});
+      });
+    });
+  }
+
+  template <typename U>
+  METAL_FUNC void store(device U* dst, const int ld) const {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::store(
+            frag_at<idx_row.value, idx_col.value>(),
+            dst,
+            ld,
+            Int<1>{},
+            idx_row * Int<kFragRows>{},
+            idx_col * Int<kFragCols>{});
+      });
+    });
+  }
+
+  template <typename U>
+  METAL_FUNC void
+  load_rows(const device U* src, const int ld, const short n_rows) {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::load_rows(
+            frag_at<idx_row.value, idx_col.value>(),
+            src,
+            ld,
+            Int<1>{},
+            n_rows,
+            idx_row * Int<kFragRows>{},
+            idx_col * Int<kFragCols>{});
+      });
+    });
+  }
+
+  template <typename U>
+  METAL_FUNC void
+  load_safe(const device U* src, const int ld, const short2 src_tile_dims) {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::load_safe(
+            frag_at<idx_row.value, idx_col.value>(),
+            src,
+            ld,
+            Int<1>{},
+            src_tile_dims.y,
+            src_tile_dims.x,
+            idx_row * Int<kFragRows>{},
+            idx_col * Int<kFragCols>{});
+      });
+    });
+  }
+
+  template <typename U>
+  METAL_FUNC void store_rows(device U* dst, const int ld, const short n_rows)
+      const {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::store_rows(
+            frag_at<idx_row.value, idx_col.value>(),
+            dst,
+            ld,
+            Int<1>{},
+            n_rows,
+            idx_row * Int<kFragRows>{},
+            idx_col * Int<kFragCols>{});
+      });
+    });
+  }
+
+  template <typename U>
+  METAL_FUNC void
+  store_safe(device U* dst, const int ld, const short2 dst_tile_dims) const {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::store_safe(
+            frag_at<idx_row.value, idx_col.value>(),
+            dst,
+            ld,
+            Int<1>{},
+            dst_tile_dims.y,
+            dst_tile_dims.x,
+            idx_row * Int<kFragRows>{},
+            idx_col * Int<kFragCols>{});
+      });
+    });
+  }
+
+  template <typename U>
+  METAL_FUNC void store_slice(
+      device U* dst,
+      const int ld,
+      const short2 start,
+      const short2 stop) const {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::store_slice(
+            frag_at<idx_row.value, idx_col.value>(),
+            dst,
+            ld,
+            Int<1>{},
+            start.y,
+            stop.y,
+            start.x,
+            stop.x,
+            idx_row * Int<kFragRows>{},
+            idx_col * Int<kFragCols>{});
+      });
+    });
+  }
+};
+
+template <
+    class CTile,
+    class ATile,
+    class BTile,
+    bool transpose_a,
+    bool transpose_b>
+METAL_FUNC void tile_matmad_nax(
+    thread CTile& C,
+    thread ATile& A,
+    metal::bool_constant<transpose_a>,
+    thread BTile& B,
+    metal::bool_constant<transpose_b>) {
+  // Static checks
+  constexpr short TMa = transpose_a ? ATile::kTileCols : ATile::kTileRows;
+  constexpr short TM = CTile::kTileRows;
+  static_assert(TMa == TM, "MXU tile matmul: M dimensions do not match");
+
+  constexpr short TNb = transpose_b ? BTile::kTileRows : BTile::kTileCols;
+  constexpr short TN = CTile::kTileCols;
+  static_assert(TNb == TN, "MXU tile matmul: N dimensions do not match");
+
+  constexpr short TKa = transpose_a ? ATile::kTileRows : ATile::kTileCols;
+  constexpr short TK = transpose_b ? BTile::kTileCols : BTile::kTileRows;
+  static_assert(TKa == TK, "MXU tile matmul: K dimensions do not match");
+
+  constexpr auto ta = metal::bool_constant<transpose_a>{};
+  constexpr auto tb = metal::bool_constant<transpose_b>{};
+
+  if constexpr (TN == 1 && TM % 2 == 0) {
+    STEEL_PRAGMA_UNROLL
+    for (short mm = 0; mm < TM; mm += 2) {
+      STEEL_PRAGMA_UNROLL
+      for (short nn = 0; nn < TN; ++nn) {
+        STEEL_PRAGMA_UNROLL
+        for (short kk = 0; kk < TK; ++kk) {
+          CTile::NAXFrag_t::mma(
+              C.frag_at(mm, nn),
+              C.frag_at(mm + 1, nn),
+              A.frag_at(mm, kk, ta),
+              A.frag_at(mm + 1, kk, ta),
+              metal::bool_constant<transpose_a>{},
+              B.frag_at(kk, nn, tb),
+              metal::bool_constant<transpose_b>{});
+        }
+      }
+    }
+  } else if constexpr (TN % 2 == 0) {
+    STEEL_PRAGMA_UNROLL
+    for (short mm = 0; mm < TM; ++mm) {
+      STEEL_PRAGMA_UNROLL
+      for (short nn = 0; nn < TN; nn += 2) {
+        STEEL_PRAGMA_UNROLL
+        for (short kk = 0; kk < TK; ++kk) {
+          CTile::NAXFrag_t::mma(
+              C.frag_at(mm, nn),
+              C.frag_at(mm, nn + 1),
+              A.frag_at(mm, kk, ta),
+              metal::bool_constant<transpose_a>{},
+              B.frag_at(kk, nn, tb),
+              B.frag_at(kk, nn + 1, tb),
+              metal::bool_constant<transpose_b>{});
+        }
+      }
+    }
+  }
+}
+
+} // namespace steel
+} // namespace mlx
+
+///////////////////////////////////////////////////////////////////////////////
+// Contents from "mlx/backend/metal/kernels/steel/gemm/params.h"
+///////////////////////////////////////////////////////////////////////////////
+
+#line 1 "mlx/backend/metal/kernels/steel/gemm/params.h"
+// Copyright © 2024 Apple Inc.
+
+
+///////////////////////////////////////////////////////////////////////////////
+// GEMM param classes
+///////////////////////////////////////////////////////////////////////////////
+
+namespace mlx {
+namespace steel {
+
+struct GEMMParams {
+  const int M;
+  const int N;
+  const int K;
+
+  const int lda;
+  const int ldb;
+  const int ldd;
+
+  const int tiles_n;
+  const int tiles_m;
+
+  const int64_t batch_stride_a;
+  const int64_t batch_stride_b;
+  const int64_t batch_stride_d;
+
+  const int swizzle_log;
+  const int gemm_k_iterations_aligned;
+
+  const int batch_ndim;
+};
+
+struct GEMMSpiltKParams {
+  const int M;
+  const int N;
+  const int K;
+
+  const int lda;
+  const int ldb;
+  const int ldc;
+
+  const int tiles_n;
+  const int tiles_m;
+
+  const int split_k_partitions;
+  const int split_k_partition_stride;
+  const int split_k_partition_size;
+
+  const int swizzle_log;
+  const int gemm_k_iterations_aligned;
+};
+
+struct GEMMAddMMParams {
+  const int ldc;
+  const int fdc;
+
+  const int64_t batch_stride_c;
+
+  const float alpha;
+  const float beta;
+};
+
+} // namespace steel
+} // namespace mlx
+
+///////////////////////////////////////////////////////////////////////////////
+// Contents from "mlx/backend/metal/kernels/steel/utils.h"
+///////////////////////////////////////////////////////////////////////////////
+
+#line 1 "mlx/backend/metal/kernels/steel/utils.h"
+// Copyright © 2024 Apple Inc.
+
+
+#include <metal_stdlib>
+
+METAL_FUNC ulong2 elem_to_loc_broadcast(
+    uint elem,
+    constant const int* shape,
+    constant const int64_t* a_strides,
+    constant const int64_t* b_strides,
+    int ndim) {
+  ulong loc_a{0};
+  ulong loc_b{0};
+  for (int i = ndim - 1; i >= 0 && elem > 0; --i) {
+    int pos_in_dim = (elem % shape[i]);
+    elem /= shape[i];
+    loc_a += pos_in_dim * a_strides[i];
+    loc_b += pos_in_dim * b_strides[i];
+  }
+  return ulong2(loc_a, loc_b);
+}
+
+METAL_FUNC ulong3 elem_to_loc_broadcast(
+    uint elem,
+    constant const int* shape,
+    constant const int64_t* a_strides,
+    constant const int64_t* b_strides,
+    constant const int64_t* c_strides,
+    int ndim) {
+  ulong loc_a{0};
+  ulong loc_b{0};
+  ulong loc_c{0};
+  for (int i = ndim - 1; i >= 0 && elem > 0; --i) {
+    int pos_in_dim = (elem % shape[i]);
+    elem /= shape[i];
+    loc_a += pos_in_dim * a_strides[i];
+    loc_b += pos_in_dim * b_strides[i];
+    loc_c += pos_in_dim * c_strides[i];
+  }
+  return ulong3(loc_a, loc_b, loc_c);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Contents from "mlx/backend/metal/kernels/steel/gemm/transforms.h"
+///////////////////////////////////////////////////////////////////////////////
+
+#line 1 "mlx/backend/metal/kernels/steel/gemm/transforms.h"
+// Copyright © 2024 Apple Inc.
+
+
+
+///////////////////////////////////////////////////////////////////////////////
+// Transforms and Epilogues
+///////////////////////////////////////////////////////////////////////////////
+
+namespace mlx {
+namespace steel {
+
+template <typename OutT, typename InT>
+struct TransformNone {
+  static METAL_FUNC OutT apply(InT x) {
+    return static_cast<OutT>(x);
+  }
+
+  static METAL_FUNC OutT apply(InT x, OutT) {
+    return static_cast<OutT>(x);
+  }
+};
+
+template <typename OutT, typename InT>
+struct TransformAdd {
+  TransformAdd(const float, const float) {}
+
+  static METAL_FUNC OutT apply(InT x) {
+    return static_cast<OutT>(x);
+  }
+
+  static METAL_FUNC OutT apply(InT x, OutT c) {
+    return static_cast<OutT>(x) + c;
+  }
+};
+
+template <typename OutT, typename InT>
+struct TransformAxpby {
+  const float alpha;
+  const float beta;
+
+  TransformAxpby(const float alpha_, const float beta_)
+      : alpha(alpha_), beta(beta_) {}
+
+  static METAL_FUNC OutT apply(InT x) {
+    return static_cast<OutT>(x);
+  }
+
+  METAL_FUNC OutT apply(InT x, OutT c) const {
+    return static_cast<OutT>(
+        x * static_cast<InT>(alpha) + (static_cast<OutT>(beta) * c));
+  }
+};
+
+template <typename T>
+struct AccumHelper {
+  typedef float accum_type;
+};
+
+struct BlockSwizzle {
+  static METAL_FUNC int2
+  swizzle(uint3 tid [[threadgroup_position_in_grid]], const int swizzle_log) {
+    const int tid_x = (tid.x) >> swizzle_log;
+    const int tid_y =
+        ((tid.y) << swizzle_log) + ((tid.x) & ((1 << swizzle_log) - 1));
+    return int2(tid_x, tid_y);
+  }
+};
+
+} // namespace steel
+} // namespace mlx
+
+///////////////////////////////////////////////////////////////////////////////
+// Contents from "mlx/backend/metal/kernels/steel/gemm/gemm_nax.h"
+///////////////////////////////////////////////////////////////////////////////
+
+#line 1 "mlx/backend/metal/kernels/steel/gemm/gemm_nax.h"
+// Copyright © 2025 Apple Inc.
+
+
+
+using namespace metal;
+
+// Match the Compiled primitive's typed tape exactly. Swift converts every
+// scalar literal to the array dtype, and each primitive writes a bfloat16
+// temporary before the next primitive reads it.
+template <typename T>
+inline T gemma4_dense_geglu_compiled_tape(T gate, T up) {
+  const T cubic_0 = static_cast<T>(static_cast<T>(0.044715f) * gate);
+  const T cubic_1 = static_cast<T>(cubic_0 * gate);
+  const T cubic_2 = static_cast<T>(cubic_1 * gate);
+  const T inner = static_cast<T>(gate + cubic_2);
+  const T scaled =
+      static_cast<T>(static_cast<T>(0.7978845608028654f) * inner);
+  const T curved = metal::precise::tanh(scaled);
+  const T shifted = static_cast<T>(static_cast<T>(1.0f) + curved);
+  const T half_gate = static_cast<T>(static_cast<T>(0.5f) * gate);
+  const T gelu = static_cast<T>(half_gate * shifted);
+  return static_cast<T>(gelu * up);
+}
+
+namespace mlx::steel {
+
+// DARKBLOOM GEMMA4 NAX VOLATILE-FENCE ELIDE.
+// Every K-step loop body in the accelerated GEMM family declares an
+// uninitialised volatile int that is never written and is read once through
+// a discarded-value cast. With the elide on, neither the declaration nor the
+// read is emitted; no value in the kernel is derived from it.
+// Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE=0 to restore
+// the incumbent declaration and read at every site.
+#ifndef DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
+#define DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE 1
+#endif
+
+template <
+    typename T,
+    short SM,
+    short SN,
+    short SK,
+    short BK,
+    bool transpose_a,
+    bool transpose_b,
+    bool kAlignedM,
+    bool kAlignedN,
+    bool kAlignedK,
+// DARKBLOOM GEMMA4 NAX SKIP-EMPTY.
+// Restores NAX-SKIP-EMPTY-001 (upstream ml-explore/mlx 66a0407) behind a kill
+// switch. A steel NAX GEMM simdgroup whose output extent is empty in either
+// dimension (sgp_sm <= 0 or sgp_sn <= 0) stores nothing: the tail store is
+// store_safe with a zero or negative extent, which writes no element. Such a
+// simdgroup skips its A and B loads and its MMA instead of computing an
+// accumulator that is then discarded.
+//
+// BARRIER SAFETY, the hazard this mechanism has to clear. The skip in the main
+// K loop is placed strictly AFTER threadgroup_barrier(mem_flags::mem_none), so
+// every simdgroup -- skipping or not -- still executes that barrier on every
+// iteration, and the loop trip count gemm_k_iterations_ is threadgroup uniform.
+// No threadgroup barrier is ever enclosed by the skip. In the unaligned-K tail
+// the only synchronisation is a simdgroup_barrier, the skip is placed after it
+// as well, and nothing after the early return contains any barrier at all.
+// has_output is derived from sgp_sm and sgp_sn, which are simdgroup uniform, so
+// all lanes of a simdgroup take the same branch and no intra-simdgroup
+// divergence is introduced either.
+//
+// THREADGROUP MEMORY. gemm_loop reads A and B straight from device memory into
+// per-simdgroup register tiles; it declares no threadgroup array, runs no
+// cooperative loader and writes no threadgroup memory. A skipped simdgroup
+// therefore produces nothing any other simdgroup reads.
+//
+// Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_SKIP_EMPTY=0 and both guards
+// fold to the incumbent unconditional form.
+#ifndef DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY
+#define DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY 1
+#endif
+
+    typename AccumType = float>
+auto gemm_loop(
+    const device T* A,
+    const device T* B,
+    int lda,
+    int ldb,
+    int K,
+    int gemm_k_iterations_aligned,
+    const short sgp_sm,
+    const short sgp_sn) {
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+
+  constexpr int RA = transpose_a ? TK : TM;
+  constexpr int CA = transpose_a ? TM : TK;
+
+  constexpr int RB = transpose_b ? TN : TK;
+  constexpr int CB = transpose_b ? TK : TN;
+
+  NAXTile<AccumType, TM, TN> Dtile;
+  Dtile.clear();
+
+  const bool has_output = sgp_sm > 0 && sgp_sn > 0;
+  (void)has_output;
+
+  int gemm_k_iterations_ = gemm_k_iterations_aligned;
+
+  STEEL_PRAGMA_NO_UNROLL
+  for (int kk0 = 0; kk0 < gemm_k_iterations_; kk0++) {
+    threadgroup_barrier(mem_flags::mem_none);
+    if constexpr (
+        (DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY != 0) &&
+        (!kAlignedM || !kAlignedN)) {
+      if (!has_output)
+        continue;
+    }
+
+    STEEL_PRAGMA_NO_UNROLL
+    for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+      NAXTile<T, RA, CA> Atile;
+      NAXTile<T, RB, CB> Btile;
+      const int k = kk1;
+
+#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
+      volatile int compiler_barrier;
+#endif
+
+      const int A_offset = transpose_a ? k * lda : k;
+      const int B_offset = transpose_b ? k : k * ldb;
+
+      if constexpr (kAlignedM) {
+        Atile.load(A + A_offset, lda);
+      } else {
+        const short rmax = transpose_a ? SK : sgp_sm;
+        const short cmax = transpose_a ? sgp_sm : SK;
+        Atile.load_safe(A + A_offset, lda, short2(cmax, rmax));
+      }
+
+      if constexpr (kAlignedN) {
+        Btile.load(B + B_offset, ldb);
+      } else {
+        const short rmax = transpose_b ? sgp_sn : SK;
+        const short cmax = transpose_b ? SK : sgp_sn;
+        Btile.load_safe(B + B_offset, ldb, short2(cmax, rmax));
+      }
+
+      tile_matmad_nax(
+          Dtile,
+          Atile,
+          metal::bool_constant<transpose_a>{},
+          Btile,
+          metal::bool_constant<transpose_b>{});
+
+#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
+      (void)compiler_barrier;
+#endif
+    }
+
+    A += transpose_a ? (BK * lda) : BK;
+    B += transpose_b ? BK : (BK * ldb);
+  }
+
+  if constexpr (!kAlignedK) {
+    simdgroup_barrier(mem_flags::mem_none);
+    if constexpr (
+        (DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY != 0) &&
+        (!kAlignedM || !kAlignedN)) {
+      if (!has_output)
+        return Dtile;
+    }
+
+    const short rem_bk = K - gemm_k_iterations_ * BK;
+
+    STEEL_PRAGMA_NO_UNROLL
+    for (int kk1 = 0; kk1 < rem_bk; kk1 += SK) {
+      NAXTile<T, RA, CA> Atile;
+      NAXTile<T, RB, CB> Btile;
+
+      const int k = kk1;
+      const short psk = max(0, rem_bk - k);
+
+      const short2 Aklims =
+          transpose_a ? short2(sgp_sm, psk) : short2(psk, sgp_sm);
+      const short2 Bklims =
+          transpose_b ? short2(psk, sgp_sn) : short2(sgp_sn, psk);
+
+      const int A_offset = transpose_a ? k * lda : k;
+      const int B_offset = transpose_b ? k : k * ldb;
+
+      Atile.load_safe(A + A_offset, lda, Aklims);
+      Btile.load_safe(B + B_offset, ldb, Bklims);
+
+      tile_matmad_nax(
+          Dtile,
+          Atile,
+          metal::bool_constant<transpose_a>{},
+          Btile,
+          metal::bool_constant<transpose_b>{});
+    }
+  }
+
+  return Dtile;
+}
+
+// PREFILL-ATTN-TRAFFIC (at1): apply the prompt softmax's per-element
+// expression T(fast::exp(float(s) - maxval) * normalizer) to the A
+// fragments this lane holds (rows and columns inside (row_limit, col_limit)
+// only -- elements outside were zero-filled by load_safe and stay zero, as in
+// the plain load). rmax / rinv hold the lane's rows in fragment order:
+// index mm * kElemRows + i for fragment row mm and element row i.
+template <typename T, short RA, short CA>
+METAL_FUNC void softmax_transform_atile(
+    thread NAXTile<T, RA, CA>& Atile,
+    const thread float* rmax,
+    const thread float* rinv,
+    const short2 sc,
+    const short row_limit,
+    const short col_limit) {
+  using Frag = typename NAXTile<T, RA, CA>::NAXFrag_t;
+  STEEL_PRAGMA_UNROLL
+  for (short mm = 0; mm < RA; mm++) {
+    STEEL_PRAGMA_UNROLL
+    for (short kk = 0; kk < CA; kk++) {
+      thread auto& frag = Atile.frag_at(mm, kk);
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < Frag::kElemRows; i++) {
+        const short row =
+            mm * Frag::kFragRows + sc.y + i * Frag::kElemRowsJump;
+        const float m = rmax[mm * Frag::kElemRows + i];
+        const float inv = rinv[mm * Frag::kElemRows + i];
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < Frag::kElemCols; j++) {
+          const short col = kk * Frag::kFragCols + sc.x + j;
+          if (row < row_limit && col < col_limit) {
+            const float s = static_cast<float>(frag[i * Frag::kElemCols + j]);
+            frag[i * Frag::kElemCols + j] =
+                static_cast<T>(metal::fast::exp(s - m) * inv);
+          }
+        }
+      }
+    }
+  }
+}
+
+// PREFILL-ATTN-TRAFFIC (at1): gemm_loop's twin for the composed prompt
+// attention's P.V product (signature and exactness argument in
+// steel_gemm_fused.h). Same loads, same tensor ops, same K order and
+// accumulator; the one addition is that every A element this lane loads is
+// replaced by T(fast::exp(float(s) - maxval) * normalizer) for its row
+// before the tensor op consumes it. The row statistics sit at
+// sm_stats + row * 4 (bf16 words carrying the fp32 bit patterns) relative to
+// this simdgroup's first row; this lane's rows are mm * 16 + sc.y + i * 8.
+// Non-transposed A only. gemm_loop itself is untouched.
+template <
+    typename T,
+    short SM,
+    short SN,
+    short SK,
+    short BK,
+    bool transpose_a,
+    bool transpose_b,
+    bool kAlignedM,
+    bool kAlignedN,
+    bool kAlignedK,
+    typename AccumType = float>
+auto gemm_loop_softmax(
+    const device T* A,
+    const device T* B,
+    int lda,
+    int ldb,
+    int K,
+    int gemm_k_iterations_aligned,
+    const short sgp_sm,
+    const short sgp_sn,
+    const device T* sm_stats) {
+  static_assert(!transpose_a, "at1: non-transposed A operand only");
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+
+  constexpr int RA = transpose_a ? TK : TM;
+  constexpr int CA = transpose_a ? TM : TK;
+
+  constexpr int RB = transpose_b ? TN : TK;
+  constexpr int CB = transpose_b ? TK : TN;
+
+  NAXTile<AccumType, TM, TN> Dtile;
+  Dtile.clear();
+
+  const bool has_output = sgp_sm > 0 && sgp_sn > 0;
+  (void)has_output;
+
+  constexpr short kSmRows = TM * BaseNAXFrag::kElemRows;
+  float sm_rmax[kSmRows];
+  float sm_rinv[kSmRows];
+  const short2 sm_sc = BaseNAXFrag::get_coord();
+  STEEL_PRAGMA_UNROLL
+  for (short mm = 0; mm < TM; mm++) {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < BaseNAXFrag::kElemRows; i++) {
+      const short row = mm * BaseNAXFrag::kFragRows + sm_sc.y +
+          i * BaseNAXFrag::kElemRowsJump;
+      const short r =
+          metal::max(short(0), metal::min(row, short(sgp_sm - 1)));
+      const uint2 w =
+          *reinterpret_cast<const device uint2*>(sm_stats + r * 4);
+      sm_rmax[mm * BaseNAXFrag::kElemRows + i] = as_type<float>(w.x);
+      sm_rinv[mm * BaseNAXFrag::kElemRows + i] = as_type<float>(w.y);
+    }
+  }
+
+  int gemm_k_iterations_ = gemm_k_iterations_aligned;
+
+  STEEL_PRAGMA_NO_UNROLL
+  for (int kk0 = 0; kk0 < gemm_k_iterations_; kk0++) {
+    threadgroup_barrier(mem_flags::mem_none);
+    if constexpr (
+        (DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY != 0) &&
+        (!kAlignedM || !kAlignedN)) {
+      if (!has_output)
+        continue;
+    }
+
+    STEEL_PRAGMA_NO_UNROLL
+    for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+      NAXTile<T, RA, CA> Atile;
+      NAXTile<T, RB, CB> Btile;
+      const int k = kk1;
+
+#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
+      volatile int compiler_barrier;
+#endif
+
+      const int A_offset = transpose_a ? k * lda : k;
+      const int B_offset = transpose_b ? k : k * ldb;
+
+      if constexpr (kAlignedM) {
+        Atile.load(A + A_offset, lda);
+      } else {
+        const short rmax = transpose_a ? SK : sgp_sm;
+        const short cmax = transpose_a ? sgp_sm : SK;
+        Atile.load_safe(A + A_offset, lda, short2(cmax, rmax));
+      }
+      softmax_transform_atile(
+          Atile,
+          sm_rmax,
+          sm_rinv,
+          sm_sc,
+          kAlignedM ? short(SM) : sgp_sm,
+          short(SK));
+
+      if constexpr (kAlignedN) {
+        Btile.load(B + B_offset, ldb);
+      } else {
+        const short rmax = transpose_b ? sgp_sn : SK;
+        const short cmax = transpose_b ? SK : sgp_sn;
+        Btile.load_safe(B + B_offset, ldb, short2(cmax, rmax));
+      }
+
+      tile_matmad_nax(
+          Dtile,
+          Atile,
+          metal::bool_constant<transpose_a>{},
+          Btile,
+          metal::bool_constant<transpose_b>{});
+
+#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
+      (void)compiler_barrier;
+#endif
+    }
+
+    A += transpose_a ? (BK * lda) : BK;
+    B += transpose_b ? BK : (BK * ldb);
+  }
+
+  if constexpr (!kAlignedK) {
+    simdgroup_barrier(mem_flags::mem_none);
+    if constexpr (
+        (DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY != 0) &&
+        (!kAlignedM || !kAlignedN)) {
+      if (!has_output)
+        return Dtile;
+    }
+
+    const short rem_bk = K - gemm_k_iterations_ * BK;
+
+    STEEL_PRAGMA_NO_UNROLL
+    for (int kk1 = 0; kk1 < rem_bk; kk1 += SK) {
+      NAXTile<T, RA, CA> Atile;
+      NAXTile<T, RB, CB> Btile;
+
+      const int k = kk1;
+      const short psk = max(0, rem_bk - k);
+
+      const short2 Aklims =
+          transpose_a ? short2(sgp_sm, psk) : short2(psk, sgp_sm);
+      const short2 Bklims =
+          transpose_b ? short2(psk, sgp_sn) : short2(sgp_sn, psk);
+
+      const int A_offset = transpose_a ? k * lda : k;
+      const int B_offset = transpose_b ? k : k * ldb;
+
+      Atile.load_safe(A + A_offset, lda, Aklims);
+      softmax_transform_atile(Atile, sm_rmax, sm_rinv, sm_sc, sgp_sm, psk);
+      Btile.load_safe(B + B_offset, ldb, Bklims);
+
+      tile_matmad_nax(
+          Dtile,
+          Atile,
+          metal::bool_constant<transpose_a>{},
+          Btile,
+          metal::bool_constant<transpose_b>{});
+    }
+  }
+
+  return Dtile;
+}
+
+} // namespace mlx::steel
+
+///////////////////////////////////////////////////////////////////////////////
+
+using namespace mlx::steel;
+"""#
+}

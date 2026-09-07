@@ -1453,7 +1453,7 @@ public class SwitchGLU: Module {
         tightDownContract = false
     }
 
-    private func tightDecodeDown(_ x: MLXArray, _ indices: MLXArray, sorted: Bool) -> MLXArray? {
+    private func tightDecodeDown(_ x: MLXArray, _ indices: MLXArray, sorted: Bool, taggedRoute: Bool = false) -> MLXArray? {
         guard Gemma4DownTightGridV1.enabled, sorted, let storage = tightDownStorage,
             Gemma4DownTightGridV1.Storage.admits(x: x, indices: indices)
         else { return nil }
@@ -1469,7 +1469,7 @@ public class SwitchGLU: Module {
             }
         }
         guard tightDownContract else { return nil }
-        return storage.call(x: x, lhsIndices: switchDownIdentity64, indices: indices)
+        return storage.call(x: x, lhsIndices: switchDownIdentity64, indices: indices, taggedRoute: taggedRoute)
     }
 
     private var fusedGateUpStorage: SwitchGateUpFusedStorage?
@@ -1688,8 +1688,8 @@ public class SwitchGLU: Module {
             let fused = fusedGateUpDispatch()
         {
             let activated = Gemma4DecodeFusedGUV1.call(
-                x: x, storage: fused.storage, lhs: lhsIndices, rhs: idx)
-            let output = tightDecodeDown(activated, idx, sorted: true)
+                x: x, storage: fused.storage, lhs: lhsIndices, rhs: idx, taggedRoute: useExpertPrefixBounds)
+            let output = tightDecodeDown(activated, idx, sorted: true, taggedRoute: useExpertPrefixBounds)
                 ?? downProj(activated, idx, lhsIndices: switchDownIdentity64, sortedIndices: true)
             return (output, inverseOrder, true)
         }
@@ -1770,7 +1770,7 @@ public class SwitchGLU: Module {
         // which otherwise materializes the same arange(64) on every call.
         let downLhs: MLXArray? =
             (doSort && idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
-        x = tightDecodeDown(activated, idx, sorted: doSort)
+        x = tightDecodeDown(activated, idx, sorted: doSort, taggedRoute: useExpertPrefixBounds)
             ?? downProj(activated, idx, lhsIndices: downLhs, sortedIndices: doSort)
         // Under `doSort` a producer above always assigned `inverseOrder`;
         // otherwise it is still nil, which is exactly what the old

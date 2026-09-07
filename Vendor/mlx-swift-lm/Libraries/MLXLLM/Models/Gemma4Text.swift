@@ -6847,6 +6847,10 @@ public class Gemma4TextModelInner: Module {
     let lastFullAttentionNonSharedIdx: Int
     let lastSlidingAttentionNonSharedIdx: Int
 
+    // Reusable carrier buffer for layer intermediate KV tracking
+    private var reusableIntermediates:
+        [(kv: (MLXArray, MLXArray)?, positionOffset: Gemma4.PositionOffset?)] = []
+
     public init(
         _ config: Gemma4TextConfiguration, forceSharedKV: Bool = false,
         fuseWeightedUnsort: Bool = false
@@ -7174,8 +7178,15 @@ public class Gemma4TextModelInner: Module {
         }
 
         // Forward through layers, tracking intermediate KV pairs for sharing
-        var intermediates = [(kv: (MLXArray, MLXArray)?, positionOffset: Gemma4.PositionOffset?)](
-            repeating: (nil, nil), count: config.numHiddenLayers)
+        if reusableIntermediates.count != config.numHiddenLayers {
+            reusableIntermediates = [(kv: (MLXArray, MLXArray)?, positionOffset: Gemma4.PositionOffset?)](
+                repeating: (nil, nil), count: config.numHiddenLayers)
+        }
+        defer {
+            for i in 0 ..< config.numHiddenLayers {
+                reusableIntermediates[i] = (nil, nil)
+            }
+        }
 
         // GLUE-003: one chain box per forward; layer L's fused tail hands
         // layer L+1 its input norm through it. EMB-RS0-001 seeds the same
@@ -7185,8 +7196,8 @@ public class Gemma4TextModelInner: Module {
         glueChain.pending = layerZeroInputCarry
         for (idx, layer) in layers.enumerated() {
             let prevIdx = previousKvs[idx]
-            let sharedKV = intermediates[prevIdx].kv
-            let sharedPositionOffset = intermediates[prevIdx].positionOffset
+            let sharedKV = reusableIntermediates[prevIdx].kv
+            let sharedPositionOffset = reusableIntermediates[prevIdx].positionOffset
 
             // CBv2: KV-shared layers attend by borrowing the SOURCE layer's
             // cache object (attendBorrowing) instead of consuming raw K/V
@@ -7238,7 +7249,7 @@ public class Gemma4TextModelInner: Module {
                     && !capturePreNorm && dFlashHiddenCapture == nil
             )
             h = out
-            intermediates[idx] = (kvPair, positionOffset)
+            reusableIntermediates[idx] = (kvPair, positionOffset)
             captureHook?(idx, kvPair)
             dFlashHiddenCapture?.capture(h, layer: idx)
 

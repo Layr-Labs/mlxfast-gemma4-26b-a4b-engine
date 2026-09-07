@@ -60,14 +60,15 @@ public enum Gemma4DownTightGridV1 {
         }
 
         /// The caller supplies the incumbent identity LHS and sorted RHS keys.
-        func call(x: MLXArray, lhsIndices: MLXArray, indices: MLXArray) -> MLXArray {
-            call(x: x, lhsIndices: lhsIndices, indices: indices, span: tileSpan)
+        func call(x: MLXArray, lhsIndices: MLXArray, indices: MLXArray, taggedRoute: Bool = false) -> MLXArray {
+            call(x: x, lhsIndices: lhsIndices, indices: indices, span: tileSpan, taggedRoute: taggedRoute)
         }
 
         func call(
-            x: MLXArray, lhsIndices: MLXArray, indices: MLXArray, span: Int
+            x: MLXArray, lhsIndices: MLXArray, indices: MLXArray, span: Int, taggedRoute: Bool = false
         ) -> MLXArray {
-            kernel(
+            let k = taggedRoute ? kernelTagged : kernel
+            return k(
                 [weight, scales, biases, x, lhsIndices, indices],
                 template: [("T", DType.bfloat16), ("SPAN", span)],
                 grid: (32, (352 / span) * 2, 64), threadGroup: (32, 2, 1),
@@ -76,11 +77,14 @@ public enum Gemma4DownTightGridV1 {
         }
     }
 
-    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_down_qmv_span4_tight_zorder_v1",
-        inputNames: ["w", "scales", "biases", "x", "lhs_indices", "rhs_indices"],
-        outputNames: ["y"],
-        source: #"""
+    private static func makeKernel(tagged: Bool) -> MLXFast.MLXFastKernel {
+        MLXFast.metalKernel(
+            name: tagged
+                ? "gemma4_b8_down_qmv_span4_tight_zorder_tagged_v1"
+                : "gemma4_b8_down_qmv_span4_tight_zorder_v1",
+            inputNames: ["w", "scales", "biases", "x", "lhs_indices", "rhs_indices"],
+            outputNames: ["y"],
+            source: #"""
 uint3 tid = threadgroup_position_in_grid;
 const uint linear = tid.y + tid.z * (352 / SPAN);
 tid.y = (linear / 64) * SPAN;
@@ -94,7 +98,7 @@ gather_qmv_gemma4_down_tile<T, 64, 4, SPAN>(
     704, 2816 * 704 / 8, 2816 * 704 / 64, 2816 * 704 / 64,
     tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
 """#,
-        header: #"""
+            header: "#define DOWN_TAGGED_ROUTE \(tagged ? 1 : 0)\n" + #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helper bodies verified byte-identical to 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -837,6 +841,15 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     return;
   }
   const uint assignment = tid.z;
+#if DOWN_TAGGED_ROUTE
+  const uint32_t route_word = rhs_indices[assignment * rhs_stride];
+  const uint32_t expert = route_word & 0xffu;
+  const uint run_offset = (route_word >> 8) & 0x3fu;
+  if ((run_offset & 1) != 0) {
+    return;
+  }
+  const bool has_pair = (((route_word >> 14) & 0x3fu) + 1u) > 1u;
+#else
   const uint32_t route_word = rhs_indices[assignment * rhs_stride];
   const bool expert_prefix_bounds = (route_word & 0x80000000u) != 0u;
   const uint32_t expert =
@@ -856,16 +869,17 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   if ((run_offset & 1) != 0) {
     return;
   }
+  const bool has_pair = expert_prefix_bounds
+      ? (((route_word >> 14) & 0x3fu) + 1u) > 1u
+      : assignment + 1 < 64 &&
+          rhs_indices[(assignment + 1) * rhs_stride] == expert;
+#endif
   const device uint32_t* tile_w = w + expert * w_stride;
   const device T* tile_scales = scales + expert * s_stride;
   const device T* tile_biases = biases + expert * b_stride;
   const device T* tile_x0 =
       x + lhs_indices[assignment * lhs_stride] * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;
-  const bool has_pair = expert_prefix_bounds
-      ? (((route_word >> 14) & 0x3fu) + 1u) > 1u
-      : assignment + 1 < 64 &&
-          rhs_indices[(assignment + 1) * rhs_stride] == expert;
   if (has_pair) {
     const device T* tile_x1 =
         x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
@@ -909,4 +923,8 @@ constant int gemma4_tight_down_K=704;
 constant int gemma4_tight_down_N=2816;
 """#,
         ensureRowContiguous: true)
+    }
+
+    private static let kernel: MLXFast.MLXFastKernel = makeKernel(tagged: false)
+    private static let kernelTagged: MLXFast.MLXFastKernel = makeKernel(tagged: true)
 }

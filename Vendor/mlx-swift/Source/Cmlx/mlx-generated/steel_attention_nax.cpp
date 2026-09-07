@@ -1289,6 +1289,14 @@ struct BlockSwizzle {
 
 using namespace mlx::steel;
 
+// DARKBLOOM GEMMA4 NAX ATTENTION QHOIST.
+// Hoist invariant query tile load out of the key-block loop.
+// Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_ATTN_QHOIST=0 to restore
+// the inner-loop load.
+#ifndef DARKBLOOM_GEMMA4_NAX_ATTN_QHOIST
+#define DARKBLOOM_GEMMA4_NAX_ATTN_QHOIST 1
+#endif
+
 ///////////////////////////////////////////////////////////////////////////////
 // GEMM kernels
 ///////////////////////////////////////////////////////////////////////////////
@@ -1475,6 +1483,18 @@ template <
   const short lim_rows_q = params->qL_rem - tm;
   const short lim_rows_k = params->kL_rem;
 
+#if DARKBLOOM_GEMMA4_NAX_ATTN_QHOIST
+  NAXTile<T, TQ, TD> Qtile_hoisted;
+  if (!align_Q && is_last_q) {
+    Qtile_hoisted.load_rows(
+        Q,
+        int(params->Q_strides[2]),
+        lim_rows_q);
+  } else {
+    Qtile_hoisted.load(Q, int(params->Q_strides[2]));
+  }
+#endif
+
   // Loop over KV seq length
   for (int kb = 0; kb < kb_lim; kb++) {
     const int is_last_k = (kb == (params->NK_aligned));
@@ -1490,6 +1510,31 @@ template <
       STEEL_PRAGMA_UNROLL
       for (short ik = 0; ik < TK; ik += 2) {
         STEEL_PRAGMA_UNROLL
+#if DARKBLOOM_GEMMA4_NAX_ATTN_QHOIST
+        for (short id = 0; id < TD; id++) {
+          NAXTile<T, 2, 1> Ktile;
+
+          const int K_load_off = ik * kU * int(params->K_strides[2]) + id * kU;
+
+          if (!align_K && is_last_k) {
+            Ktile.load_rows(
+                K + K_load_off,
+                int(params->K_strides[2]),
+                lim_rows_k - ik * kU);
+          } else {
+            Ktile.load(K + K_load_off, int(params->K_strides[2]));
+          }
+
+          stile_t::NAXFrag_t::mma(
+              Stile.frag_at(iq, ik),
+              Stile.frag_at(iq, ik + 1),
+              Qtile_hoisted.frag_at(iq, id),
+              metal::false_type{},
+              Ktile.frag_at(0, 0),
+              Ktile.frag_at(1, 0),
+              metal::true_type{});
+        }
+#else
         for (short id = 0; id < TD; id++) {
           NAXTile<T, 1, 1> Qtile;
           NAXTile<T, 2, 1> Ktile;
@@ -1524,6 +1569,7 @@ template <
               Ktile.frag_at(1, 0),
               metal::true_type{});
         }
+#endif
       }
     }
 

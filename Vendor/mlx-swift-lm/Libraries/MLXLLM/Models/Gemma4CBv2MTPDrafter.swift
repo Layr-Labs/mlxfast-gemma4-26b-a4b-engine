@@ -38,6 +38,10 @@ public struct DrafterRoPETable: @unchecked Sendable {
     public let cos: MLXArray
     /// `[windowAhead, dims/2]` sines for the same positions.
     public let sin: MLXArray
+    /// Interleaved `[cos, sin]` rows with shape
+    /// `[windowAhead, dims/2, 2]`, when available.
+    public let paired: MLXArray?
+
     /// The rotary dimension the table was built for (== `cos.shape[1] * 2`).
     public let dims: Int
     /// First absolute position covered by the table.
@@ -49,10 +53,12 @@ public struct DrafterRoPETable: @unchecked Sendable {
 
     public init(
         cos: MLXArray, sin: MLXArray, dims: Int,
-        startPosition: Int, windowAhead: Int, base: Float
+        startPosition: Int, windowAhead: Int, base: Float,
+        paired: MLXArray? = nil
     ) {
         self.cos = cos
         self.sin = sin
+        self.paired = paired
         self.dims = dims
         self.startPosition = startPosition
         self.windowAhead = windowAhead
@@ -69,6 +75,17 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
     /// table. One full speculative block + a margin; matches the
     /// `blockSize <= 16` contract in `Gemma4MTPError.invalidBlockSize`.
     public static let defaultRoPEWindowAhead = 16
+
+    /// Use one indexed interleaved row instead of separate cos/sin gathers.
+    private static let pairedRoPEEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MTP_ROPE_PAIRED"
+        ] else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
 
     /// Round-scoped state built by `prepare(rows:)`: the padded/stacked
     /// shared KV, the per-row padding masks, and the constant anchor
@@ -134,7 +151,6 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
             startPosition: anchorMin,
             windowAhead: Self.defaultRoPEWindowAhead)
         cachedRoPETable = ropeTable
-
         if rows.count == 1 {
             let row = rows[0]
             let slidingMask = Self.slidingMask(
@@ -149,6 +165,7 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
                     sliding: slidingMask.map { .array($0) } ?? .none),
                 positionOffset: positionOffset,
                 ropeTable: ropeTable)
+
         }
 
         let (fullKV, fullMask) = Self.padAndMask(
@@ -315,8 +332,9 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         let angles = positions * freqs
         let cos = MLX.cos(angles)
         let sin = MLX.sin(angles)
+        let paired = pairedRoPEEnabled ? MLX.stacked([cos, sin], axis: -1) : nil
         return DrafterRoPETable(
-            cos: cos, sin: sin,
+            cos: cos, sin: sin, paired: paired,
             dims: rotatedDims,
             startPosition: startPosition,
             windowAhead: windowAhead,
@@ -361,8 +379,17 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         guard inRange else { return hidden }
 
         let indices = MLXArray(steps, [perRow.count, 1])
-        let cosRows = table.cos[indices]  // [B, halfDim]
-        let sinRows = table.sin[indices]  // [B, halfDim]
+        let cosRows: MLXArray
+        let sinRows: MLXArray
+        if Self.pairedRoPEEnabled, let paired = table.paired {
+            let pairedRows = paired[indices]  // [B, halfDim, 2]
+            cosRows = pairedRows[.ellipsis, 0]
+            sinRows = pairedRows[.ellipsis, 1]
+            CBv2EngageMark.once("gemma4-mtp-rope-paired-gather")
+        } else {
+            cosRows = table.cos[indices]  // [B, halfDim]
+            sinRows = table.sin[indices]  // [B, halfDim]
+        }
 
         // Reshape hidden so the rotary prefix is `[B, L, 1, halfDim, 2]`.
         let leadShape = Array(hidden.shape.dropLast())

@@ -85,6 +85,14 @@ public enum Gemma4MMAQuantizedGEMV {
         fileprivate let values: MLXArray
     }
 
+    /// The final RMSNorm producer's transposed twin of the head activation:
+    /// `[K, 8]` bf16 holding exactly the values the `[8, 1, K]` output holds,
+    /// with the eight activation rows adjacent at each contraction index. The
+    /// initializer stays private so callers cannot fabricate one.
+    public struct TransposedActivation {
+        fileprivate let values: MLXArray
+    }
+
     /// Rows the accumulator tile carries --- the ranked cohort's batch.
     private static let mRows = 8
     /// Output columns one simdgroup owns (one 8x8 tile).
@@ -203,6 +211,57 @@ public enum Gemma4MMAQuantizedGEMV {
             values.size == mRows * (2816 / 64)
         else { return nil }
         return ActivationSums(values: values)
+    }
+
+    /// `false` only when `DARKBLOOM_GEMMA4_HEAD_XT` is an explicit off value.
+    /// Off restores the incumbent argmax kernels, their names, their operand
+    /// and the producer's output list byte for byte.
+    private static let headXTEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_HEAD_XT"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
+    /// Liveness diagnostic: exchange the two adjacent operands so the
+    /// selection MUST move if the transposed read is the one being served.
+    /// Never set on a scored run.
+    private static let headXTPoison: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_HEAD_XT_POISON"]
+        else { return false }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "", "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
+    /// Whether the final RMSNorm producer should publish the transposed twin.
+    public static var consumesTransposedActivation: Bool {
+        headXTEnabled && consumesActivationSums
+    }
+
+    /// Adopt a producer-emitted transposed activation only for the exact
+    /// ranked head input. The layout is `[k * 8 + row]`.
+    public static func transposedActivation(
+        produced values: MLXArray, for x: MLXArray
+    ) -> TransposedActivation? {
+        guard consumesTransposedActivation,
+            x.dtype == .bfloat16,
+            x.ndim == 3,
+            x.dim(0) == mRows,
+            x.dim(1) == 1,
+            x.dim(2) == 2816,
+            x.size == mRows * 2816,
+            values.dtype == .bfloat16,
+            values.ndim == 2,
+            values.dim(0) == 2816,
+            values.dim(1) == mRows
+        else { return nil }
+        return TransposedActivation(values: values)
     }
 
     /// Kernel source. `T` is the activation/scale dtype, `K` the contraction
@@ -3122,6 +3181,8 @@ public enum Gemma4MMAQuantizedGEMV {
         let logits: MLXFast.MLXFastKernel
         let carry: MLXFast.MLXFastKernel
         let argmax: MLXFast.MLXFastKernel
+        /// nil when HEAD-XT is off or its own derivation did not match.
+        let argmaxXT: MLXFast.MLXFastKernel?
     }
 
     /// The three `_rl1` twins, or nil when the switch is off or a derivation
@@ -3137,6 +3198,16 @@ public enum Gemma4MMAQuantizedGEMV {
             FileHandle.standardError.write(
                 Data("[head-relayout] derivation mismatch; incumbent kept\n".utf8))
             return nil
+        }
+
+        let argmaxXT: String? = headXTEnabled
+            ? relayoutRewrite(
+                sourceV27ArgmaxXT,
+                logitslessCarryEnabled ? relayoutCarryLanePairs : relayoutLanePairs)
+            : nil
+        if headXTEnabled, argmaxXT == nil {
+            FileHandle.standardError.write(
+                Data("[head-xt] derivation mismatch; incumbent kept\n".utf8))
         }
 
         return RelayoutKernels(
@@ -3161,7 +3232,17 @@ public enum Gemma4MMAQuantizedGEMV {
                 outputNames: ["pv", "pi"],
                 source: argmax,
                 header: "#include <metal_simdgroup_matrix>\n",
-                ensureRowContiguous: true))
+                ensureRowContiguous: true),
+            argmaxXT: argmaxXT.map { source in
+                MLXFast.metalKernel(
+                    name: "gemma4_mma_affine4_qmv_m8_v27_argmax_rl1"
+                        + logitslessCarryKeySuffix + "_xt1",
+                    inputNames: ["x", "w", "scales", "biases", "xSums"],
+                    outputNames: ["pv", "pi"],
+                    source: source,
+                    header: "#include <metal_simdgroup_matrix>\n",
+                    ensureRowContiguous: true)
+            })
     }()
 
     private static let relayoutLock = NSLock()
@@ -3489,6 +3570,67 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
+    // MARK: - HEAD-XT --- the activation operand pair read as one word
+
+    /// The pair a lane feeds the matrix unit is `X[fragmentCol][k]` and
+    /// `X[fragmentCol + 1][k]`: ONE contraction index, two adjacent
+    /// activation rows. In the `[8, K]` activation those two values are K
+    /// elements apart, so each is its own scalar load and a simdgroup's
+    /// thirty-two lanes touch eight scattered runs. Read from the
+    /// producer's `[K, 8]` twin the pair is adjacent and aligned: one 32-bit
+    /// load, and the simdgroup's slice is one contiguous run.
+    ///
+    /// The twin holds the SAME bf16 values --- it is a second store of the
+    /// producer's `outv[i]`, not a recomputation --- so both matrix operands,
+    /// their fragment positions, the group walk, the scale close and every
+    /// accumulation are untouched and the selected token is bit-identical.
+    private static let sourceV27ArgmaxXT: String = {
+        var result = sourceV27Argmax
+
+        func replaceOnce(_ old: String, with new: String) {
+            let count = result.components(separatedBy: old).count
+            precondition(
+                count == 2, "sourceV27ArgmaxXT replacement count \(count): \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            """
+                    const uint activationK = g * GROUP + t * 8 + fragmentRow;
+                    B.thread_elements()[0] =
+                        float(x[fragmentCol * K + activationK]);
+                    B.thread_elements()[1] =
+                        float(x[(fragmentCol + 1) * K + activationK]);
+            """,
+            with: """
+                    const uint activationK = g * GROUP + t * 8 + fragmentRow;
+                    const device vec<T, 2>* activationPair =
+                        reinterpret_cast<const device vec<T, 2>*>(
+                            x + activationK * M_ROWS + fragmentCol);
+                    const vec<T, 2> activationOperands = activationPair[0];
+                    B.thread_elements()[0] =
+                        float(activationOperands[\(headXTPoison ? 1 : 0)]);
+                    B.thread_elements()[1] =
+                        float(activationOperands[\(headXTPoison ? 0 : 1)]);
+            """
+        )
+
+        precondition(
+            !result.contains("fragmentCol * K"),
+            "sourceV27ArgmaxXT still reads the row-major activation")
+        return result
+    }()
+
+    private static let kernelV27ArgmaxXT: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_v27_argmax"
+            + logitslessCarryKeySuffix + "_xt1",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["pv", "pi"],
+        source: sourceV27ArgmaxXT,
+        header: "#include <metal_simdgroup_matrix>\n",
+        ensureRowContiguous: true
+    )
+
     /// Stage two. One simdgroup per activation row folds that row's `NT`
     /// threadgroup records under the same total order and emits the token id.
     private static let argmaxReduceKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
@@ -3565,7 +3707,8 @@ public enum Gemma4MMAQuantizedGEMV {
         biases: MLXArray?,
         groupSize: Int,
         bits: Int,
-        activationSums: ActivationSums? = nil
+        activationSums: ActivationSums? = nil,
+        transposedActivation: TransposedActivation? = nil
     ) -> MLXArray? {
         guard
             admitsArgmax(
@@ -3601,18 +3744,44 @@ public enum Gemma4MMAQuantizedGEMV {
             )[0]
         }
 
-        let headKernel: MLXFast.MLXFastKernel
-        let plane: MLXArray
-        if let relaid = relayoutKernels {
-            CBv2EngageMark.once("head-relayout")
-            headKernel = relaid.argmax
-            plane = relayoutPlane(for: w, k: k, n: n)
+        // HEAD-XT: the producer's transposed twin replaces the activation
+        // OPERAND and nothing else. Absent it, or with the switch off, the
+        // incumbent operand and the incumbent kernel are kept.
+        var transposedX: MLXArray? = nil
+        if headXTEnabled, let transposedActivation {
+            let values = transposedActivation.values
+            if values.dtype == x.dtype, values.ndim == 2,
+                values.dim(0) == k, values.dim(1) == mRows
+            {
+                transposedX = values
+            }
+        }
+
+        let relaid = relayoutKernels
+        if relaid != nil { CBv2EngageMark.once("head-relayout") }
+        let plane: MLXArray = relaid != nil ? relayoutPlane(for: w, k: k, n: n) : w
+
+        let xtKernel: MLXFast.MLXFastKernel?
+        if transposedX == nil {
+            xtKernel = nil
+        } else if let relaid {
+            xtKernel = relaid.argmaxXT
         } else {
-            headKernel = kernelV27Argmax
-            plane = w
+            xtKernel = kernelV27ArgmaxXT
+        }
+
+        let headKernel: MLXFast.MLXFastKernel
+        let activation: MLXArray
+        if let xtKernel, let transposedX {
+            CBv2EngageMark.once("head-xt")
+            headKernel = xtKernel
+            activation = transposedX
+        } else {
+            headKernel = relaid?.argmax ?? kernelV27Argmax
+            activation = flatX
         }
         let partials = headKernel(
-            [flatX, plane, scales, biases, xSums],
+            [activation, plane, scales, biases, xSums],
             template: [("T", x.dtype), ("K", k), ("N", n)],
             grid: (threadgroups * threadsPerThreadgroup, 1, 1),
             threadGroup: (threadsPerThreadgroup, 1, 1),

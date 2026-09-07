@@ -474,6 +474,16 @@ private let routeSimdRank64Enabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// The rank-64 route kernel indexes the contiguous pointer linearly, so its
+/// accepted `[8, 8]` input does not need a separate flattened view.
+/// `DARKBLOOM_ROUTE_SIMD_RANK64_DIRECT_INPUT=0` restores that view.
+private let routeSimdRank64DirectInputEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTE_SIMD_RANK64_DIRECT_INPUT"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 // MARK: - ROUTE-CSORT-64: fused counting-sort route table (donor port)
 
 /// Stable counting sort for the flattened B=8 decode route table (64 uint32
@@ -1165,7 +1175,12 @@ public func gatherSort(
         (indices.shape == [8, 8] || (indices.ndim == 1 && indices.size == 64)),
         indices.dtype == .uint32
     {
-        let flat = indices.flattened()
+        if routeSimdRank64DirectInputEnabled {
+            CBv2EngageMark.once("route-simd-direct-input")
+        }
+        let flat: MLXArray = routeSimdRank64DirectInputEnabled
+            ? indices
+            : indices.flattened()
         let outputs = routeSimdRank64Kernel(
             [flat],
             grid: (64, 1, 1),
@@ -1248,7 +1263,12 @@ public func gatherSortIndices(
         if expertPrefixBounds {
             CBv2EngageMark.once("expert-prefix-bounds")
         }
-        let flat = indices.flattened()
+        if routeSimdRank64DirectInputEnabled {
+            CBv2EngageMark.once("route-simd-direct-input")
+        }
+        let flat: MLXArray = routeSimdRank64DirectInputEnabled
+            ? indices
+            : indices.flattened()
         let kernel = expertPrefixBounds
             ? routeSimdRank64PrefixBoundsKernel : routeSimdRank64Kernel
         let outputs = kernel(
@@ -1631,10 +1651,8 @@ public class SwitchGLU: Module {
             && useLhsIndices
             && indices.dtype == .uint32 && x.dtype == .bfloat16
             && expertPrefixBoundsProjectionsEligible
-        // Decode already supplies [rows, inputDims]; avoid constructing then
-        // immediately flattening two singleton axes on that path.
-        var x = useLhsIndices ? x : MLX.expandedDimensions(x, axes: [-2, -3])
-        let doSort = useLhsIndices || indices.size >= 64
+        var x = MLX.expandedDimensions(x, axes: [-2, -3])
+        let doSort = indices.size >= 64
 
         var idx = indices
         // ROUTE-LAZY-INVERSE-ORDER: the sentinel `MLXArray()` this variable
@@ -1646,6 +1664,7 @@ public class SwitchGLU: Module {
         var lhsIndices: MLXArray?
         if doSort {
             if useLhsIndices {
+                x = x.flattened(start: 0, end: -3)
                 // GLUE-FOLD: an upstream producer already emitted the exact
                 // route table beside the top-8 selection; consume it and the
                 // standalone `mlx_lm_route_simd_rank_scatter` dispatch never

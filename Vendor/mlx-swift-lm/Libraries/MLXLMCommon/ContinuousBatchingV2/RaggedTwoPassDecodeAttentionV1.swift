@@ -4872,11 +4872,15 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// value plane and stay resident, are re-read by twice as many tiles.
     ///
     /// `DARKBLOOM_GEMMA4_D512_AV_TILES=8` restores the incumbent geometry.
+    /// A 16-column tile uses one SIMD group and removes the cross-SIMD
+    /// run-sum barrier. Its quarter-group sums are combined by o_proj using
+    /// the same two remaining butterfly levels. The 8/16 settings retain
+    /// their full/pair tables for same-binary comparisons.
     private static let avColumnTiles: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_D512_AV_TILES"], let value = Int(raw)
-        else { return 16 }
-        return value == 8 || value == 16 ? value : 16
+        else { return 32 }
+        return value == 8 || value == 16 || value == 32 ? value : 32
     }()
 
     /// Columns one threadgroup of dispatch 3 owns, and the simdgroups it
@@ -5452,9 +5456,9 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 rsv += xt[0] + xt[1] + xt[2] + xt[3];
                 rsv += xt[4] + xt[5] + xt[6] + xt[7];
                 rsv += simd_shuffle_xor(rsv, 2u);
-                rs_partial[sg][lane] = rsv;
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                rsv += rs_partial[sg ^ 1][lane];
+                \(avSimdgroups > 1
+                    ? "rs_partial[sg][lane] = rsv;\n                threadgroup_barrier(mem_flags::mem_threadgroup);\n                rsv += rs_partial[sg ^ 1][lane];"
+                    : "")
                 \(avSimdgroups == 4
                     ? "rsv += rs_partial[sg ^ 2][lane] + rs_partial[sg ^ 3][lane];"
                     : "")
@@ -6413,7 +6417,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             output = attended[0]
             oRunsum = attended[1]
             CBv2EngageMark.once(
-                avORunsumPartials == 1 ? "d512-ors-av-table" : "d512-ors-av-pairs")
+                avORunsumPartials == 1 ? "d512-ors-av-table"
+                    : avORunsumPartials == 2 ? "d512-ors-av-pairs" : "d512-ors-av-quarters")
         } else {
             output = avActive(
                 [probs] + valueBuffers + [paramsArray],

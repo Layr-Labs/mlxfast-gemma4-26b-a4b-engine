@@ -645,7 +645,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
             x.dim(0) == batch,
             x.dim(1) == sequence,
             x.dim(2) == 8192,
-            table.shape == [batch, 2 * (x.dim(2) / groupSize)]
+            (table.shape == [batch, 2 * (x.dim(2) / groupSize)]
+                || table.shape == [batch, 4 * (x.dim(2) / groupSize)])
         else { return nil }
         return table
     }
@@ -717,7 +718,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
     /// kernels keep their own header text and names.
     private static let mma8Rsp2KernelHeader = mma8KernelHeader + """
 
-template <typename T, int KS, int KFIX>
+template <typename T, int KS, int KFIX, int RS_PARTS = 2>
 METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
     const device uint32_t* w,
     const device T* scales,
@@ -743,8 +744,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
   const device T* brow = biases + (n0 + c.fm) * G;
   const device T* x0 = x + c.fn * K + 8 * c.fm;
   const device T* x1 = x0 + K;
-  const device float* p0 = rs_pairs + c.fn * (2 * G);
-  const device float* p1 = p0 + 2 * G;
+  const device float* p0 = rs_pairs + c.fn * (RS_PARTS * G);
+  const device float* p1 = p0 + RS_PARTS * G;
 
   float acc0 = 0.0f;
   float acc1 = 0.0f;
@@ -757,8 +758,13 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
     const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
 
-    const float2 rs = float2(
-        p0[2 * g] + p0[2 * g + 1], p1[2 * g] + p1[2 * g + 1]);
+    // Quarter tiles retain the original octet butterfly: pair adjacent
+    // quarters first, then add the two halves. RS_PARTS is compile-time.
+    const float2 rs = RS_PARTS == 4
+        ? float2(
+            (p0[4 * g] + p0[4 * g + 1]) + (p0[4 * g + 2] + p0[4 * g + 3]),
+            (p1[4 * g] + p1[4 * g + 1]) + (p1[4 * g + 2] + p1[4 * g + 3]))
+        : float2(p0[2 * g] + p0[2 * g + 1], p1[2 * g] + p1[2 * g + 1]);
 
     MMA8_SETB(B0, x, lo)
     MMA8_SETB(B1, x, hi)
@@ -823,6 +829,25 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
         header: mma8Rsp2Header,
         ensureRowContiguous: true)
 
+    // One-SIMD AV tiles emit four quarter sums per affine group.
+    private static let mma8Rsp4KernelK8192 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp4_v1"
+            + carry2KeySuffix + unroll4KeySuffix,
+        inputNames: ["x", "w", "scales", "biases", "rs_pairs"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            attention_o_qmv_mma8_affine4_g64_rsp2<T, 2, 8192, 4>(
+                w, scales, biases, x, rs_pairs, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8Rsp2Header,
+        ensureRowContiguous: true)
+
     @inline(__always)
     private static func liveInputWidth(_ width: Int) -> Bool {
         width == 4096 || width == 8192
@@ -871,7 +896,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
             inDim == 8192
             && rsPairTable != nil
             && rsPairTable!.dtype == .float32
-            && rsPairTable!.shape == [batch, 2 * (inDim / Self.groupSize)]
+            && (rsPairTable!.shape == [batch, 2 * (inDim / Self.groupSize)]
+                || rsPairTable!.shape == [batch, 4 * (inDim / Self.groupSize)])
 
         if mma8Enabled {
             // One threadgroup per 8-column output tile; all eight cohort rows
@@ -886,8 +912,11 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
                 if unroll4Enabled {
                     CBv2EngageMark.once("oproj-ur4")
                 }
-                CBv2EngageMark.once("d512-ors-oproj-pairs")
-                return mma8Rsp2KernelK8192(
+                let quarterSums = rsPairTable!.dim(1) == 4 * (inDim / Self.groupSize)
+                CBv2EngageMark.once(
+                    quarterSums ? "d512-ors-oproj-quarters" : "d512-ors-oproj-pairs")
+                let kernel = quarterSums ? mma8Rsp4KernelK8192 : mma8Rsp2KernelK8192
+                return kernel(
                     [x, weight, scales, biases, rsPairTable!],
                     template: [("T", x.dtype)],
                     grid: (simdWidth, yTiles * simdGroups, 1),

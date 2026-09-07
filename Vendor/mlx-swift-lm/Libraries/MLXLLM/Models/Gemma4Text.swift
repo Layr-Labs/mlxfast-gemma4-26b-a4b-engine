@@ -6438,12 +6438,16 @@ public class Gemma4DecoderLayer: Module {
             // is materialised bf16 either way.
             var g = gemma4GeluProduct(gate(out), perLayerInput)
             g = proj(g)
-            // Same `residual + rmsNorm(x, w)` at 2816 and the same eps as the
-            // post-attention site, so the prefill fusion applies unchanged.
-            if let fusedPLE = Gemma4PrefillGlueV1.normResidual(
-                x: g, weight: norm.weight, residual: residual3,
-                eps: config.rmsNormEps)
-            {
+            // Same `residual + rmsNorm(x, w)` at 2816 and the same eps as
+            // the post-attention site. The decode helper admits B8/L1;
+            // the prefill helper remains the fallback for wider planes.
+            if let fusedPLE =
+                Gemma4FusedLayerGlue.normResidual(
+                    x: g, residual: residual3, weight: norm.weight,
+                    eps: config.rmsNormEps)
+                ?? Gemma4PrefillGlueV1.normResidual(
+                    x: g, weight: norm.weight, residual: residual3,
+                    eps: config.rmsNormEps)
                 out = fusedPLE
             } else {
                 g = norm(g)

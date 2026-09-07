@@ -3196,7 +3196,8 @@ public enum Gemma4MMAQuantizedGEMV {
     private static func relayoutReport(
         _ tag: String, candidate: MLXArray, incumbent: MLXArray
     ) {
-        let wordType: DType = candidate.dtype == .bfloat16 ? .uint16 : .uint32
+        let wordType: DType = candidate.dtype == .uint8
+            ? .uint8 : (candidate.dtype == .bfloat16 ? .uint16 : .uint32)
         let differing = sum(
             notEqual(candidate.view(dtype: wordType), incumbent.view(dtype: wordType))
         ).item(Int.self)
@@ -3371,7 +3372,7 @@ public enum Gemma4MMAQuantizedGEMV {
             raw.trimmingCharacters(in: .whitespaces).lowercased())
     }()
 
-    private static let logitslessCarryKeySuffix = logitslessCarryEnabled ? "_carry" : ""
+    private static let logitslessCarryKeySuffix = (logitslessCarryEnabled ? "_carry" : "") + "_pi8"
 
     /// The promoted version 27 with the vocabulary store replaced by an in-register top-1
     /// selection. The GEMV above is untouched, so what the reduction compares
@@ -3387,9 +3388,10 @@ public enum Gemma4MMAQuantizedGEMV {
     /// commutative, so the simd butterfly and the second stage return the same
     /// answer whatever order they visit partials in.
     ///
-    /// Each threadgroup emits one `(float, uint)` record per activation row
-    /// into `pv`/`pi`: `[8, N / 128]`, 128 KB at the tied head's geometry
-    /// against the 4 MB the logits store cost.
+    /// Each threadgroup emits one `(float, local_uint8)` record per activation
+    /// row into `pv`/`pi`: `[8, N / 128]`, 80 KiB at the tied head's geometry
+    /// against the 4 MiB the logits store cost. The record position identifies
+    /// its 128-column tile; stage two reconstructs the global token index.
     private static let sourceV27Argmax: String = {
         var result = logitslessCarryEnabled ? sourceV27Carry : sourceV27
 
@@ -3416,6 +3418,7 @@ public enum Gemma4MMAQuantizedGEMV {
             """,
             with: """
             constexpr uint TILES = uint(N) / (N_SG * N_PSG * 4);
+            static_assert(N_SG * N_PSG * 4 == 128, "Local-index tile must be 128 columns");
             threadgroup float bestVal[N_SG * M_ROWS];
             threadgroup uint bestIdx[N_SG * M_ROWS];
 
@@ -3472,7 +3475,8 @@ public enum Gemma4MMAQuantizedGEMV {
                     if (ov > rv || (ov == rv && oi < ri)) { rv = ov; ri = oi; }
                 }
                 pv[lid * TILES + tg] = rv;
-                pi[lid * TILES + tg] = ri;
+                // The record position already identifies n0 = 128 * tg.
+                pi[lid * TILES + tg] = uchar(ri - n0);
             }
             """
         )
@@ -3492,20 +3496,22 @@ public enum Gemma4MMAQuantizedGEMV {
     /// Stage two. One simdgroup per activation row folds that row's `NT`
     /// threadgroup records under the same total order and emits the token id.
     private static let argmaxReduceKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_head_argmax_reduce_v2_vec4",
+        name: "gemma4_mma_head_argmax_reduce_v2_vec4_pi8",
         inputNames: ["pv", "pi"],
         outputNames: ["tokens"],
         source: """
             const uint m = threadgroup_position_in_grid.x;
             const uint lane = thread_index_in_simdgroup;
             const device float4* pv4 = (const device float4*)(pv + m * uint(NT));
-            const device uint4* pi4 = (const device uint4*)(pi + m * uint(NT));
+            static_assert(COLS_PER_RECORD == 128, "Local-index tile must be 128 columns");
+            const device uchar4* pi4 = (const device uchar4*)(pi + m * uint(NT));
             float rv = -INFINITY;
             uint ri = 0xFFFFFFFFu;
             constexpr uint NT4 = uint(NT) / 4;
             for (uint i = lane; i < NT4; i += 32) {
                 const float4 ov = pv4[i];
-                const uint4 oi = pi4[i];
+                const uint4 records = uint4(i * 4u) + uint4(0u, 1u, 2u, 3u);
+                const uint4 oi = records * uint(COLS_PER_RECORD) + uint4(pi4[i]);
                 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
                     const float v = ov[e];
@@ -3617,7 +3623,7 @@ public enum Gemma4MMAQuantizedGEMV {
             grid: (threadgroups * threadsPerThreadgroup, 1, 1),
             threadGroup: (threadsPerThreadgroup, 1, 1),
             outputShapes: [[mRows * threadgroups], [mRows * threadgroups]],
-            outputDTypes: [.float32, .uint32]
+            outputDTypes: [.float32, .uint8]
         )
         if relayoutKernels != nil, relayoutXCheck {
             let reference = kernelV27Argmax(
@@ -3626,7 +3632,7 @@ public enum Gemma4MMAQuantizedGEMV {
                 grid: (threadgroups * threadsPerThreadgroup, 1, 1),
                 threadGroup: (threadsPerThreadgroup, 1, 1),
                 outputShapes: [[mRows * threadgroups], [mRows * threadgroups]],
-                outputDTypes: [.float32, .uint32]
+                outputDTypes: [.float32, .uint8]
             )
             relayoutReport("argmax pv", candidate: partials[0], incumbent: reference[0])
             relayoutReport("argmax pi", candidate: partials[1], incumbent: reference[1])
@@ -3634,7 +3640,7 @@ public enum Gemma4MMAQuantizedGEMV {
 
         return argmaxReduceKernel(
             [partials[0], partials[1]],
-            template: [("NT", threadgroups)],
+            template: [("NT", threadgroups), ("COLS_PER_RECORD", colsPerThreadgroup * 4)],
             grid: (mRows * 32, 1, 1),
             threadGroup: (32, 1, 1),
             outputShapes: [[mRows]],

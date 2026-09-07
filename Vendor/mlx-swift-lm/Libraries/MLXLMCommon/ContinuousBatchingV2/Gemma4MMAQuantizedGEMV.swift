@@ -3492,7 +3492,7 @@ public enum Gemma4MMAQuantizedGEMV {
     /// Stage two. One simdgroup per activation row folds that row's `NT`
     /// threadgroup records under the same total order and emits the token id.
     private static let argmaxReduceKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_head_argmax_reduce_v2_vec4",
+        name: "gemma4_mma_head_argmax_reduce_v3_max_min",
         inputNames: ["pv", "pi"],
         outputNames: ["tokens"],
         source: """
@@ -3513,11 +3513,11 @@ public enum Gemma4MMAQuantizedGEMV {
                     if (v > rv || (v == rv && idx < ri)) { rv = v; ri = idx; }
                 }
             }
-            for (ushort xm = 1; xm < 32; xm <<= 1) {
-                const float ov = simd_shuffle_xor(rv, xm);
-                const uint oi = simd_shuffle_xor(ri, xm);
-                if (ov > rv || (ov == rv && oi < ri)) { rv = ov; ri = oi; }
-            }
+            // The local fold starts at -INFINITY and never selects NaN.
+            // Lexicographic max(value, -index) factors into two reductions:
+            // the maximum value, then the minimum index among its ties.
+            const float best = simd_max(rv);
+            ri = simd_min(rv == best ? ri : 0xFFFFFFFFu);
             if (lane == 0) {
                 tokens[m] = int32_t(ri);
             }

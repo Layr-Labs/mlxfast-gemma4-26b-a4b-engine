@@ -62,6 +62,17 @@ public enum Gemma4DownTightGridV1 {
                 span: tileSpan)]
         }
 
+    private static let compiledGateUpDownTagged: @Sendable ([MLXArray]) -> [MLXArray] =
+        MLX.compile(shapeless: false) { inputs in
+            let activated = Gemma4DecodeFusedGUV1.call(
+                [inputs[0], inputs[1], inputs[2], inputs[6], inputs[7], inputs[8]],
+                taggedRoute: true)
+            return [Gemma4DownTightGridV1.call(
+                [inputs[3], inputs[4], inputs[5], activated, inputs[9], inputs[8]],
+                span: tileSpan,
+                taggedRoute: true)]
+        }
+
     /// Bound to the immutable sanitized checkpoint, like the fused gate/up storage.
     public final class Storage {
         private let weight: MLXArray
@@ -88,32 +99,36 @@ public enum Gemma4DownTightGridV1 {
         }
 
         /// The caller supplies the incumbent identity LHS and sorted RHS keys.
-        func call(x: MLXArray, lhsIndices: MLXArray, indices: MLXArray) -> MLXArray {
-            call(x: x, lhsIndices: lhsIndices, indices: indices, span: tileSpan)
+        func call(x: MLXArray, lhsIndices: MLXArray, indices: MLXArray, taggedRoute: Bool = false) -> MLXArray {
+            call(x: x, lhsIndices: lhsIndices, indices: indices, span: tileSpan, taggedRoute: taggedRoute)
         }
 
         func call(
-            x: MLXArray, lhsIndices: MLXArray, indices: MLXArray, span: Int
+            x: MLXArray, lhsIndices: MLXArray, indices: MLXArray, span: Int, taggedRoute: Bool = false
         ) -> MLXArray {
             Gemma4DownTightGridV1.call(
-                [weight, scales, biases, x, lhsIndices, indices], span: span)
+                [weight, scales, biases, x, lhsIndices, indices], span: span, taggedRoute: taggedRoute)
         }
 
         /// The caller has checked compiledGateUpAvailable and both projection
         /// contracts. Storage is read here, never captured by the compiled body.
         func callCompiledGateUp(
             x: MLXArray, storage: SwitchGateUpFusedStorage, lhs: MLXArray,
-            rhs: MLXArray, downLHS: MLXArray
+            rhs: MLXArray, downLHS: MLXArray, taggedRoute: Bool = false
         ) -> MLXArray? {
-            Gemma4DownTightGridV1.compiledGateUpDown(
+            let compiled = taggedRoute
+                ? Gemma4DownTightGridV1.compiledGateUpDownTagged
+                : Gemma4DownTightGridV1.compiledGateUpDown
+            return compiled(
                 [storage.weight, storage.scales, storage.biases, weight, scales, biases,
                  x, lhs, rhs, downLHS]).first
         }
     }
 
     /// Raw launch for callers that already passed the tight-DOWN contract.
-    static func call(_ inputs: [MLXArray], span: Int) -> MLXArray {
-        kernel(
+    static func call(_ inputs: [MLXArray], span: Int, taggedRoute: Bool = false) -> MLXArray {
+        let k = taggedRoute ? kernelTagged : kernel
+        return k(
             inputs,
             template: [("T", DType.bfloat16), ("SPAN", span)],
             grid: (32, (352 / span) * 2, 64), threadGroup: (32, 2, 1),
@@ -121,8 +136,11 @@ public enum Gemma4DownTightGridV1 {
         )[0]
     }
 
-    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_down_qmv_span4_tight_zorder_v1" + (packedWordLoads ? "_word32" : ""),
+    private static func makeKernel(tagged: Bool) -> MLXFast.MLXFastKernel {
+        MLXFast.metalKernel(
+            name: "gemma4_b8_down_qmv_span4_tight_zorder_v1"
+                + (packedWordLoads ? "_word32" : "")
+                + (tagged ? "_tagged" : ""),
         inputNames: ["w", "scales", "biases", "x", "lhs_indices", "rhs_indices"],
         outputNames: ["y"],
         source: #"""
@@ -139,7 +157,7 @@ gather_qmv_gemma4_down_tile<T, 64, 4, SPAN>(
     704, 2816 * 704 / 8, 2816 * 704 / 64, 2816 * 704 / 64,
     tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
 """#,
-        header: "#define DOWN_PACKED_WORD_LOAD \(packedWordLoads ? 1 : 0)\n" + #"""
+        header: "#define DOWN_TAGGED_ROUTE \(tagged ? 1 : 0)\n#define DOWN_PACKED_WORD_LOAD \(packedWordLoads ? 1 : 0)\n" + #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helper bodies verified byte-identical to 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -897,6 +915,15 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     return;
   }
   const uint assignment = tid.z;
+#if DOWN_TAGGED_ROUTE
+  const uint32_t route_word = rhs_indices[assignment * rhs_stride];
+  const uint32_t expert = route_word & 0xffu;
+  const uint run_offset = (route_word >> 8) & 0x3fu;
+  if ((run_offset & 1) != 0) {
+    return;
+  }
+  const bool has_pair = (((route_word >> 14) & 0x3fu) + 1u) > 1u;
+#else
   const uint32_t route_word = rhs_indices[assignment * rhs_stride];
   const bool expert_prefix_bounds = (route_word & 0x80000000u) != 0u;
   const uint32_t expert =
@@ -916,16 +943,17 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   if ((run_offset & 1) != 0) {
     return;
   }
+  const bool has_pair = expert_prefix_bounds
+      ? (((route_word >> 14) & 0x3fu) + 1u) > 1u
+      : assignment + 1 < 64 &&
+          rhs_indices[(assignment + 1) * rhs_stride] == expert;
+#endif
   const device uint32_t* tile_w = w + expert * w_stride;
   const device T* tile_scales = scales + expert * s_stride;
   const device T* tile_biases = biases + expert * b_stride;
   const device T* tile_x0 =
       x + lhs_indices[assignment * lhs_stride] * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;
-  const bool has_pair = expert_prefix_bounds
-      ? (((route_word >> 14) & 0x3fu) + 1u) > 1u
-      : assignment + 1 < 64 &&
-          rhs_indices[(assignment + 1) * rhs_stride] == expert;
   if (has_pair) {
     const device T* tile_x1 =
         x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
@@ -969,4 +997,8 @@ constant int gemma4_tight_down_K=704;
 constant int gemma4_tight_down_N=2816;
 """#,
         ensureRowContiguous: true)
+    }
+
+    private static let kernel: MLXFast.MLXFastKernel = makeKernel(tagged: false)
+    private static let kernelTagged: MLXFast.MLXFastKernel = makeKernel(tagged: true)
 }

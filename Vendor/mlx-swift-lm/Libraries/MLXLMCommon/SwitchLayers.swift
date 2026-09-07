@@ -1474,11 +1474,11 @@ public class SwitchGLU: Module {
         return storage
     }
 
-    private func tightDecodeDown(_ x: MLXArray, _ indices: MLXArray, sorted: Bool) -> MLXArray? {
+    private func tightDecodeDown(_ x: MLXArray, _ indices: MLXArray, sorted: Bool, taggedRoute: Bool = false) -> MLXArray? {
         guard let storage = resolveTightDownStorage(
             xShape: x.shape, xDType: x.dtype, indices: indices, sorted: sorted)
         else { return nil }
-        return storage.call(x: x, lhsIndices: switchDownIdentity64, indices: indices)
+        return storage.call(x: x, lhsIndices: switchDownIdentity64, indices: indices, taggedRoute: taggedRoute)
     }
 
     private var fusedGateUpStorage: SwitchGateUpFusedStorage?
@@ -1702,13 +1702,13 @@ public class SwitchGLU: Module {
                     xDType: Gemma4DecodeFusedGUV1.outputDType, indices: idx, sorted: true),
                 let output = down.callCompiledGateUp(
                     x: x, storage: fused.storage, lhs: lhsIndices,
-                    rhs: idx, downLHS: switchDownIdentity64)
+                    rhs: idx, downLHS: switchDownIdentity64, taggedRoute: useExpertPrefixBounds)
             {
                 return (output, inverseOrder, true)
             }
             let activated = Gemma4DecodeFusedGUV1.call(
-                x: x, storage: fused.storage, lhs: lhsIndices, rhs: idx)
-            let output = tightDecodeDown(activated, idx, sorted: true)
+                x: x, storage: fused.storage, lhs: lhsIndices, rhs: idx, taggedRoute: useExpertPrefixBounds)
+            let output = tightDecodeDown(activated, idx, sorted: true, taggedRoute: useExpertPrefixBounds)
                 ?? downProj(activated, idx, lhsIndices: switchDownIdentity64, sortedIndices: true)
             return (output, inverseOrder, true)
         }
@@ -1789,7 +1789,7 @@ public class SwitchGLU: Module {
         // which otherwise materializes the same arange(64) on every call.
         let downLhs: MLXArray? =
             (doSort && idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
-        x = tightDecodeDown(activated, idx, sorted: doSort)
+        x = tightDecodeDown(activated, idx, sorted: doSort, taggedRoute: useExpertPrefixBounds)
             ?? downProj(activated, idx, lhsIndices: downLhs, sortedIndices: doSort)
         // Under `doSort` a producer above always assigned `inverseOrder`;
         // otherwise it is still nil, which is exactly what the old

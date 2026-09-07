@@ -26,22 +26,26 @@ public enum Gemma4DecodeFusedGUV1 {
     }()
 
     static func call(x: MLXArray, storage: SwitchGateUpFusedStorage,
-        lhs: MLXArray, rhs: MLXArray) -> MLXArray {
-        call([storage.weight, storage.scales, storage.biases, x, lhs, rhs])
+        lhs: MLXArray, rhs: MLXArray, taggedRoute: Bool = false) -> MLXArray {
+        call([storage.weight, storage.scales, storage.biases, x, lhs, rhs], taggedRoute: taggedRoute)
     }
 
     /// Raw launch for callers that already passed the fused-GU contract.
-    static func call(_ inputs: [MLXArray]) -> MLXArray {
-        kernel(inputs,
+    static func call(_ inputs: [MLXArray], taggedRoute: Bool = false) -> MLXArray {
+        let k = taggedRoute ? kernelTagged : kernel
+        return k(inputs,
             grid: (32, 176 * 2, 64), threadGroup: (32, 2, 1),
             outputShapes: [outputShape], outputDTypes: [outputDType])[0]
     }
 
-    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_decode_gateup_geglu_threadgroup_v1",
-        inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"],
-        outputNames: ["y"],
-        source: #"""
+    private static func makeKernel(tagged: Bool) -> MLXFast.MLXFastKernel {
+        MLXFast.metalKernel(
+            name: tagged
+                ? "gemma4_b8_decode_gateup_geglu_threadgroup_tagged_v1"
+                : "gemma4_b8_decode_gateup_geglu_threadgroup_v1",
+            inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"],
+            outputNames: ["y"],
+            source: #"""
 uint3 tid=threadgroup_position_in_grid;
 uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
 
@@ -69,7 +73,7 @@ uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
     }
 
 """#,
-        header: "#define GU_RUN_CAP \(runCap)\n" + #"""
+        header: "#define GU_TAGGED_ROUTE \(tagged ? 1 : 0)\n#define GU_RUN_CAP \(runCap)\n" + #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helpers from 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -1122,8 +1126,15 @@ constant int guPairs=GU_PAIRS;
 #endif
 constant uint guRunCap=GU_RUN_CAP;
 constant int guK=2816,guN=704,guSliceN=8;
-struct ExpertRun { uint expert; uint count; bool leader; };
-METAL_FUNC ExpertRun expert_run(const device uint* rhs,uint assignment) {
+struct ExpertRun { uint expert; uint count; bool leader; };METAL_FUNC ExpertRun expert_run(const device uint* rhs,uint assignment) {
+#if GU_TAGGED_ROUTE
+    const uint word=rhs[assignment];
+    const uint expert=word&0xffu;
+    const uint offset=(word>>8)&0x3fu;
+    if(guRunCap>1u && (offset&(guRunCap-1u))!=0u)return {expert,0,false};
+    const uint count=min(guRunCap,((word>>14)&0x3fu)+1u);
+    return {expert,count,true};
+#else
     const uint word=rhs[assignment];const bool tagged=(word&0x80000000u)!=0u;
     const uint expert=tagged ? word&0xffu:word;
     uint offset=0;
@@ -1134,11 +1145,12 @@ METAL_FUNC ExpertRun expert_run(const device uint* rhs,uint assignment) {
     if(tagged)count=min(guRunCap,((word>>14)&0x3fu)+1u);
     else while(count<guRunCap && assignment+count<64 && rhs[assignment+count]==expert)++count;
     return {expert,count,true};
+#endif
 }
 template<typename T>
 METAL_FUNC void tg_execute_projection(const device uint* w,const device T* scales,const device T* biases,
     const device T* x,const device uint* lhs,threadgroup T* y0,int rowStride,
-    const constant int& outputN,uint assignment,uint count,uint3 tid,uint sg,uint lane) {
+    const constant int& outputN,uint assignment,uint count,uint tid,uint sg,uint lane) {
     const device T* x0=x+lhs[assignment]*2816;
     if(count==1){tg_qmv_impl<T,64,4>(w,scales,biases,x0,y0,guK,outputN,tid,sg,lane);return;}
     const device T* x1=x+lhs[assignment+1]*2816;threadgroup T* y1=y0+rowStride;
@@ -1155,4 +1167,8 @@ METAL_FUNC void tg_execute_projection(const device uint* w,const device T* scale
 
 """#,
         ensureRowContiguous: true)
+    }
+
+    private static let kernel: MLXFast.MLXFastKernel = makeKernel(tagged: false)
+    private static let kernelTagged: MLXFast.MLXFastKernel = makeKernel(tagged: true)
 }

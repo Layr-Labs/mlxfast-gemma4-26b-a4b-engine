@@ -2536,6 +2536,14 @@ public enum Gemma4MMAQuantizedGEMV {
     /// block has four groups. Iterate `gg < 8`, `continue` the four-group
     /// tail, and fully unroll both loops. The named metallib key changes so a
     /// stale v26 body cannot keep serving the runtime-bounded trip.
+    /// Bound the compiled instruction footprint to one eight-group affine
+    /// block. The outer walk still visits every group and closes its bias MMA
+    /// at the same points; all inner unrolling and carry updates stay intact.
+    /// The switch restores the fully unrolled source and its existing keys.
+    private static let countedAffineBlocks =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_HEAD_COUNTED_BLOCKS"] != "0"
+    private static let affineBlockKeySuffix = countedAffineBlocks ? "_counted_blocks_v1" : ""
+
     private static let sourceV27: String = {
         var result = sourceV26
 
@@ -2562,11 +2570,17 @@ public enum Gemma4MMAQuantizedGEMV {
             """
         )
 
+        if countedAffineBlocks {
+            let fullUnroll = "#pragma unroll\nfor (uint biasBlock = 0; biasBlock < N_GROUPS; biasBlock += 8) {"
+            let counted = "#pragma clang loop unroll(disable)\nfor (uint biasBlock = 0; biasBlock < N_GROUPS; biasBlock += 8) {"
+            precondition(result.components(separatedBy: fullUnroll).count == 2)
+            result = result.replacingOccurrences(of: fullUnroll, with: counted)
+        }
         return result
     }()
 
     private static let kernelV27: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1",
+        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1" + affineBlockKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["out"],
         source: sourceV27,
@@ -2750,7 +2764,7 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27Carry: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2",
+        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2" + affineBlockKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["out"],
         source: sourceV27Carry,
@@ -3141,21 +3155,21 @@ public enum Gemma4MMAQuantizedGEMV {
 
         return RelayoutKernels(
             logits: MLXFast.metalKernel(
-                name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1_rl1",
+                name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1_rl1" + affineBlockKeySuffix,
                 inputNames: ["x", "w", "scales", "biases", "xSums"],
                 outputNames: ["out"],
                 source: logits,
                 header: "#include <metal_simdgroup_matrix>\n",
                 ensureRowContiguous: true),
             carry: MLXFast.metalKernel(
-                name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2_rl1",
+                name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2_rl1" + affineBlockKeySuffix,
                 inputNames: ["x", "w", "scales", "biases", "xSums"],
                 outputNames: ["out"],
                 source: carry,
                 header: "#include <metal_simdgroup_matrix>\n",
                 ensureRowContiguous: true),
             argmax: MLXFast.metalKernel(
-                name: "gemma4_mma_affine4_qmv_m8_v27_argmax_rl1"
+                name: "gemma4_mma_affine4_qmv_m8_v27_argmax_rl1" + affineBlockKeySuffix
                     + logitslessCarryKeySuffix,
                 inputNames: ["x", "w", "scales", "biases", "xSums"],
                 outputNames: ["pv", "pi"],
@@ -3481,7 +3495,7 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27Argmax: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_argmax" + logitslessCarryKeySuffix,
+        name: "gemma4_mma_affine4_qmv_m8_v27_argmax" + affineBlockKeySuffix + logitslessCarryKeySuffix,
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["pv", "pi"],
         source: sourceV27Argmax,

@@ -988,6 +988,15 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         fusedLock.unlock()
         guard let (fw, fs, fb) = plane else { return nil }
 
+        if tableReady && compiledRSPAvailable {
+            let compiled = qWidth == 4096 ? compiledRSPSliding : compiledRSPFull
+            let projected = compiled([x, fw, fs, fb, rsTable!])
+            if projected.count == 2 {
+                CBv2EngageMark.once("qkv-compiled-rsp")
+                return (projected[0], projected[1])
+            }
+        }
+
         let outputs = kernel(
             tableReady ? [x, fw, fs, fb, rsTable!] : [x, fw, fs, fb],
             template: [("T", x.dtype)],
@@ -1002,6 +1011,42 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     private static func liveFusedSplit(_ width: Int) -> Bool {
         width == 4096 || width == 8192
     }
+
+    private static let compiledRSPEnabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_COMPILED_RSP_V1"]
+        return raw.map {
+            !["0", "false", "no", "off"].contains(
+                $0.trimmingCharacters(in: .whitespaces).lowercased())
+        } ?? true
+    }()
+
+    // Check the task-local stream before entering a cached GPU trace.
+    private static var compiledRSPAvailable: Bool {
+        compiledRSPEnabled && StreamOrDevice.default == .gpu
+    }
+
+    /// Cache only an operation graph. Every tensor remains a call argument;
+    /// the unchanged admission predicates bound the traced shape signatures.
+    private static func makeCompiledRSP(
+        kernel: MLXFast.MLXFastKernel, split: Int
+    ) -> @Sendable ([MLXArray]) -> [MLXArray] {
+        compile(shapeless: false) { (args: [MLXArray]) -> [MLXArray] in
+            precondition(args.count==5)
+            let width=args[1].dim(0)
+            let shapes=split==0 ? [[8,1,width]]:[[8,1,split],[8,1,width-split]]
+            return kernel(args,template:[("T",args[0].dtype)],
+                grid:(32,(width/16)*2,1),threadGroup:(32,2,1),
+                outputShapes:shapes,outputDTypes:Array(repeating:args[0].dtype,count:shapes.count))
+        }
+    }
+
+    private static let compiledRSPPlain = makeCompiledRSP(
+        kernel: multiTileRspKernel, split: 0)
+    private static let compiledRSPSliding = makeCompiledRSP(
+        kernel: fusedSlidingRspKernel, split: 4096)
+    private static let compiledRSPFull = makeCompiledRSP(
+        kernel: fusedFullRspKernel, split: 8192)
 
     private static func liveOutputWidth(_ width: Int) -> Bool {
         width == 1024 || width == 2048 || width == 4096 || width == 8192
@@ -1049,6 +1094,13 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         let yTiles = outputWidth / outputsPerGroup
         if multiTileEnabled, yTiles % tilesPerGroup == 0 {
             if tableReady {
+                if compiledRSPAvailable,
+                    let projected = compiledRSPPlain(
+                        [x, weight, scales, biases, rsTable!]).first
+                {
+                    CBv2EngageMark.once("qkv-compiled-rsp")
+                    return projected
+                }
                 return multiTileRspKernel(
                     [x, weight, scales, biases, rsTable!],
                     template: [("T", x.dtype)],

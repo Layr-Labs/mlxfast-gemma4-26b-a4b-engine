@@ -172,6 +172,36 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    private static let compiledDenseEnabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DENSE_COMPILED_DISPATCH_V1"]
+        return raw.map {
+            !["0", "false", "no", "off"].contains(
+                $0.trimmingCharacters(in: .whitespaces).lowercased())
+        } ?? true
+    }()
+
+    // Preserve task-local stream selection outside the reusable GPU graph.
+    private static var compiledDenseAvailable: Bool {
+        compiledDenseEnabled && StreamOrDevice.default == .gpu
+    }
+
+    private static func makeCompiledDense(
+        kernel: MLXFast.MLXFastKernel, width: Int
+    ) -> @Sendable ([MLXArray]) -> [MLXArray] {
+        compile(shapeless: false) { (args: [MLXArray]) -> [MLXArray] in
+            precondition(args.count==4)
+            return kernel(args,template:[("T",args[0].dtype)],
+                grid:(32,(width/8)*2,1),threadGroup:(32,2,1),
+                outputShapes:[[8,1,width]],outputDTypes:[args[0].dtype])
+        }
+    }
+
+    private static let compiledDenseGateUp = makeCompiledDense(
+        kernel: mma8GateUpGeluKernel, width: 2112)
+    private static let compiledDenseDown = makeCompiledDense(
+        kernel: mma8DownStaticKNKernel, width: 2816)
+
     private static let batch = 8
     private static let sequence = 1
     private static let groupSize = 64
@@ -1103,6 +1133,12 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
             biases.shape == scales.shape
         else { return nil }
         CBv2EngageMark.once("dense-gelu-epilogue-decode")
+        if compiledDenseAvailable,
+            let projected = compiledDenseGateUp([x, weight, scales, biases]).first
+        {
+            CBv2EngageMark.once("dense-compiled-dispatch")
+            return projected
+        }
         let yTiles = 2112 / outputsPerGroup
         return mma8GateUpGeluKernel(
             [x, weight, scales, biases],
@@ -1590,6 +1626,12 @@ inline U qdot_affine8_registered_v4(
             } else {
                 if mma8DownStaticKEnabled && mma8DownStaticNEnabled {
                     CBv2EngageMark.once("mlp-down-static-n")
+                    if compiledDenseAvailable,
+                        let projected = compiledDenseDown([x, weight, scales, biases]).first
+                    {
+                        CBv2EngageMark.once("dense-compiled-dispatch")
+                        return projected
+                    }
                     return mma8DownStaticKNKernel(
                         [x, weight, scales, biases],
                         template: [("T", x.dtype)],

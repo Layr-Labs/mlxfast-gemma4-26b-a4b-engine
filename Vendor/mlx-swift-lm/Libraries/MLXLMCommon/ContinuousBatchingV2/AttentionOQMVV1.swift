@@ -32,6 +32,39 @@ public enum CBv2AttentionOQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    private static let compiledOEnabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_OPROJ_COMPILED_DISPATCH_V1"]
+        return raw.map {
+            !["0", "false", "no", "off"].contains(
+                $0.trimmingCharacters(in: .whitespaces).lowercased())
+        } ?? true
+    }()
+
+    // Check the task-local stream on every call, outside the cached GPU graph.
+    private static var compiledOAvailable: Bool {
+        compiledOEnabled && StreamOrDevice.default == .gpu
+    }
+
+    /// Cache operations only; all five tensors are explicit dynamic arguments.
+    private static func makeCompiledO(
+        kernel: MLXFast.MLXFastKernel, width: Int
+    ) -> @Sendable ([MLXArray]) -> [MLXArray] {
+        compile(shapeless: false) { (args: [MLXArray]) -> [MLXArray] in
+            precondition(args.count==5)
+            return kernel(args,template:[("T",args[0].dtype)],
+                grid:(32,(width/8)*2,1),threadGroup:(32,2,1),
+                outputShapes:[[8,1,width]],outputDTypes:[args[0].dtype])
+        }
+    }
+
+    private static let compiledORSP4096 = makeCompiledO(
+        kernel: mma8RspStaticNKernelK4096, width: 2816)
+    private static let compiledORSP8192 = makeCompiledO(
+        kernel: mma8RspStaticNKernelK8192, width: 2816)
+    private static let compiledORSP2 = makeCompiledO(
+        kernel: mma8Rsp2StaticNKernelK8192, width: 2816)
+
     private static let batch = 8
     private static let sequence = 1
     private static let outputWidth = 2816
@@ -971,6 +1004,13 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
                 CBv2EngageMark.once("d512-ors-oproj-pairs")
                 if staticNEnabled {
                     CBv2EngageMark.once("oproj-static-n")
+                    if compiledOAvailable,
+                        let projected = compiledORSP2(
+                            [x, weight, scales, biases, rsPairTable!]).first
+                    {
+                        CBv2EngageMark.once("oproj-compiled-dispatch")
+                        return projected
+                    }
                     return mma8Rsp2StaticNKernelK8192(
                         [x, weight, scales, biases, rsPairTable!],
                         template: [("T", x.dtype)],
@@ -998,6 +1038,13 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
                 }
                 if staticNEnabled {
                     CBv2EngageMark.once("oproj-static-n")
+                    if compiledOAvailable {
+                        let compiled = inDim == 8192 ? compiledORSP8192 : compiledORSP4096
+                        if let projected = compiled([x, weight, scales, biases, rsTable!]).first {
+                            CBv2EngageMark.once("oproj-compiled-dispatch")
+                            return projected
+                        }
+                    }
                     let staticNKernel = inDim == 8192
                         ? mma8RspStaticNKernelK8192 : mma8RspStaticNKernelK4096
                     return staticNKernel(

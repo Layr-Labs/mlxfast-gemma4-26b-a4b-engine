@@ -310,6 +310,19 @@ extension CBv2LayerCache: KVCache {
         return arrays
     }
 
+    /// Same roots and ordering as `innerState()`, appended directly to the
+    /// caller's buffer. This retains duplicate shared offsets and pooled K/V
+    /// deliberately: it changes host collection, not graph-root semantics.
+    func appendInnerState(to arrays: inout [MLXArray]) {
+        arrays.append(positionOffsetsState.value)
+        arrays.append(decodeRingWriteFence.value)
+        for row in rows {
+            if let provider = row as? CBv2InnerStateProviding {
+                provider.appendCBv2InnerState(to: &arrays)
+            }
+        }
+    }
+
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         fatalError(
             "CBv2LayerCache.update(keys:values:) is unsupported — v2-adapted models must call updateAndAttend (layer \(layerIndex))"

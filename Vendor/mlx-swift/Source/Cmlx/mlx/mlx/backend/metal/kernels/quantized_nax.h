@@ -1937,23 +1937,31 @@ template <
         // occupy the physical prefix of the ordinary 1408-wide allocation.
         if (gemma4_gather_rhs_geglu) {
           static_assert(TN % 2 == 0, "GeGLU epilogue requires paired fragments");
-          NAXTile<AccumType, TM, TN / 2> Otile;
-          const_for_loop<0, TM, 1>([&](auto mm) {
-            const_for_loop<0, TN / 2, 1>([&](auto nn) {
-              thread auto& gate =
-                  Dtile.frag_at(short(mm), short(nn) * 2);
-              thread auto& up =
-                  Dtile.frag_at(short(mm), short(nn) * 2 + 1);
-              thread auto& out = Otile.frag_at(short(mm), short(nn));
-              STEEL_PRAGMA_UNROLL
-              for (short i = 0; i < Dtile.kElemsPerFrag; ++i) {
-                const T g = static_cast<T>(gate[i]);
-                const T u = static_cast<T>(up[i]);
-                out[i] = float(gemma4_geglu_compiled_tape(g, u));
-              }
-            });
-          });
+          // Only this segment's stored fragment rows need the typed GeGLU
+          // tape. The segment bounds are simdgroup-uniform, and this close
+          // uses private accumulators only: no MMA, shared write or barrier
+          // is skipped. store_slice never reads a wholly excluded fragment.
           if (!seg_empty) {
+            NAXTile<AccumType, TM, TN / 2> Otile;
+            const_for_loop<0, TM, 1>([&](auto mm) {
+              const short fr = short(mm * Dtile.kFragRows);
+              if (fr >= seg_hi || short(fr + Dtile.kFragRows) <= seg_lo) {
+                return;
+              }
+              const_for_loop<0, TN / 2, 1>([&](auto nn) {
+                thread auto& gate =
+                    Dtile.frag_at(short(mm), short(nn) * 2);
+                thread auto& up =
+                    Dtile.frag_at(short(mm), short(nn) * 2 + 1);
+                thread auto& out = Otile.frag_at(short(mm), short(nn));
+                STEEL_PRAGMA_UNROLL
+                for (short i = 0; i < Dtile.kElemsPerFrag; ++i) {
+                  const T g = static_cast<T>(gate[i]);
+                  const T u = static_cast<T>(up[i]);
+                  out[i] = float(gemma4_geglu_compiled_tape(g, u));
+                }
+              });
+            });
             device T* compact_y =
                 y - y_row_long * N - y_col_long +
                 y_row_long * (N / 2) + size_t(tid.x) * (BN / 2) +

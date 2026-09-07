@@ -57,6 +57,17 @@ public enum CBv2CoreInstrumentation {
 /// unconsumed lazy chain may grow O(steps) — DAR-325).
 protocol CBv2InnerStateProviding {
     func cbv2InnerState() -> [MLXArray]
+
+    /// Append the same ordered roots without creating an intermediate array.
+    /// The default preserves existing providers; live contiguous rows override
+    /// it because the engine visits every row at every decode submission.
+    func appendCBv2InnerState(to arrays: inout [MLXArray])
+}
+
+extension CBv2InnerStateProviding {
+    func appendCBv2InnerState(to arrays: inout [MLXArray]) {
+        arrays.append(contentsOf: cbv2InnerState())
+    }
 }
 
 /// ATT-008: shared batch-wide K/V storage for a lockstep decode cohort of
@@ -413,6 +424,16 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
             return [pool.keys, pool.values]
         }
         return [keys, values].compactMap { $0 }
+    }
+
+    func appendCBv2InnerState(to arrays: inout [MLXArray]) {
+        if let pool = cohortPool {
+            arrays.append(pool.keys)
+            arrays.append(pool.values)
+        } else {
+            if let keys { arrays.append(keys) }
+            if let values { arrays.append(values) }
+        }
     }
 
     // MARK: - ATT-008 cohort pooling

@@ -6078,6 +6078,52 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         """,
         ensureRowContiguous: true)
 
+    /// D512-SIMD-RMS: the four RMS partials are written once, then each
+    /// SIMD group repeats the same 32-lane second reduction and lane-zero
+    /// precise inverse. This removes the zero-fill and inverse-publication
+    /// barriers without changing the reduction tree or BF16 boundaries.
+    /// Off selects the original source and kernel name for same-binary A/B.
+    private static let d512SIMDRMSEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_SIMD_RMS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let ringStoreNormRopeReduction = d512SIMDRMSEnabled
+        ? """
+            threadgroup float partials[4];
+            threadgroup T rounded[D];
+            if (lane == 0) partials[simd_group] = sum;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Feed every SIMD group the incumbent's same 32-lane vector:
+            // four row partials followed by 28 positive zeros. Repeating
+            // the exact tree avoids publishing one shared inverse RMS.
+            sum = simd_sum(lane < 4 ? partials[lane] : 0.0f);
+            float inverse_rms = 0.0f;
+            if (lane == 0) {
+                inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+            }
+            inverse_rms = simd_shuffle(inverse_rms, ushort(0));
+            """
+        : """
+            threadgroup float partials[32];
+            threadgroup float inverse_rms;
+            threadgroup T rounded[D];
+            if (simd_group == 0) partials[lane] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) partials[simd_group] = sum;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group == 0) {
+                sum = simd_sum(partials[lane]);
+                if (lane == 0) {
+                    inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            """
+
     /// NORMROPE-D512: the WRITE-022 store dispatch with the full layers' Q/K
     /// RMSNorm + RoPE folded in, so the standalone
     /// `gemma4_b8_qkv_rms_norm_rope_v2_vec1` dispatch leaves the chain.
@@ -6103,7 +6149,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// slot receives the K row the standalone kernel would have handed the
     /// incumbent store, so dispatches 1...3 read identical bytes.
     private static let ringStoreNormRopeKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1",
+        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1"
+            + (d512SIMDRMSEnabled ? "_simdrms_v1" : ""),
         inputNames: [
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -6175,20 +6222,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             }
             sum = simd_sum(sum);
 
-            threadgroup float partials[32];
-            threadgroup float inverse_rms;
-            threadgroup T rounded[D];
-            if (simd_group == 0) partials[lane] = 0.0f;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (lane == 0) partials[simd_group] = sum;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group == 0) {
-                sum = simd_sum(partials[lane]);
-                if (lane == 0) {
-                    inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            \(ringStoreNormRopeReduction)
 
             const T4 wv = *reinterpret_cast<const device T4*>(weight);
             for (int i = 0; i < reads; ++i) {

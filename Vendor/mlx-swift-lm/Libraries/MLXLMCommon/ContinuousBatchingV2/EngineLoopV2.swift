@@ -57,6 +57,15 @@ internal func resolveCBv2CompactDecodeRootsEnabled(_ raw: String?) -> Bool {
 private let cbv2CompactDecodeRootsEnabled = resolveCBv2CompactDecodeRootsEnabled(
     ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_COMPACT_DECODE_ROOTS"])
 
+/// Stream the full cache-root list into one buffer. Unlike decode-root
+/// compaction, this drops no root and requires no model capability proof.
+/// The off switch restores the incumbent nested array collection verbatim.
+private let cbv2AppendCacheRootsEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_APPEND_CACHE_ROOTS"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Builds per-layer batch-facing cache views for a set of rows
 /// (`rowStates[b][layer]`, row order == batch row order). WS-A's
 /// `LayerCacheV2` conforms; see CONTRACT-ISSUES-B-scheduler.md §1.
@@ -1331,7 +1340,22 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// of unevaluated graph — the DAR-325 bug class (legacy `BatchKVCache`
     /// had exactly this). Empty for caches that vend no inner state (mocks).
     func eagerCacheInnerState(_ caches: [CBv2AttendingLayerCache]) -> [MLXArray] {
-        caches.flatMap { ($0 as? KVCache)?.innerState() ?? [] }
+        guard cbv2AppendCacheRootsEnabled else {
+            return caches.flatMap { ($0 as? KVCache)?.innerState() ?? [] }
+        }
+        var arrays: [MLXArray] = []
+        // Two layer roots plus at most three roots per live contiguous row.
+        // This is only a capacity hint; mixed/custom providers may append more.
+        let rowCount = (caches.first as? CBv2LayerCache)?.rows.count ?? 0
+        arrays.reserveCapacity(caches.count * (2 + 3 * rowCount))
+        for cache in caches {
+            if let contiguous = cache as? CBv2LayerCache {
+                contiguous.appendInnerState(to: &arrays)
+            } else if let legacy = cache as? KVCache {
+                arrays.append(contentsOf: legacy.innerState())
+            }
+        }
+        return arrays
     }
 
     /// Decode-only counterpart to `eagerCacheInnerState`. The MODEL, not just

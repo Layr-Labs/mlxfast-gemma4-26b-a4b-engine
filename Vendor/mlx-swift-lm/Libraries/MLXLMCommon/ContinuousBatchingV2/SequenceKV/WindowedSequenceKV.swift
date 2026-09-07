@@ -594,6 +594,12 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         [keys, values, quantMirror].compactMap { $0 }
     }
 
+    func appendCBv2InnerState(to arrays: inout [MLXArray]) {
+        if let keys { arrays.append(keys) }
+        if let values { arrays.append(values) }
+        if let quantMirror { arrays.append(quantMirror) }
+    }
+
     // MARK: - Ring geometry
 
     private func writeDecodeToken(keys newKeys: MLXArray, values newValues: MLXArray) {

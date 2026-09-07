@@ -1,16 +1,7 @@
-namespace mlx::core::metal {
-
-const char* steel_attention_nax() {
-  return R"preamble(
-// Copyright © 2025 Apple Inc.
-
-// Auto generated source for mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.h
-
-///////////////////////////////////////////////////////////////////////////////
-// Contents from "mlx/backend/metal/kernels/steel/defines.h"
-///////////////////////////////////////////////////////////////////////////////
-
-#line 1 "mlx/backend/metal/kernels/steel/defines.h"
+// Copyright © 2023-2024 Apple Inc.
+// Pinned steel NAX helpers and quantized loader used by the expert task launch.
+enum CBv2ExpertPrefillNAXSourceV1 {
+    static let header = #"""
 // Copyright © 2024 Apple Inc.
 
 
@@ -18,17 +9,6 @@ const char* steel_attention_nax() {
 #define STEEL_PRAGMA_UNROLL _Pragma("clang loop unroll(full)")
 #define STEEL_PRAGMA_NO_UNROLL _Pragma("clang loop unroll(disable)")
 
-///////////////////////////////////////////////////////////////////////////////
-// Contents from "/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v17.5.188.0.9CLJ6d/Metal.xctoolchain/usr/metal/32023/lib/clang/32023.883/include/metal/__exec/units.h"
-///////////////////////////////////////////////////////////////////////////////
-
-#line 1 "/private/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v17.5.188.0.9CLJ6d/Metal.xctoolchain/usr/metal/32023/lib/clang/32023.883/include/metal/__exec/units.h"
-
-///////////////////////////////////////////////////////////////////////////////
-// Contents from "mlx/backend/metal/kernels/steel/utils/type_traits.h"
-///////////////////////////////////////////////////////////////////////////////
-
-#line 1 "mlx/backend/metal/kernels/steel/utils/type_traits.h"
 // Copyright © 2024 Apple Inc.
 
 
@@ -84,11 +64,6 @@ using pointer_element_t = typename pointer_element<remove_cv_t<T>>::type;
 
 #pragma METAL internals : disable
 
-///////////////////////////////////////////////////////////////////////////////
-// Contents from "mlx/backend/metal/kernels/steel/utils/integral_constant.h"
-///////////////////////////////////////////////////////////////////////////////
-
-#line 1 "mlx/backend/metal/kernels/steel/utils/integral_constant.h"
 // Copyright © 2024 Apple Inc.
 
 
@@ -218,11 +193,6 @@ METAL_FUNC constexpr auto sum(T x, Us... us) {
 
 #pragma METAL internals : disable
 
-///////////////////////////////////////////////////////////////////////////////
-// Contents from "mlx/backend/metal/kernels/steel/attn/nax.h"
-///////////////////////////////////////////////////////////////////////////////
-
-#line 1 "mlx/backend/metal/kernels/steel/attn/nax.h"
 // Copyright © 2025 Apple Inc.
 
 
@@ -1108,663 +1078,248 @@ METAL_FUNC void tile_matmad_nax(
 } // namespace steel
 } // namespace mlx
 
-///////////////////////////////////////////////////////////////////////////////
-// Contents from "mlx/backend/metal/kernels/steel/attn/params.h"
-///////////////////////////////////////////////////////////////////////////////
-
-#line 1 "mlx/backend/metal/kernels/steel/attn/params.h"
-// Copyright © 2024 Apple Inc.
-
-
-///////////////////////////////////////////////////////////////////////////////
-// Attn param classes
-///////////////////////////////////////////////////////////////////////////////
-
-namespace mlx {
-namespace steel {
-
-struct AttnParams {
-  int B; ///< Batch Size
-  int H; ///< Heads
-  int D; ///< Head Dim
-
-  int qL; ///< Query Sequence Length
-  int kL; ///< Key Sequence Length
-
-  int gqa_factor; ///< Group Query factor
-  float scale; ///< Attention scale
-
-  int NQ; ///< Number of query blocks
-  int NK; ///< Number of key/value blocks
-
-  int NQ_aligned; ///< Number of full query blocks
-  int NK_aligned; ///< Number of full key/value blocks
-
-  int qL_rem; ///< Remainder in last query block
-  int kL_rem; ///< Remainder in last key/value block
-  int qL_off; ///< Offset in query sequence start
-
-  int64_t Q_strides[3]; ///< Query  strides (B, H, L, D = 1)
-  int64_t K_strides[3]; ///< Key    strides (B, H, L, D = 1)
-  int64_t V_strides[3]; ///< Value  strides (B, H, L, D = 1)
-  int64_t O_strides[3]; ///< Output strides (B, H, L, D = 1)
-};
-
-struct AttnMaskParams {
-  int64_t M_strides[3]; ///< Mask  strides (B, H, qL, kL = 1)
-};
-
-} // namespace steel
-} // namespace mlx
-
-///////////////////////////////////////////////////////////////////////////////
-// Contents from "mlx/backend/metal/kernels/steel/utils.h"
-///////////////////////////////////////////////////////////////////////////////
-
-#line 1 "mlx/backend/metal/kernels/steel/utils.h"
-// Copyright © 2024 Apple Inc.
-
-
-#include <metal_stdlib>
-
-METAL_FUNC ulong2 elem_to_loc_broadcast(
-    uint elem,
-    constant const int* shape,
-    constant const int64_t* a_strides,
-    constant const int64_t* b_strides,
-    int ndim) {
-  ulong loc_a{0};
-  ulong loc_b{0};
-  for (int i = ndim - 1; i >= 0 && elem > 0; --i) {
-    int pos_in_dim = (elem % shape[i]);
-    elem /= shape[i];
-    loc_a += pos_in_dim * a_strides[i];
-    loc_b += pos_in_dim * b_strides[i];
-  }
-  return ulong2(loc_a, loc_b);
-}
-
-METAL_FUNC ulong3 elem_to_loc_broadcast(
-    uint elem,
-    constant const int* shape,
-    constant const int64_t* a_strides,
-    constant const int64_t* b_strides,
-    constant const int64_t* c_strides,
-    int ndim) {
-  ulong loc_a{0};
-  ulong loc_b{0};
-  ulong loc_c{0};
-  for (int i = ndim - 1; i >= 0 && elem > 0; --i) {
-    int pos_in_dim = (elem % shape[i]);
-    elem /= shape[i];
-    loc_a += pos_in_dim * a_strides[i];
-    loc_b += pos_in_dim * b_strides[i];
-    loc_c += pos_in_dim * c_strides[i];
-  }
-  return ulong3(loc_a, loc_b, loc_c);
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// Contents from "mlx/backend/metal/kernels/steel/attn/transforms.h"
-///////////////////////////////////////////////////////////////////////////////
-
-#line 1 "mlx/backend/metal/kernels/steel/attn/transforms.h"
-// Copyright © 2024 Apple Inc.
-
-
-
-///////////////////////////////////////////////////////////////////////////////
-// Transforms and Epilogues
-///////////////////////////////////////////////////////////////////////////////
-
-namespace mlx {
-namespace steel {
-
-template <typename OutT, typename InT>
-struct TransformNone {
-  static METAL_FUNC OutT apply(InT x) {
-    return static_cast<OutT>(x);
-  }
-
-  static METAL_FUNC OutT apply(InT x, OutT) {
-    return static_cast<OutT>(x);
-  }
-};
-
-template <typename OutT, typename InT>
-struct TransformAdd {
-  TransformAdd(const float, const float) {}
-
-  static METAL_FUNC OutT apply(InT x) {
-    return static_cast<OutT>(x);
-  }
-
-  static METAL_FUNC OutT apply(InT x, OutT c) {
-    return static_cast<OutT>(x) + c;
-  }
-};
-
-template <typename OutT, typename InT>
-struct TransformAxpby {
-  const float alpha;
-  const float beta;
-
-  TransformAxpby(const float alpha_, const float beta_)
-      : alpha(alpha_), beta(beta_) {}
-
-  static METAL_FUNC OutT apply(InT x) {
-    return static_cast<OutT>(x);
-  }
-
-  METAL_FUNC OutT apply(InT x, OutT c) const {
-    return static_cast<OutT>(x * alpha + (beta * c));
-  }
-};
-
-template <typename T>
-struct AccumHelper {
-  typedef float accum_type;
-};
-
-struct BlockSwizzle {
-  static METAL_FUNC int2
-  swizzle(uint3 tid [[threadgroup_position_in_grid]], const int swizzle_log) {
-    const int tid_x = (tid.x) >> swizzle_log;
-    const int tid_y =
-        ((tid.y) << swizzle_log) + ((tid.x) & ((1 << swizzle_log) - 1));
-    return int2(tid_x, tid_y);
-  }
-};
-
-} // namespace steel
-} // namespace mlx
-
-///////////////////////////////////////////////////////////////////////////////
-// Contents from "mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.h"
-///////////////////////////////////////////////////////////////////////////////
-
-#line 1 "mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.h"
-// Copyright © 2024-25 Apple Inc.
-
 
 using namespace mlx::steel;
-
-///////////////////////////////////////////////////////////////////////////////
-// GEMM kernels
-///////////////////////////////////////////////////////////////////////////////
-
-constant bool align_Q [[function_constant(200)]];
-constant bool align_K [[function_constant(201)]];
-
-constant bool has_mask [[function_constant(300)]];
-constant bool do_causal [[function_constant(301)]];
-constant bool has_sinks [[function_constant(302)]];
-
 template <typename T>
-struct TransformScale {
-  T scale;
-  METAL_FUNC TransformScale(T scale_) : scale(scale_) {}
+inline T gemma4_geglu_compiled_tape(T gate, T up) {
+  const T cubic_0 = static_cast<T>(static_cast<T>(0.044715f) * gate);
+  const T cubic_1 = static_cast<T>(cubic_0 * gate);
+  const T cubic_2 = static_cast<T>(cubic_1 * gate);
+  const T inner = static_cast<T>(gate + cubic_2);
+  const T scaled =
+      static_cast<T>(static_cast<T>(0.7978845608028654f) * inner);
+  const T curved = metal::precise::tanh(scaled);
+  const T shifted = static_cast<T>(static_cast<T>(1.0f) + curved);
+  const T half_gate = static_cast<T>(static_cast<T>(0.5f) * gate);
+  const T gelu = static_cast<T>(half_gate * shifted);
+  return static_cast<T>(gelu * up);
+}
 
-  METAL_FUNC T apply(T x) const {
-    return scale * x;
+#define MLX_MTL_CONST static constant constexpr const
+
+MLX_MTL_CONST int SIMD_SIZE = 32;
+MLX_MTL_CONST int QUAD_SIZE = 4;
+
+template <int bits, int wsize = 8>
+inline constexpr short get_pack_factor() {
+  return (bits == 3 || bits == 5) ? 8 : (bits == 6 ? 4 : wsize / bits);
+}
+
+template <int bits, int wsize = 8>
+inline constexpr short get_bytes_per_pack() {
+  constexpr int power_of_2_bits = (bits & (bits - 1)) == 0;
+  return power_of_2_bits ? (wsize / 8) : (bits == 5 ? 5 : 3);
+}
+
+template <typename U, int N, int bits>
+inline void
+dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
+  static_assert(
+      bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
+          bits == 8,
+      "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
+
+  if (bits == 2) {
+    U s[4] = {
+        scale,
+        scale / static_cast<U>(4.0f),
+        scale / static_cast<U>(16.0f),
+        scale / static_cast<U>(64.0f)};
+    for (int i = 0; i < (N / 4); i++) {
+      w_local[4 * i] = s[0] * (w[i] & 0x03) + bias;
+      w_local[4 * i + 1] = s[1] * (w[i] & 0x0c) + bias;
+      w_local[4 * i + 2] = s[2] * (w[i] & 0x30) + bias;
+      w_local[4 * i + 3] = s[3] * (w[i] & 0xc0) + bias;
+    }
   }
-};
 
-struct MaxOp {
-  template <typename T>
-  METAL_FUNC static constexpr T apply(T x, T y) {
-    return metal::max(x, y);
+  else if (bits == 3) {
+    for (int i = 0; i < (N / 8); i++) {
+      w_local += 8 * i;
+      w += 3 * i;
+
+      w_local[0] = (w[0] & 0x7) * scale + bias;
+      w_local[1] = ((w[0] & 0x38) >> 3) * scale + bias;
+      w_local[2] = (((w[0] & 0xc0) >> 6) + ((w[1] & 0x1) << 2)) * scale + bias;
+      w_local[3] = ((w[1] & 0xe) >> 1) * scale + bias;
+      w_local[4] = ((w[1] & 0x70) >> 4) * scale + bias;
+      w_local[5] = (((w[1] & 0x80) >> 7) + ((w[2] & 0x3) << 1)) * scale + bias;
+      w_local[6] = ((w[2] & 0x1c) >> 2) * scale + bias;
+      w_local[7] = ((w[2] & 0xe0) >> 5) * scale + bias;
+    }
   }
-};
 
-struct SumOp {
-  template <typename T>
-  METAL_FUNC static constexpr T apply(T x, T y) {
-    return x + y;
+  else if (bits == 4) {
+    U s[2] = {scale, scale / static_cast<U>(16.0f)};
+    for (int i = 0; i < (N / 2); i++) {
+      w_local[2 * i] = s[0] * (w[i] & 0x0f) + bias;
+      w_local[2 * i + 1] = s[1] * (w[i] & 0xf0) + bias;
+    }
   }
-};
 
-struct MulOp {
-  template <typename T>
-  METAL_FUNC static constexpr T apply(T x, T y) {
-    return x * y;
+  else if (bits == 5) {
+    for (int i = 0; i < (N / 8); i++) {
+      w_local += 8 * i;
+      w += 5 * i;
+
+      w_local[0] = (w[0] & 0x1f) * scale + bias;
+      w_local[1] = (((w[0] & 0xe0) >> 5) + ((w[1] & 0x3) << 3)) * scale + bias;
+      w_local[2] = ((w[1] & 0x7c) >> 2) * scale + bias;
+      w_local[3] = (((w[1] & 0x80) >> 7) + ((w[2] & 0xf) << 1)) * scale + bias;
+      w_local[4] = (((w[2] & 0xf0) >> 4) + ((w[3] & 0x1) << 4)) * scale + bias;
+      w_local[5] = ((w[3] & 0x3e) >> 1) * scale + bias;
+      w_local[6] = (((w[3] & 0xc0) >> 6) + ((w[4] & 0x7) << 2)) * scale + bias;
+      w_local[7] = ((w[4] & 0xf8) >> 3) * scale + bias;
+    }
   }
-};
 
-struct SubOp {
-  template <typename T>
-  METAL_FUNC static constexpr T apply(T x, T y) {
-    return x - y;
+  else if (bits == 6) {
+    for (int i = 0; i < (N / 4); i++) {
+      w_local += 4 * i;
+      w += 3 * i;
+      w_local[0] = (w[0] & 0x3f) * scale + bias;
+      w_local[1] = (((w[0] >> 6) & 0x03) + ((w[1] & 0x0f) << 2)) * scale + bias;
+      w_local[2] = (((w[1] >> 4) & 0x0f) + ((w[2] & 0x03) << 4)) * scale + bias;
+      w_local[3] = ((w[2] >> 2) & 0x3f) * scale + bias;
+    }
   }
-};
 
-struct ExpSubOp {
-  template <typename T>
-  METAL_FUNC static constexpr T apply(T x, T y) {
-    return fast::exp2(x - y);
+  else if (bits == 8) {
+    for (int i = 0; i < N; i++) {
+      w_local[i] = scale * w[i] + bias;
+    }
   }
-};
+}
 
-struct DivOp {
-  template <typename T>
-  METAL_FUNC static constexpr T apply(T x, T y) {
-    return x / y;
-  }
-};
-
-// clang-format off
 template <
     typename T,
-    int BQ,
-    int BK,
-    int BD,
-    int WM,
-    int WN,
-    typename MaskType = float,
-    typename AccumType = float>
-[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void attention_nax(
-    const device T* Q [[buffer(0)]],
-    const device T* K [[buffer(1)]],
-    const device T* V [[buffer(2)]],
-    device T* O [[buffer(3)]],
-    const constant AttnParams* params [[buffer(4)]],
-    const constant AttnMaskParams* mask_params [[buffer(5), function_constant(has_mask)]],
-    const device MaskType* mask [[buffer(6), function_constant(has_mask)]],
-    const device T* sinks [[buffer(7), function_constant(has_sinks)]],
-    uint simd_lane_id [[thread_index_in_simdgroup]],
-    uint simd_group_id [[simdgroup_index_in_threadgroup]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint3 lid [[thread_position_in_threadgroup]]) { // clang-format on
-
-  // Pacifying compiler
-  (void)lid;
-  (void)simd_lane_id;
-
-  // Move to correct block
-  ulong3 tidl{tid.x, tid.y, tid.z};
-
-  Q += tidl.z * params->Q_strides[0] + // Batch
-      tidl.y * params->Q_strides[1] + // Head
-      tidl.x * BQ * params->Q_strides[2]; // Sequence
-
-  ulong kv_head_idx = int(tid.y) / params->gqa_factor;
-  K += tidl.z * params->K_strides[0] + // Batch
-      kv_head_idx * params->K_strides[1]; // Head
-
-  V += tidl.z * params->V_strides[0] + // Batch
-      kv_head_idx * params->V_strides[1]; // Head
-
-  O += tidl.z * params->O_strides[0] + // Batch
-      tidl.y * params->O_strides[1] + // Head
-      tidl.x * BQ * params->O_strides[2]; // Sequence
-
-  if (has_mask) {
-    mask += tidl.z * mask_params->M_strides[0] + // Batch
-        tidl.y * mask_params->M_strides[1]; // Head
-  }
-
-  const metal::uniform<float> scale2 =
-      make_uniform(params->scale) * make_uniform(1.44269504089f);
-
-  // Prepare MMA tiles
-  constexpr short kU = 16;
-
-  constexpr int kNWarps = WM * WN;
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size,
+    short group_size,
+    short bits>
+struct QuantizedBlockLoader {
   static_assert(
-      BQ >= (kNWarps * kU) && BQ % (kNWarps * kU) == 0,
-      "Each simdgroup must host atleast 1 simdgroup matrix along Q sequence.");
+      BCOLS <= group_size,
+      "The group size should be larger than the columns");
+  static_assert(
+      group_size % BCOLS == 0,
+      "The group size should be divisible by the columns");
+  static_assert(
+      bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
+          bits == 8,
+      "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
 
-  // Q seq frags per warp
-  constexpr int TQ = BQ / (kNWarps * kU);
-  // HeadDim frags (all warps load the same frags)
-  constexpr int TD = BD / kU;
-  // KV seq frags per warp
-  constexpr short TK = BK / kU;
+  MLX_MTL_CONST short pack_factor = get_pack_factor<bits, 8>();
+  MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack<bits>();
+  MLX_MTL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
+  MLX_MTL_CONST short n_reads =
+      (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
+  MLX_MTL_CONST short group_steps = group_size / BCOLS;
 
-  static_assert(TQ == 1, "Check TQ");
-  using otile_t = NAXTile<AccumType, TQ, TD>;
-  otile_t Otile;
+  const int src_ld;
+  const int tile_stride;
+  short group_step_cnt;
+  const int group_stride;
 
-  Otile.clear();
+  const short thread_idx;
+  const short bi;
+  const short bj;
 
-  // Prepare mma tile offsets
-  const short tm = kU * TQ * simd_group_id;
-  Q += tm * int(params->Q_strides[2]);
+  threadgroup T* dst;
+  const device uint8_t* src;
+  const device T* scales;
+  const device T* biases;
 
-  const short2 simd_coord = otile_t::NAXFrag_t::get_coord();
-  const short sm = simd_coord.y;
-  const short sn = simd_coord.x;
+  QuantizedBlockLoader(
+      const device uint8_t* src_,
+      const device T* scales_,
+      const device T* biases_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]])
+      : src_ld(src_ld_),
+        tile_stride(
+            reduction_dim ? BCOLS_PACKED * bytes_per_pack
+                          : BROWS * src_ld * bytes_per_pack / pack_factor),
+        group_step_cnt(0),
+        group_stride(BROWS * src_ld / group_size),
+        thread_idx(simd_group_id * 32 + simd_lane_id),
+        bi(n_reads * thread_idx / BCOLS_PACKED),
+        bj((n_reads * thread_idx) % BCOLS_PACKED),
+        dst(dst_ + bi * dst_ld + bj * pack_factor),
+        src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
+            bj * bytes_per_pack),
+        scales(scales_ + bi * src_ld / group_size),
+        biases(biases_ + bi * src_ld / group_size) {}
 
-  // Init row reduction variables
-  constexpr short kRowsPT = otile_t::kRowsPerThread;
+  void load_unsafe() const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
 
-  metal::vec<AccumType, kRowsPT> max_score;
-  metal::vec<AccumType, kRowsPT> sum_score{0};
-
-  // Init to -Inf
-  STEEL_PRAGMA_UNROLL
-  for (short i = 0; i < kRowsPT; ++i) {
-    max_score[i] = Limits<AccumType>::finite_min;
-  }
-
-  if (has_sinks) {
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < kRowsPT; ++i) {
-      max_score[i] = M_LOG2E_F * static_cast<AccumType>(sinks[tidl.y]);
-      sum_score[i] = 1;
+    T scale = *scales;
+    T bias = *biases;
+    for (int i = 0; i < n_reads; i++) {
+      dequantize<T, pack_factor, bits>(
+          src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
     }
   }
 
-  int kb_lim = params->NK;
-  int kb_min_causal = params->NK;
+  void load_safe(short2 src_tile_dim) const {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
 
-  if (do_causal) {
-    int q_max = (tid.x + 1) * BQ + params->qL_off;
-    kb_lim = (q_max + BK - 1) / BK;
-    kb_lim = min(params->NK, kb_lim);
+    if (reduction_dim == 1 && bi >= src_tile_dim.x) {
+      for (int i = 0; i < n_reads * pack_factor; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
 
-    int q_min = tid.x * BQ + params->qL_off;
-    q_min = max(0, q_min);
-    kb_min_causal = (q_min / BK);
+    if (reduction_dim == 0 && bi >= src_tile_dim.y) {
+      for (int i = 0; i < n_reads * pack_factor; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+
+    T scale = *scales;
+    T bias = *biases;
+    for (int i = 0; i < n_reads; i++) {
+      dequantize<T, pack_factor, bits>(
+          (device uint8_t*)(src + i * bytes_per_pack),
+          scale,
+          bias,
+          dst + i * pack_factor);
+    }
   }
 
-  const bool is_last_bq = int(tid.x) == (params->NQ_aligned);
-  // const bool is_last_tq = int(simd_group_id) >= (params->qL_rem / UQ);
-  const bool is_last_q = is_last_bq;
-
-  const short lim_rows_q = params->qL_rem - tm;
-  const short lim_rows_k = params->kL_rem;
-
-  // Loop over KV seq length
-  for (int kb = 0; kb < kb_lim; kb++) {
-    const int is_last_k = (kb == (params->NK_aligned));
-
-    // Do S = Q @ K.T
-    using stile_t = NAXTile<AccumType, TQ, TK>;
-    stile_t Stile;
-
-    Stile.clear();
-
-    STEEL_PRAGMA_UNROLL
-    for (short iq = 0; iq < TQ; iq++) {
-      STEEL_PRAGMA_UNROLL
-      for (short ik = 0; ik < TK; ik += 2) {
-        STEEL_PRAGMA_UNROLL
-        for (short id = 0; id < TD; id++) {
-          NAXTile<T, 1, 1> Qtile;
-          NAXTile<T, 2, 1> Ktile;
-
-          const int Q_load_off = iq * kU * int(params->Q_strides[2]) + id * kU;
-          const int K_load_off = ik * kU * int(params->K_strides[2]) + id * kU;
-
-          if (!align_Q && is_last_q) {
-            Qtile.load_rows(
-                Q + Q_load_off,
-                int(params->Q_strides[2]),
-                lim_rows_q - iq * kU);
-          } else {
-            Qtile.load(Q + Q_load_off, int(params->Q_strides[2]));
-          }
-
-          if (!align_K && is_last_k) {
-            Ktile.load_rows(
-                K + K_load_off,
-                int(params->K_strides[2]),
-                lim_rows_k - ik * kU);
-          } else {
-            Ktile.load(K + K_load_off, int(params->K_strides[2]));
-          }
-
-          stile_t::NAXFrag_t::mma(
-              Stile.frag_at(iq, ik),
-              Stile.frag_at(iq, ik + 1),
-              Qtile.frag_at(0, 0),
-              metal::false_type{},
-              Ktile.frag_at(0, 0),
-              Ktile.frag_at(1, 0),
-              metal::true_type{});
-        }
-      }
-    }
-
-    // Scale S
-    STEEL_PRAGMA_UNROLL
-    for (short ii = 0; ii < stile_t::kElemsPerTile; ii++) {
-      Stile.elems()[ii] *= float(scale2);
-    }
-
-    // Mask out length sequence
-    if (!align_K && is_last_k) {
-      constexpr auto neg_inf = Limits<AccumType>::finite_min;
-
-      STEEL_PRAGMA_UNROLL
-      for (short iq = 0; iq < TQ; iq++) {
-        STEEL_PRAGMA_UNROLL
-        for (short ik = 0; ik < TK; ik++) {
-          const short col_pos = ik * kU + sn;
-
-          thread auto& fg = Stile.frag_at(iq, ik);
-
-          STEEL_PRAGMA_UNROLL
-          for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
-            STEEL_PRAGMA_UNROLL
-            for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
-              const auto loc = ii * stile_t::kFragThrCols + jj;
-              fg[loc] = ((col_pos + jj) < params->kL_rem) ? fg[loc] : neg_inf;
-            }
-          }
-        }
-      }
-    }
-
-    // Mask out if causal
-    if (do_causal && kb >= kb_min_causal) {
-      constexpr auto neg_inf = Limits<AccumType>::finite_min;
-
-      const int base_row = tid.x * BQ + params->qL_off + tm;
-      const int base_col = kb * BK;
-
-      STEEL_PRAGMA_UNROLL
-      for (short iq = 0; iq < TQ; iq++) {
-        STEEL_PRAGMA_UNROLL
-        for (short ik = 0; ik < TK; ik++) {
-          thread auto& fg = Stile.frag_at(iq, ik);
-
-          STEEL_PRAGMA_UNROLL
-          for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
-            STEEL_PRAGMA_UNROLL
-            for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
-              const auto r =
-                  base_row + iq * kU + ii * stile_t::kFragRowsJump + sm;
-              const auto c = base_col + ik * kU + jj + sn;
-              const auto loc = ii * stile_t::kFragThrCols + jj;
-              fg[loc] = (r < c) ? neg_inf : fg[loc];
-            }
-          }
-        }
-      }
-    }
-
-    // Other masking as needed
-    if (has_mask) {
-      constexpr auto neg_inf = Limits<AccumType>::finite_min;
-
-      const int base_row = tid.x * BQ + tm;
-      const int base_col = kb * BK;
-
-      constexpr bool is_bool = is_same_v<MaskType, bool>;
-      using melem_t = typename metal::conditional_t<is_bool, bool, AccumType>;
-      using mtile_t = NAXTile<melem_t, TQ, TK>;
-      using mfrag_t = typename mtile_t::frag_type;
-
-      if (base_row + BQ <= params->qL && base_col + BK <= params->kL) {
-        for (short iq = 0; iq < TQ; iq++) {
-          STEEL_PRAGMA_UNROLL
-          for (short ik = 0; ik < TK; ik++) {
-            const int row_pos = base_row + iq * kU;
-            const int col_pos = base_col + ik * kU;
-
-            mfrag_t mfrag;
-            mtile_t::NAXFrag_t::load(
-                mfrag,
-                mask,
-                int64_t(mask_params->M_strides[2]),
-                Int<1>{},
-                row_pos,
-                col_pos);
-
-            thread auto& fg = Stile.frag_at(iq, ik);
-
-            STEEL_PRAGMA_UNROLL
-            for (short jj = 0; jj < mtile_t::kElemsPerFrag; jj++) {
-              if constexpr (is_bool) {
-                fg[jj] = mfrag[jj] ? fg[jj] : neg_inf;
-              } else {
-                fg[jj] += M_LOG2E_F * AccumType(mfrag[jj]);
-              }
-            }
-          }
+  void next() {
+    src += tile_stride;
+    if (reduction_dim == 1) {
+      if (group_steps > 1) {
+        group_step_cnt++;
+        if (group_step_cnt == group_steps) {
+          group_step_cnt = 0;
+          scales++;
+          biases++;
         }
       } else {
-        STEEL_PRAGMA_UNROLL
-        for (short iq = 0; iq < TQ; iq++) {
-          STEEL_PRAGMA_UNROLL
-          for (short ik = 0; ik < TK; ik++) {
-            const int row_pos = base_row + iq * kU;
-            const int col_pos = base_col + ik * kU;
-
-            mfrag_t mfrag;
-            mtile_t::NAXFrag_t::load_safe(
-                mfrag,
-                mask,
-                int64_t(mask_params->M_strides[2]),
-                Int<1>{},
-                params->qL,
-                params->kL,
-                row_pos,
-                col_pos);
-
-            thread auto& fg = Stile.frag_at(iq, ik);
-
-            STEEL_PRAGMA_UNROLL
-            for (short jj = 0; jj < mtile_t::kElemsPerFrag; jj++) {
-              if constexpr (is_bool) {
-                fg[jj] = mfrag[jj] ? fg[jj] : neg_inf;
-              } else {
-                fg[jj] += M_LOG2E_F * AccumType(mfrag[jj]);
-              }
-            }
-          }
-        }
+        scales++;
+        biases++;
       }
+    } else {
+      scales += group_stride;
+      biases += group_stride;
     }
-
-    // Do softmax
-
-    // Temp variables
-    metal::vec<AccumType, kRowsPT> new_max;
-    metal::vec<AccumType, kRowsPT> factor;
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < kRowsPT; ++i) {
-      new_max[i] = max_score[i];
-    }
-
-    // Row max
-    Stile.template row_reduce<MaxOp>(new_max);
-
-    // exp(Si - rowmax(Si))
-    Stile.template row_bin_op<ExpSubOp>(new_max);
-
-    // Factor exp(rowmax(Si) - rowmax(Si-1))
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < kRowsPT; ++i) {
-      factor[i] = fast::exp2(max_score[i] - new_max[i]);
-      max_score[i] = new_max[i];
-    }
-
-    // Row Sum
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < kRowsPT; ++i) {
-      sum_score[i] = sum_score[i] * factor[i];
-    }
-
-    Stile.template row_reduce<SumOp>(sum_score);
-
-    // Update O
-    Otile.template row_bin_op<MulOp>(factor);
-
-    simdgroup_barrier(mem_flags::mem_none);
-
-    // Do O = P @ V
-    STEEL_PRAGMA_UNROLL
-    for (short iq = 0; iq < TQ; iq++) {
-      STEEL_PRAGMA_UNROLL
-      for (short id = 0; id < TD; id += 2) {
-        if constexpr (BD == 128) {
-          if (id == 4) {
-            threadgroup_barrier(mem_flags::mem_none);
-          }
-        }
-
-        STEEL_PRAGMA_UNROLL
-        for (short ik = 0; ik < TK; ik++) {
-          NAXTile<T, 1, 2> Vtile;
-
-          const int V_load_off = ik * kU * int(params->V_strides[2]) + id * kU;
-
-          if (!align_K && is_last_k) {
-            Vtile.load_rows(
-                V + V_load_off,
-                int(params->V_strides[2]),
-                lim_rows_k - ik * kU);
-          } else {
-            Vtile.load(V + V_load_off, int(params->V_strides[2]));
-          }
-
-          otile_t::NAXFrag_t::mma(
-              Otile.frag_at(iq, id),
-              Otile.frag_at(iq, id + 1),
-              Stile.frag_at(iq, ik),
-              metal::false_type{},
-              Vtile.frag_at(0, 0),
-              Vtile.frag_at(0, 1),
-              metal::false_type{});
-        }
-      }
-    }
-
-    // Prepare for next iteration
-    K += BK * int(params->K_strides[2]);
-    V += BK * int(params->V_strides[2]);
   }
+};
 
-  // Normalize output
 
-  threadgroup_barrier(mem_flags::mem_none);
-
-  metal::vec<AccumType, kRowsPT> rcp;
-  STEEL_PRAGMA_UNROLL
-  for (short i = 0; i < kRowsPT; ++i) {
-    rcp[i] = 1.f / sum_score[i];
-  }
-
-  Otile.template row_bin_op<MulOp>(rcp);
-
-  // Store results
-  O += tm * int(params->O_strides[2]);
-
-  if (!align_Q && is_last_q) {
-    if (lim_rows_q <= 0)
-      return;
-
-    Otile.store_rows(O, int(params->O_strides[2]), lim_rows_q);
-  } else {
-    Otile.store(O, int(params->O_strides[2]));
-  }
+"""#
 }
-
-///////////////////////////////////////////////////////////////////////////////
-)preamble";
-}
-
-} // namespace mlx::core::metal

@@ -26,19 +26,32 @@ public enum Gemma4DecodeFusedGUV1 {
     }()
 
     static func call(x: MLXArray, storage: SwitchGateUpFusedStorage,
-        lhs: MLXArray, rhs: MLXArray) -> MLXArray {
-        call([storage.weight, storage.scales, storage.biases, x, lhs, rhs])
+        lhs: MLXArray, rhs: MLXArray, taggedRoute: Bool = false) -> MLXArray {
+        call([storage.weight, storage.scales, storage.biases, x, lhs, rhs],
+            taggedRoute: taggedRoute)
     }
 
     /// Raw launch for callers that already passed the fused-GU contract.
-    static func call(_ inputs: [MLXArray]) -> MLXArray {
-        kernel(inputs,
+    static func call(_ inputs: [MLXArray], taggedRoute: Bool = false) -> MLXArray {
+        (taggedRoute ? kernelTagged : kernelGeneral)(inputs,
             grid: (32, 176 * 2, 64), threadGroup: (32, 2, 1),
             outputShapes: [outputShape], outputDTypes: [outputDType])[0]
     }
 
-    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_decode_gateup_geglu_threadgroup_v1",
+    /// GU-TAGGED-ROUTE. When the route producer emits prefix-bounds tagged
+    /// words, `expert_run`'s untagged fallback -- a backward, data-dependent
+    /// scan over `rhs` -- can never execute, but it still inlines into the
+    /// body and its registers and its unhoistable loop are charged to every
+    /// threadgroup. Same inline-path pruning that took the run cap from four
+    /// to two. Chosen per call from the producer's own `hasExpertPrefixBounds`
+    /// contract, so a fallback emitting raw keys keeps the general body; the
+    /// two carry distinct kernel names so their pipeline-cache entries never
+    /// alias. Only an already-unreachable branch is removed, so the output is
+    /// bit-identical.
+    private static func makeKernel(tagged: Bool) -> MLXFast.MLXFastKernel {
+        MLXFast.metalKernel(
+        name: "gemma4_b8_decode_gateup_geglu_threadgroup_v1"
+            + (tagged ? "_tagged_v1" : ""),
         inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"],
         outputNames: ["y"],
         source: #"""
@@ -69,7 +82,8 @@ uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
     }
 
 """#,
-        header: "#define GU_RUN_CAP \(runCap)\n" + #"""
+        header: "#define GU_RUN_CAP \(runCap)\n"
+            + "#define GU_TAGGED_ROUTE \(tagged ? 1 : 0)\n" + #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helpers from 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -1124,7 +1138,15 @@ constant uint guRunCap=GU_RUN_CAP;
 constant int guK=2816,guN=704,guSliceN=8;
 struct ExpertRun { uint expert; uint count; bool leader; };
 METAL_FUNC ExpertRun expert_run(const device uint* rhs,uint assignment) {
-    const uint word=rhs[assignment];const bool tagged=(word&0x80000000u)!=0u;
+    const uint word=rhs[assignment];
+#if GU_TAGGED_ROUTE
+    const uint expert=word&0xffu;
+    const uint offset=(word>>8)&0x3fu;
+    if(guRunCap>1u && (offset&(guRunCap-1u))!=0u)return {expert,0,false};
+    const uint count=min(guRunCap,((word>>14)&0x3fu)+1u);
+    return {expert,count,true};
+#else
+    const bool tagged=(word&0x80000000u)!=0u;
     const uint expert=tagged ? word&0xffu:word;
     uint offset=0;
     if(tagged)offset=(word>>8)&0x3fu;
@@ -1134,6 +1156,7 @@ METAL_FUNC ExpertRun expert_run(const device uint* rhs,uint assignment) {
     if(tagged)count=min(guRunCap,((word>>14)&0x3fu)+1u);
     else while(count<guRunCap && assignment+count<64 && rhs[assignment+count]==expert)++count;
     return {expert,count,true};
+#endif
 }
 template<typename T>
 METAL_FUNC void tg_execute_projection(const device uint* w,const device T* scales,const device T* biases,
@@ -1155,4 +1178,8 @@ METAL_FUNC void tg_execute_projection(const device uint* w,const device T* scale
 
 """#,
         ensureRowContiguous: true)
+    }
+
+    private static let kernelGeneral: MLXFast.MLXFastKernel = makeKernel(tagged: false)
+    private static let kernelTagged: MLXFast.MLXFastKernel = makeKernel(tagged: true)
 }

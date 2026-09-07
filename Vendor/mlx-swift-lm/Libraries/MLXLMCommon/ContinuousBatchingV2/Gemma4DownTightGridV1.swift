@@ -31,8 +31,8 @@ public enum Gemma4DownTightGridV1 {
     static let tileSpan: Int = {
         #if os(macOS)
         guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_TILE_SPAN2"]
-        else { return 1 }
-        return ["0", "false", "no", "off"].contains(raw.lowercased()) ? 4 : 1
+        else { return 2 }
+        return ["0", "false", "no", "off"].contains(raw.lowercased()) ? 4 : 2
         #else
         return 4
         #endif

@@ -193,7 +193,7 @@ private let gemma4PrefillTailRows: Int = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_PREFILL_TAIL_ROWS"],
         let value = Int(raw)
-    else { return 1 }
+    else { return 2 }
     return max(0, value)
 }()
 

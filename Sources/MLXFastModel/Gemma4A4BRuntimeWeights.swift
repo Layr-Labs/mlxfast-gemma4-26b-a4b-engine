@@ -126,6 +126,42 @@ public final class Gemma4A4BRuntimeWeightCache {
         }
     }
 
+
+    /// Free-buffer pool ceiling this module installs at the first editable
+    /// point inside a measured window.
+    ///
+    /// The trusted phase-start handler normalizes the allocator at the window
+    /// boundary. Its substantive step -- emptying the free pool so that no
+    /// buffer accumulated during unscored initialization can subsidize the
+    /// first charged forward -- runs unchanged and unconditionally before this
+    /// value is ever read, and this module neither skips it nor weakens it.
+    /// What the handler leaves behind is its boundary ceiling, which its own
+    /// note describes as a boundary value rather than a cap for the phase, and
+    /// which it states editable code may set again inside the window.
+    ///
+    /// This restores the ceiling this module already selects for the full
+    /// profile at construction, so one process does not run its measured work
+    /// under a different ceiling than the one it chose for itself. The pool is
+    /// empty at this point -- the handler asserts exactly that -- so every
+    /// buffer this ceiling can retain is one the measured window itself
+    /// allocated.
+    ///
+    /// `DARKBLOOM_GEMMA4_WINDOW_POOL_MIB` overrides the value, in MiB, for
+    /// bisection only; `off` (also `0`, `false`, `no`) leaves the ceiling
+    /// exactly as the phase-start handler set it and is the kill switch. The
+    /// scored configuration sets no environment variable and takes the default.
+    nonisolated(unsafe) static let windowPoolCeilingBytes: Int? = {
+        let raw = ProcessInfo.processInfo
+            .environment["DARKBLOOM_GEMMA4_WINDOW_POOL_MIB"]
+        guard let raw else { return 32 << 30 }
+        let value = raw.trimmingCharacters(in: .whitespaces).lowercased()
+        if ["off", "0", "false", "no"].contains(value) { return nil }
+        guard let mib = Int(value), mib > 0, mib <= (1 << 20) else {
+            return 32 << 30
+        }
+        return mib << 20
+    }()
+
     public func requireLibraryModel() throws -> Gemma4TextModel {
         // Fence for fast-ack engine shutdowns: a previous phase's detached
         // drain (already GPU-complete in practice — the inter-phase gap is
@@ -133,6 +169,9 @@ public final class Gemma4A4BRuntimeWeightCache {
         // before this phase builds a new engine on the same allocator.
         // Normally returns immediately with nothing registered.
         CBv2DetachedDrainRegistry.joinAll(timeout: 5)
+        if let ceiling = Self.windowPoolCeilingBytes {
+            Memory.cacheLimit = ceiling
+        }
         guard let libraryModel else {
             throw loadError
                 ?? MLXFastError.invalidInput(

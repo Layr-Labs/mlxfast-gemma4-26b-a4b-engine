@@ -962,21 +962,11 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         return result
     }()
 
-    /// DENSE-GELU-EPILOGUE-DECODE. The gate/up plane is [8, 4224] with gate in
-    /// the first 2112 columns and up in the second, and the GeGLU that consumes
-    /// it runs as a separate elementwise pass. Profiling the decode step
-    /// (`kprof`) put that pass at **74.1 us per launch against 22.6 us for the
-    /// gate/up GEMM that feeds it and 14.6 us for the down GEMM that consumes
-    /// it** -- 9.7% of the whole decode step, three times the matmuls it sits
-    /// between, because it writes 4224 columns, reads them back, and writes
-    /// 2112 more.
-    ///
-    /// A threadgroup here owns 8 CONSECUTIVE columns, so it holds one side of
-    /// each pair and cannot fuse on its own. This variant runs the accumulate
-    /// body twice -- once at `n0` for gate, once at `n0 + 2112` for up -- and
-    /// combines in register, so the same MMA work emits the activated plane
-    /// directly and the intermediate never reaches memory. Grid halves to 264
-    /// tiles because each now covers a pair.
+    /// DENSE-GELU-EPILOGUE-DECODE. Each threadgroup walks gate columns at `n0`
+    /// and up columns at `n0 + 2112` together. Activation loads, run sums and
+    /// each B operand feed both MMA chains. Each chain retains its ascending
+    /// K order and affine close. Both 22-group partials share one barrier
+    /// before the FP32 close and BF16 GeGLU tape. The grid remains 264 tiles.
     private static let mma8GateUpGeluHeader: String = {
         var result = mma8GateUpStaticKHeader
         func replaceOnce(_ old: String, with new: String) {
@@ -998,28 +988,57 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
             "    uint simd_lid) {",
             with: "    uint simd_lid,\n"
                 + "    thread float& o0,\n"
-                + "    thread float& o1) {")
-        // simdgroup 1 must NOT return -- it has a second column tile to run.
-        // The trailing barrier lets the caller reuse a `red` slab safely.
+                + "    thread float& o1,\n"
+                + "    thread float& u0,\n"
+                + "    thread float& u1) {")
+        replaceOnce("    threadgroup float2* red,", with: "    threadgroup float4* red,")
         replaceOnce(
-            "    if (simd_gid == 1) {\n"
-                + "      return;\n"
-                + "    }\n"
-                + "    const float2 other = red[simd_lid];\n"
-                + "    acc0 = acc0 + other.x;\n"
-                + "    acc1 = acc1 + other.y;\n"
-                + "  }",
-            with: "    if (simd_gid == 0) {\n"
-                + "      const float2 other = red[simd_lid];\n"
-                + "      acc0 = acc0 + other.x;\n"
-                + "      acc1 = acc1 + other.y;\n"
-                + "    }\n"
-                + "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-                + "  }")
+            "  const device T* brow = biases + (n0 + c.fm) * G;",
+            with: "  const device T* brow = biases + (n0 + c.fm) * G;\n"
+                + "  const device uint8_t* wrowUp = wrow + 2112 * K;\n"
+                + "  const device T* srowUp = srow + 2112 * G;\n"
+                + "  const device T* browUp = brow + 2112 * G;")
+        replaceOnce(
+            "  float acc1 = 0.0f;",
+            with: "  float acc1 = 0.0f;\n"
+                + "  float accUp0 = 0.0f;\n"
+                + "  float accUp1 = 0.0f;")
+        replaceOnce(
+            "    const float b = float(brow[g]);",
+            with: "    const float b = float(brow[g]);\n"
+                + "    const uint4 wvUp = *((const device uint4*)(wrowUp + 64 * g));\n"
+                + "    const float sUp = float(srowUp[g]);\n"
+                + "    const float bUp = float(browUp[g]);")
+        replaceOnce(
+            "    simdgroup_float8x8 C = simdgroup_float8x8(0.0f);",
+            with: "    simdgroup_float8x8 C = simdgroup_float8x8(0.0f);\n"
+                + "    simdgroup_float8x8 CUp = simdgroup_float8x8(0.0f);")
+        replaceOnce(
+            "simdgroup_multiply_accumulate(C, A, BB, C);",
+            with: "simdgroup_multiply_accumulate(C, A, BB, C); "
+                + "A.thread_elements()[0] = float(extract_bits(wvUp.WLO, (SH), 8)); "
+                + "A.thread_elements()[1] = float(extract_bits(wvUp.WHI, (SH), 8)); "
+                + "simdgroup_multiply_accumulate(CUp, A, BB, CUp);")
+        replaceOnce(
+            "    acc1 += s * C.thread_elements()[1] + rs.y * b;",
+            with: "    acc1 += s * C.thread_elements()[1] + rs.y * b;\n"
+                + "    accUp0 += sUp * CUp.thread_elements()[0] + rs.x * bUp;\n"
+                + "    accUp1 += sUp * CUp.thread_elements()[1] + rs.y * bUp;")
+        replaceOnce(
+            "      red[simd_lid] = float2(acc0, acc1);",
+            with: "      red[simd_lid] = float4(acc0, acc1, accUp0, accUp1);")
+        replaceOnce(
+            "    const float2 other = red[simd_lid];",
+            with: "    const float4 other = red[simd_lid];")
+        replaceOnce(
+            "    acc1 = acc1 + other.y;",
+            with: "    acc1 = acc1 + other.y;\n"
+                + "    accUp0 = accUp0 + other.z;\n"
+                + "    accUp1 = accUp1 + other.w;")
         replaceOnce(
             "  y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);\n"
                 + "  y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);",
-            with: "  o0 = acc0;\n  o1 = acc1;")
+            with: "  o0 = acc0;\n  o1 = acc1;\n  u0 = accUp0;\n  u1 = accUp1;")
         // The compiled tape's EXACT rounding: every intermediate is rounded to
         // T, matching `gemma4SafeGeluProduct` op for op. Computing this in
         // float would be more accurate and would diverge the tokens.
@@ -1042,23 +1061,18 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }()
 
     private static let mma8GateUpGeluKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_gelu_k2816_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_gelu_k2816_shared_x_v2",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
             const uint3 tid = threadgroup_position_in_grid;
-            threadgroup float2 redGate[32];
-            threadgroup float2 redUp[32];
+            threadgroup float4 red[32];
             const int n0 = int(tid.y) * 8;
             float g0 = 0.0f, g1 = 0.0f, u0 = 0.0f, u1 = 0.0f;
             gemma4_qmv_mma8_affine8_g64_gateup_k2816_acc<T, 2>(
-                w, scales, biases, x, n0, redGate,
+                w, scales, biases, x, n0, red,
                 simdgroup_index_in_threadgroup,
-                thread_index_in_simdgroup, g0, g1);
-            gemma4_qmv_mma8_affine8_g64_gateup_k2816_acc<T, 2>(
-                w, scales, biases, x, n0 + 2112, redUp,
-                simdgroup_index_in_threadgroup,
-                thread_index_in_simdgroup, u0, u1);
+                thread_index_in_simdgroup, g0, g1, u0, u1);
             if (simdgroup_index_in_threadgroup == 0) {
               const mma8_coord c = mma8_lane(thread_index_in_simdgroup);
               y[c.fn * 2112 + n0 + c.fm] = gemma4_dense_geglu_tape<T>(
@@ -1070,9 +1084,9 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         header: mma8GateUpGeluHeader,
         ensureRowContiguous: true)
 
-    /// ON by default. Measured over 30 ABBA-interleaved rounds: **+0.364%
-    /// decode, faster in 27 of 30, tokens bit-identical** (paired per-round
-    /// mean, SE 0.163%). Kill switch:
+    /// ON by default. The original GeGLU fusion measured **+0.364% decode**
+    /// over 30 ABBA-interleaved rounds (SE 0.163%). The shared activation
+    /// traversal has not been measured. Kill switch:
     /// `DARKBLOOM_GEMMA4_DENSE_GELU_EPILOGUE=0`.
     public static let denseGeluEpilogueEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[

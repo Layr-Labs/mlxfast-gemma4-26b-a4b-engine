@@ -928,7 +928,7 @@ private let gemma4QKVNormRopeEnabled: Bool = {
 }()
 
 private let gemma4QKVNormKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_qkv_rms_norm_rope_v2_vec1",
+        name: "gemma4_b8_qkv_rms_norm_rope_v2_vec1_nb1",
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base", "rope_freqs",
@@ -983,12 +983,15 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
         threadgroup float partials[32];
         threadgroup float inverse_rms;
         threadgroup T rounded[D];
-        if (simd_group == 0) partials[lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // NORM-NB: 零初始化 + 它那道 barrier 只是为了让 32 lane 的 simd_sum
+        // 读到确定值。改成有界读即可，省一次 threadgroup 写和一道 barrier。
+        // 越界 lane 贡献 0.0f，浮点加法的精确恒等，逐位相同。
+        // threads = D/4，每 32 线程一个 simdgroup。
+        constexpr uint NB_NSG = D / 128u;
         if (lane == 0) partials[simd_group] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (simd_group == 0) {
-            sum = simd_sum(partials[lane]);
+            sum = simd_sum(lane < NB_NSG ? partials[lane] : 0.0f);
             if (lane == 0) {
                 inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
             }
@@ -1081,7 +1084,7 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
 /// threadgroup, and each row keeps its own 64 threads and its own two
 /// simdgroups, so the reduction tree is the stock one row for row.
 private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_v2",
+    name: "gemma4_qkv_rms_norm_head_major_v2_nb1",
     inputNames: [
         "q", "k", "q_weight", "k_weight",
         "position_offsets", "rope_freqs",
@@ -1151,12 +1154,12 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
 
         // Slots 2..31 stay exactly zero, so the 32-lane combine returns the
         // two simdgroup partials' sum whatever order the tree adds them in.
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // NORM-NB: 同上。这三个内核的原注释已写明「Slots 2..31 stay exactly
+        // zero」，即只有两个 simdgroup 写入，所以有界读的界就是 2。
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
+            sum = simd_sum(lane < 2u ? partials[slot][lane] : 0.0f);
             if (lane == 0) {
                 inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
             }
@@ -1281,7 +1284,7 @@ private func gemma4FusedQKVNormHeadMajor(
 /// staging boundary. Structure extends the head-major twin; rotation is a
 /// line-for-line transcription of rope.metal's base path.
 private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_sliding_v1",
+    name: "gemma4_qkv_rms_norm_head_major_sliding_v1_nb1",
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base",
@@ -1353,12 +1356,12 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // NORM-NB: 同上。这三个内核的原注释已写明「Slots 2..31 stay exactly
+        // zero」，即只有两个 simdgroup 写入，所以有界读的界就是 2。
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
+            sum = simd_sum(lane < 2u ? partials[slot][lane] : 0.0f);
             if (lane == 0) {
                 inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
             }
@@ -1421,7 +1424,7 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
 /// allocation. The mirror is therefore the pack kernel's output byte for
 /// byte, computed without re-reading the 67 MB of K/V it packs.
 private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_sliding_pack_pg1",
+    name: "gemma4_qkv_rms_norm_head_major_sliding_pack_pg1_nb1",
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base",
@@ -1502,12 +1505,12 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // NORM-NB: 同上。这三个内核的原注释已写明「Slots 2..31 stay exactly
+        // zero」，即只有两个 simdgroup 写入，所以有界读的界就是 2。
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
+            sum = simd_sum(lane < 2u ? partials[slot][lane] : 0.0f);
             if (lane == 0) {
                 inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
             }

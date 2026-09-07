@@ -160,6 +160,92 @@
 #                                     ships prebuilt and pinned by sha256.
 set -euo pipefail
 
+# ---------------------------------------------------------------------------
+# THE FAILURE-CLASS TRAILER. REPORTING ONLY -- it decides nothing, refuses
+# nothing, and changes no exit code.
+#
+# WHY. This script is the whole of the ranked Benchmark step, so every way it
+# can end badly reaches the run page as one line: `##[error]Process completed
+# with exit code N`. On 2026-08-28 the ranked job failed 13 times in five
+# unrelated classes -- a benchd refusal, a candidate the acceptance gates threw
+# out after a full measurement, a build failure, a below-floor score, a missing
+# prerequisite -- and all five looked identical in the trace and identical again
+# in Yukon, which reports every one of them as `benchmark_failed`. The submitter
+# could not tell which had hit them. This adds ONE line naming the class.
+#
+# IT NAMES, IT DOES NOT DIAGNOSE. Only two exit codes carry a meaning this
+# script can honestly translate -- benchctl's 5 and 6 -- and everything else is
+# pointed back at the error that was actually printed rather than guessed at.
+# The cause of a refusal is still whatever benchctl or the emitter said above;
+# this only stops that cause being invisible behind a number.
+#
+# IT MUST NOT CHANGE THE STATUS. In bash an EXIT trap leaves the exit status
+# alone unless it exits itself, so this trap never calls `exit` -- reporting
+# code must not become a way for the box to report a different result. For the
+# same reason every command below is guarded (`|| true`, `if`): `set -e` is
+# still in force inside the trap, and a failing diagnostic that killed the shell
+# would take the real exit code with it.
+#
+# THE --preflight-only PATH BELOW execs, which DROPS this trap. That is
+# deliberate and acceptable: preflight is benchmark.json's preSubmitCommand, not
+# the ranked path this exists for, and the exec is left exactly as it was.
+gemma4_report_failure_class() {
+  local rc="$1"
+  if [ "${rc}" = "0" ]; then
+    return 0
+  fi
+
+  local class
+  case "${rc}" in
+    5) class="benchctl refused the candidate after measurement (acceptance gates)" ;;
+    6) class="benchctl refusal, named in its own output above (die 6)" ;;
+    *) class="see the last error above (exit ${rc})" ;;
+  esac
+
+  # THE ONLY TWO FACTS THIS READS OUT OF results.json, and no others ever:
+  # `candidate_accepted` and `accepted_pairs`. That file is derived from the
+  # hidden goldens, so nothing else in it may be echoed into a public run log.
+  #
+  # `// empty` is NOT used on candidate_accepted: jq's `//` treats `false` as
+  # absent, and `false` is precisely the value the exit-5 class exists to show.
+  # `select(. != null)` is the same defensive "print it only if it is there"
+  # without swallowing the answer.
+  local facts=""
+  local results="${OUT_DIR:-}/results.json"
+  if [ -n "${OUT_DIR:-}" ] && [ -f "${results}" ] && command -v jq >/dev/null 2>&1; then
+    local accepted pairs
+    accepted="$(jq -r '.candidate_accepted | select(. != null) | tostring' < "${results}" 2>/dev/null || true)"
+    pairs="$(jq -r '.accepted_pairs | select(. != null) | tostring' < "${results}" 2>/dev/null || true)"
+    if [ -n "${accepted}" ]; then
+      facts="${facts} candidate_accepted=${accepted}"
+    fi
+    if [ -n "${pairs}" ]; then
+      facts="${facts} accepted_pairs=${pairs}"
+    fi
+  fi
+
+  echo "gemma4-measure-and-score.sh: failure class: ${class}${facts}" >&2
+
+  # The annotation. Without it the run page's own error list says only the exit
+  # code; with it the class is the first thing a submitter reads.
+  if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    echo "::error::gemma4-measure-and-score.sh: failure class: ${class}${facts}" >&2
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -w "${GITHUB_STEP_SUMMARY}" ]; then
+      {
+        echo "### Benchmark step failed (exit ${rc})"
+        echo
+        echo "Failure class: ${class}"
+        if [ -n "${facts}" ]; then
+          echo
+          echo "Measurement facts:${facts}"
+        fi
+      } >> "${GITHUB_STEP_SUMMARY}" || true
+    fi
+  fi
+}
+trap 'gemma4_report_failure_class "$?"' EXIT
+# ---------------------------------------------------------------------------
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${SCRIPT_DIR}"
 

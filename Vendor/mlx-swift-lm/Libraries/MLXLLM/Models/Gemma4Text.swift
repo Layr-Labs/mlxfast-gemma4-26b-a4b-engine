@@ -6812,29 +6812,59 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
     private static let threadgroupSize = axis / valuesPerThread
     private static let eps: Float = 1e-6
 
-    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v1",
-        inputNames: ["x", "w"],
-        outputNames: ["out", "xSums"],
-        source: """
-            const uint row = threadgroup_position_in_grid.x;
-            const uint lid = thread_position_in_threadgroup.x;
-            const uint simd_lane_id = thread_index_in_simdgroup;
-            const uint simd_group_id = simdgroup_index_in_threadgroup;
-            threadgroup float local_inv[1];
-            threadgroup float local_sums[32];
-            threadgroup float quad_sums[704];
+    /// FINAL-NORM-RR: collapse the combine's three barriers to one. The
+    /// threadgroup runs 22 simdgroups but the single `simd_sum` intrinsic
+    /// reads a fixed 32 lanes, so the incumbent zero-fills the 10 surplus
+    /// lanes behind a barrier, elects simdgroup 0 to combine, publishes the
+    /// normalizer through `local_inv[0]`, and broadcasts it behind a second
+    /// barrier. This emission instead publishes the 22 partials, keeps the
+    /// single publish barrier, and has every simdgroup recompute the
+    /// identical cross-simd `simd_sum` itself — selecting an exact `0.0f`
+    /// for the 10 surplus lanes — keeping the normalizer in a per-thread
+    /// register. Same election-to-redundancy trade as the promoted NORM-TB1
+    /// switch in the four glue kernels; 22 redundant `simd_sum` +
+    /// `precise::rsqrt` evaluate in parallel for near-zero wall time.
+    ///
+    /// Bit-identical: `simd_sum` returns one value to every lane and is a
+    /// deterministic function of its input vector, and every simdgroup runs
+    /// it after the publish barrier over byte-identical
+    /// `local_sums[0..21]`. The float reaching the norm body is the float
+    /// the broadcast used to deliver. Nothing is reassociated, and fast
+    /// math stays disabled on this path.
+    /// `DARKBLOOM_GEMMA4_FINAL_NORM_RR=0` restores the incumbent text and
+    /// name byte for byte.
+    static let finalNormRrEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_FINAL_NORM_RR"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
 
-            const uint base = row * 2816 + lid * 4;
-            const uint wbase = lid * 4;
+    private static let rrSuffix: String = finalNormRrEnabled ? "_rr1" : ""
 
-            // Exact `rms_single_row<T, 4>` reduction for axis 2816.
-            float acc = 0.0f;
-            for (int i = 0; i < 4; ++i) {
-                const float xi = x[base + i];
-                acc += xi * xi;
+    /// RR keeps the normalizer in the per-thread `local_inv_rr` register
+    /// the RR combine declares, so the threadgroup `local_inv` plane is not
+    /// declared at all.
+    private static let invDecl: String =
+        finalNormRrEnabled ? "" : "threadgroup float local_inv[1];"
+
+    /// The normalizer read the norm body uses: the per-thread register in
+    /// the RR emission, the published threadgroup slot otherwise.
+    private static let invRead: String =
+        finalNormRrEnabled ? "local_inv_rr" : "local_inv[0]"
+
+    private static let rrCombine: String = """
+            if (simd_lane_id == 0) {
+                local_sums[simd_group_id] = acc;
             }
-            acc = simd_sum(acc);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            acc = simd_sum(
+                simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
+            float local_inv_rr =
+                metal::precise::rsqrt(acc / 2816.0f + 1e-06f);
+            """
+
+    private static let combine: String = finalNormRrEnabled ? rrCombine : """
             if (simd_group_id == 0) {
                 local_sums[simd_lane_id] = 0.0f;
             }
@@ -6851,12 +6881,39 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            """
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v1"
+            + rrSuffix,
+        inputNames: ["x", "w"],
+        outputNames: ["out", "xSums"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            \(invDecl)
+            threadgroup float local_sums[32];
+            threadgroup float quad_sums[704];
+
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+
+            // Exact `rms_single_row<T, 4>` reduction for axis 2816.
+            float acc = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                const float xi = x[base + i];
+                acc += xi * xi;
+            }
+            acc = simd_sum(acc);
+            \(combine)
 
             T outv[4];
             for (int i = 0; i < 4; ++i) {
                 // Preserve the stock RMSNorm's BF16 boundary exactly.
                 outv[i] = w[wbase + i]
-                    * static_cast<T>((float)x[base + i] * local_inv[0]);
+                    * static_cast<T>((float)x[base + i] * \(invRead));
                 out[base + i] = outv[i];
             }
 
@@ -6909,6 +6966,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             produced: outputs[1], for: outputs[0])
         else { return nil }
         CBv2EngageMark.once("final-norm-mma-xsum")
+        if finalNormRrEnabled { CBv2EngageMark.once("final-norm-rr") }
         return (outputs[0], sums)
     }
 }

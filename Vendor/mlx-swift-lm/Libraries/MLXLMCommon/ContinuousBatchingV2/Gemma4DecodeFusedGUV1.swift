@@ -20,8 +20,11 @@ public enum Gemma4DecodeFusedGUV1 {
     /// impls inline into the same kernel, so their registers were charged to
     /// the 86% of threadgroups that never execute them.
     /// `DARKBLOOM_GEMMA4_GU_RUN_CAP=4` restores the incumbent.
+    /// The default was carried back to 4 by a retention bundle whose own donor
+    /// receipt for that line was a regression, which left this block's measured
+    /// claim contradicting the value below. Restored to the measured optimum.
     static let runCap: Int = {
-        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_RUN_CAP"] ?? "4"
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_RUN_CAP"] ?? "2"
         return Int(raw).map { min(max($0, 1), 4) } ?? 2
     }()
 

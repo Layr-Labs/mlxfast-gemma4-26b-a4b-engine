@@ -122,7 +122,7 @@ inline float mma8_runsum4(uint4 r) {
 
 #define MMA8_STEP(BB, J) A.thread_elements()[0] = float(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = float(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, BB, C);
 
-template <typename T, int KS, int KFIX>
+template <typename T, int KS, int KFIX, int NFIX = 0>
 METAL_FUNC void qkv_mma8_affine4_g64_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -220,8 +220,9 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
     acc1 = acc1 + other.y;
   }
 
-  y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
-  y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
+  const int strideN = (NFIX != 0) ? NFIX : N;
+  y[c.fn * strideN + n0 + c.fm] = static_cast<T>(acc0);
+  y[(c.fn + 1) * strideN + n0 + c.fm] = static_cast<T>(acc1);
 }
 
 // MMA-MT-001: the promoted Q/K/V matrix-unit body with TWO eight-column output
@@ -247,7 +248,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
 // identical [0, gh) / [gh, G) split across the threadgroup's two simdgroups
 // and the identical simdgroup-0-adds-simdgroup-1 close, per tile. Every output
 // word is therefore the same float sum accumulated in the same order.
-template <typename T, int KS, int TILES, int KFIX, int SPLIT = 0>
+template <typename T, int KS, int TILES, int KFIX, int SPLIT = 0, int NFIX = 0>
 METAL_FUNC void qkv_mma8_affine4_g64_mt(
     const device uint32_t* w,
     const device T* scales,
@@ -392,8 +393,9 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
   for (int t = 0; t < TILES; ++t) {
     const int nt = n0 + t * 8;
     if (SPLIT == 0) {
-      y[c.fn * N + nt + c.fm] = static_cast<T>(acc0[t]);
-      y[(c.fn + 1) * N + nt + c.fm] = static_cast<T>(acc1[t]);
+      const int strideN = (NFIX != 0) ? NFIX : N;
+      y[c.fn * strideN + nt + c.fm] = static_cast<T>(acc0[t]);
+      y[(c.fn + 1) * strideN + nt + c.fm] = static_cast<T>(acc1[t]);
     } else {
       // Fused Q||K plane: columns below SPLIT belong to Q, the rest to K.
       // Both rows of a store pair share one column, so the branch is uniform.
@@ -402,10 +404,10 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         y[c.fn * SPLIT + col] = static_cast<T>(acc0[t]);
         y[(c.fn + 1) * SPLIT + col] = static_cast<T>(acc1[t]);
       } else {
-        const int n2 = N - SPLIT;
+        const int stride_n2 = (NFIX != 0) ? (NFIX - SPLIT) : (N - SPLIT);
         const int c2 = col - SPLIT;
-        y2[c.fn * n2 + c2] = static_cast<T>(acc0[t]);
-        y2[(c.fn + 1) * n2 + c2] = static_cast<T>(acc1[t]);
+        y2[c.fn * stride_n2 + c2] = static_cast<T>(acc0[t]);
+        y2[(c.fn + 1) * stride_n2 + c2] = static_cast<T>(acc1[t]);
       }
     }
   }
@@ -416,7 +418,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
 // (row, g) entry is the value the incumbent's own runsum4 pair and 2/4/16
 // butterfly produce for that row and group, so the `acc += s * C + rs[i] * b`
 // step consumes the identical float. Everything else is the incumbent text.
-template <typename T, int KS, int KFIX>
+template <typename T, int KS, int KFIX, int NFIX = 0>
 METAL_FUNC void qkv_mma8_affine4_g64_rsp(
     const device uint32_t* w,
     const device T* scales,
@@ -497,8 +499,9 @@ METAL_FUNC void qkv_mma8_affine4_g64_rsp(
     acc1 = acc1 + other.y;
   }
 
-  y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
-  y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
+  const int strideN = (NFIX != 0) ? NFIX : N;
+  y[c.fn * strideN + n0 + c.fm] = static_cast<T>(acc0);
+  y[(c.fn + 1) * strideN + n0 + c.fm] = static_cast<T>(acc1);
 }
 
 // MMA-RS-001: the two-tile MMA-MT-001 body with the run sums read from the
@@ -508,7 +511,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_rsp(
 // output word is the same float sum in the same order.
 // QKFUSE-001 merge: the SPLIT/y2 store split mirrors the MT body's, so the
 // fused concatenated-N dispatch can consume this rsp body unchanged.
-template <typename T, int KS, int TILES, int KFIX, int SPLIT = 0>
+template <typename T, int KS, int TILES, int KFIX, int SPLIT = 0, int NFIX = 0>
 METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     const device uint32_t* w,
     const device T* scales,
@@ -612,8 +615,9 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
   for (int t = 0; t < TILES; ++t) {
     const int nt = n0 + t * 8;
     if (SPLIT == 0) {
-      y[c.fn * N + nt + c.fm] = static_cast<T>(acc0[t]);
-      y[(c.fn + 1) * N + nt + c.fm] = static_cast<T>(acc1[t]);
+      const int strideN = (NFIX != 0) ? NFIX : N;
+      y[c.fn * strideN + nt + c.fm] = static_cast<T>(acc0[t]);
+      y[(c.fn + 1) * strideN + nt + c.fm] = static_cast<T>(acc1[t]);
     } else {
       // Fused Q||K plane: columns below SPLIT belong to Q, the rest to K.
       // Both rows of a store pair share one column, so the branch is uniform.
@@ -622,10 +626,10 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         y[c.fn * SPLIT + col] = static_cast<T>(acc0[t]);
         y[(c.fn + 1) * SPLIT + col] = static_cast<T>(acc1[t]);
       } else {
-        const int n2 = N - SPLIT;
+        const int stride_n2 = (NFIX != 0) ? (NFIX - SPLIT) : (N - SPLIT);
         const int c2 = col - SPLIT;
-        y2[c.fn * n2 + c2] = static_cast<T>(acc0[t]);
-        y2[(c.fn + 1) * n2 + c2] = static_cast<T>(acc1[t]);
+        y2[c.fn * stride_n2 + c2] = static_cast<T>(acc0[t]);
+        y2[(c.fn + 1) * stride_n2 + c2] = static_cast<T>(acc1[t]);
       }
     }
   }
@@ -665,6 +669,23 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
+    private static let multiTileKernelN2048 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_n2048_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt<T, 2, 2, 2816, 0, 2048>(
+                w, scales, biases, x, y,
+                2048, int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
     /// QKFUSE-001 arm. Default ON.
     /// `DARKBLOOM_GEMMA4_QKV_FUSE_QK=0` restores the two separate dispatches.
     public static let fuseQKEnabled: Bool = {
@@ -681,9 +702,9 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         source: """
             const uint3 tid = threadgroup_position_in_grid;
             threadgroup float2 red[64];
-            qkv_mma8_affine4_g64_mt<T, 2, 2, 2816, 4096>(
+            qkv_mma8_affine4_g64_mt<T, 2, 2, 2816, 4096, 6144>(
                 w, scales, biases, x, y,
-                w_shape[0], int(tid.y) * 16, red,
+                6144, int(tid.y) * 16, red,
                 simdgroup_index_in_threadgroup,
                 thread_index_in_simdgroup, y2);
             return;
@@ -698,9 +719,9 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         source: """
             const uint3 tid = threadgroup_position_in_grid;
             threadgroup float2 red[64];
-            qkv_mma8_affine4_g64_mt<T, 2, 2, 2816, 8192>(
+            qkv_mma8_affine4_g64_mt<T, 2, 2, 2816, 8192, 9216>(
                 w, scales, biases, x, y,
-                w_shape[0], int(tid.y) * 16, red,
+                9216, int(tid.y) * 16, red,
                 simdgroup_index_in_threadgroup,
                 thread_index_in_simdgroup, y2);
             return;
@@ -720,9 +741,9 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         source: """
             const uint3 tid = threadgroup_position_in_grid;
             threadgroup float2 red[64];
-            qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816, 4096>(
+            qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816, 4096, 6144>(
                 w, scales, biases, x, rs_table, y,
-                w_shape[0], int(tid.y) * 16, red,
+                6144, int(tid.y) * 16, red,
                 simdgroup_index_in_threadgroup,
                 thread_index_in_simdgroup, y2);
             return;
@@ -737,9 +758,9 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         source: """
             const uint3 tid = threadgroup_position_in_grid;
             threadgroup float2 red[64];
-            qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816, 8192>(
+            qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816, 8192, 9216>(
                 w, scales, biases, x, rs_table, y,
-                w_shape[0], int(tid.y) * 16, red,
+                9216, int(tid.y) * 16, red,
                 simdgroup_index_in_threadgroup,
                 thread_index_in_simdgroup, y2);
             return;
@@ -814,6 +835,23 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816>(
                 w, scales, biases, x, rs_table, y,
                 w_shape[0], int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    private static let multiTileRspKernelN2048 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_n2048_v1",
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816, 0, 2048>(
+                w, scales, biases, x, rs_table, y,
+                2048, int(tid.y) * 16, red,
                 simdgroup_index_in_threadgroup,
                 thread_index_in_simdgroup);
             return;
@@ -1048,6 +1086,26 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
 
         let yTiles = outputWidth / outputsPerGroup
         if multiTileEnabled, yTiles % tilesPerGroup == 0 {
+            if outputWidth == 2048 {
+                if tableReady {
+                    return multiTileRspKernelN2048(
+                        [x, weight, scales, biases, rsTable!],
+                        template: [("T", x.dtype)],
+                        grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),
+                        threadGroup: (simdWidth, simdGroups, 1),
+                        outputShapes: [[batch, sequence, outputWidth]],
+                        outputDTypes: [x.dtype]
+                    )[0]
+                }
+                return multiTileKernelN2048(
+                    [x, weight, scales, biases],
+                    template: [("T", x.dtype)],
+                    grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),
+                    threadGroup: (simdWidth, simdGroups, 1),
+                    outputShapes: [[batch, sequence, outputWidth]],
+                    outputDTypes: [x.dtype]
+                )[0]
+            }
             if tableReady {
                 return multiTileRspKernel(
                     [x, weight, scales, biases, rsTable!],

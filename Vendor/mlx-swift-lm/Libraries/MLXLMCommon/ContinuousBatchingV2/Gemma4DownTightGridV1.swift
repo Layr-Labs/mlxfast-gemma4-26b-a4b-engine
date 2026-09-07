@@ -51,50 +51,6 @@ public enum Gemma4DownTightGridV1 {
         compiledGateUpEnabled && StreamOrDevice.default == .gpu
     }
 
-    /// DQS1 reuses quartets on the admitted path. "0" restores the original;
-    /// "control" emits quartets but recomputes the sums for comparison.
-    private static let quartetMode: Int = {
-        switch ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_DOWN_QUARTET_SUMS"]?.lowercased() {
-        case nil: return 2
-        case "control": return 1
-        case "1", "reuse": return 2
-        default: return 0
-        }
-    }()
-
-    private static var quartetAvailable: Bool {
-        quartetMode != 0 && enabled && compiledGateUpAvailable
-            && tileSpan == 1 && packedWordLoads
-            && Gemma4DecodeFusedGUV1.enabled
-            && (Gemma4DecodeFusedGUV1.runCap == 2 || Gemma4DecodeFusedGUV1.runCap == 4)
-    }
-
-    private static let compiledQuartetControl: @Sendable ([MLXArray]) -> [MLXArray] =
-        makeCompiledQuartets(reuse: false)
-    private static let compiledQuartetReuse: @Sendable ([MLXArray]) -> [MLXArray] =
-        makeCompiledQuartets(reuse: true)
-
-    private static func makeCompiledQuartets(
-        reuse: Bool
-    ) -> @Sendable ([MLXArray]) -> [MLXArray] {
-        MLX.compile(shapeless: false) { inputs in
-            let gu = Gemma4DecodeFusedGUV1.callWithDownQuartets(
-                [inputs[0], inputs[1], inputs[2], inputs[6], inputs[7], inputs[8]])
-            return [callWithQuartets(
-                [inputs[3], inputs[4], inputs[5], gu[0], inputs[9], inputs[8], gu[1]],
-                reuse: reuse)]
-        }
-    }
-
-    /// Internal launch. The compiled producer above owns BOTH activation inputs.
-    static func callWithQuartets(_ inputs: [MLXArray], reuse: Bool) -> MLXArray {
-        (reuse ? kernelQuartetReuse : kernelQuartetControl)(
-            inputs, template: [("T", DType.bfloat16), ("USE_QUARTETS", reuse)],
-            grid: (32, 352 * 2, 64), threadGroup: (32, 2, 1),
-            outputShapes: [[64, 1, 2816]], outputDTypes: [.bfloat16])[0]
-    }
-
     // One identity across layers. Every tensor, including both projections' weights
     // and the shared RHS, is substituted from the current explicit arguments.
     private static let compiledGateUpDown: @Sendable ([MLXArray]) -> [MLXArray] =
@@ -167,20 +123,7 @@ public enum Gemma4DownTightGridV1 {
             x: MLXArray, storage: SwitchGateUpFusedStorage, lhs: MLXArray,
             rhs: MLXArray, downLHS: MLXArray, taggedRoute: Bool = false
         ) -> MLXArray? {
-            if taggedRoute, Gemma4DownTightGridV1.quartetAvailable,
-                x.dtype == .bfloat16,
-                (x.shape == [8, 2816] || x.shape == [8, 1, 2816]),
-                lhs.dtype == .uint32, lhs.shape == [64],
-                rhs.dtype == .uint32, rhs.shape == [64],
-                downLHS.dtype == .uint32, downLHS.shape == [64]
-            {
-                return (Gemma4DownTightGridV1.quartetMode == 2
-                    ? Gemma4DownTightGridV1.compiledQuartetReuse
-                    : Gemma4DownTightGridV1.compiledQuartetControl)(
-                    [storage.weight, storage.scales, storage.biases, weight, scales, biases,
-                     x, lhs, rhs, downLHS]).first
-            }
-            return (taggedRoute
+            (taggedRoute
                 ? Gemma4DownTightGridV1.compiledGateUpDownTagged
                 : Gemma4DownTightGridV1.compiledGateUpDown)(
                 [storage.weight, storage.scales, storage.biases, weight, scales, biases,
@@ -206,18 +149,14 @@ public enum Gemma4DownTightGridV1 {
     /// reads of `rhs_indices` -- can never execute, yet they inline into the
     /// tile helper and are charged to every threadgroup. Selected per call from
     /// the producer's own contract; distinct kernel name; bit-identical output.
-    private static func makeKernel(
-        tagged: Bool, quartets: Bool = false, reuse: Bool = false
-    ) -> MLXFast.MLXFastKernel {
+    private static func makeKernel(tagged: Bool) -> MLXFast.MLXFastKernel {
         MLXFast.metalKernel(
-        name: "gemma4_b8_down_qmv_span4_tight_zorder_v1"
+        name: "gemma4_b8_down_qmv_span4_tight_zorder_v2_solo1"
             + (packedWordLoads ? "_word32" : "")
-            + (tagged ? "_tagged_v1" : "")
-            + (quartets ? (reuse ? "_dqs1_reuse" : "_dqs1_control") : ""),
-        inputNames: ["w", "scales", "biases", "x", "lhs_indices", "rhs_indices"]
-            + (quartets ? ["quartets"] : []),
+            + (tagged ? "_tagged_v1" : ""),
+        inputNames: ["w", "scales", "biases", "x", "lhs_indices", "rhs_indices"],
         outputNames: ["y"],
-        source: quartets ? quartetSource : #"""
+        source: #"""
 uint3 tid = threadgroup_position_in_grid;
 const uint linear = tid.y + tid.z * (352 / SPAN);
 tid.y = (linear / 64) * SPAN;
@@ -670,6 +609,29 @@ inline void qdot_affine4_pair_word(
   out1 = scale * accum1 + sum1 * bias;
 }
 
+template <typename U, int values_per_thread>
+inline U qdot_affine4_registered_word(
+    uint packed_word,
+    const thread U* x_thread,
+    U scale,
+    U bias,
+    U sum) {
+  static_assert(values_per_thread == 8, "Word load expects eight 4-bit values");
+  const uint packed0 = packed_word & 0xffffu;
+  const uint packed1 = packed_word >> 16;
+  U accum =
+      (x_thread[0] * (packed0 & 0x000f) +
+       x_thread[1] * (packed0 & 0x00f0) +
+       x_thread[2] * (packed0 & 0x0f00) +
+       x_thread[3] * (packed0 & 0xf000));
+  accum +=
+      (x_thread[4] * (packed1 & 0x000f) +
+       x_thread[5] * (packed1 & 0x00f0) +
+       x_thread[6] * (packed1 & 0x0f00) +
+       x_thread[7] * (packed1 & 0xf000));
+  return scale * accum + sum * bias;
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
@@ -965,6 +927,92 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   }
 }
 
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine4_g64_solo_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    device T* y0,
+    const constant int& in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 8;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x0_thread[values_per_thread];
+  thread uint packed[results_per_simdgroup];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float result0[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  y0 += out_row;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x0_thread, scale_local[row], bias_local[row], sum0);
+    }
+
+    ws += block_size / 2;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+  }
+
+  // Every Gemma 4 caller entering this specialized g64 path has K aligned to
+  // 64. The final block therefore contains an integral number of complete
+  // eight-value lane packets (32 lanes for K=2816, 24 for expert down_proj
+  // K=704); no active lane needs the generic dynamic safe-tail loops.
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum0 =
+        load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x0_thread, scale_local[row], bias_local[row], sum0);
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    if (simd_lid == 0) {
+      y0[row] = static_cast<T>(result0[row]);
+    }
+  }
+}
+
 template <typename T, int group_size, int bits, int span>
 METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device uint32_t* w,
@@ -1053,14 +1101,13 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
+    qmv_affine4_g64_solo_impl<T, group_size, bits>(
         tile_w,
         tile_scales,
         tile_biases,
         tile_x0,
         tile_y0,
         in_vec_size,
-        out_vec_size,
         tile_tid,
         simd_gid,
         simd_lid);
@@ -1069,128 +1116,10 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
 
 constant int gemma4_tight_down_K=704;
 constant int gemma4_tight_down_N=2816;
-"""# + (quartets ? quartetHeader : ""),
+"""#,
         ensureRowContiguous: true)
     }
 
-    private static let quartetSource = #"""
-const uint3 tid=threadgroup_position_in_grid;
-const uint linear=tid.y+tid.z*352u;
-const uint a=linear%64u, tile=linear/64u;
-const uint word=rhs_indices[a];
-const uint expert=word&0xffu, offset=(word>>8)&0x3fu;
-if((offset&1u)!=0u)return;
-const bool pair=(((word>>14)&0x3fu)+1u)>1u;
-const uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
-const uint out_row=tile*8u+sg*4u;
-const uint r0=lhs_indices[a];
-const device uint* ew=w+expert*(2816u*88u);
-const device T* es=scales+expert*(2816u*11u);
-const device T* eb=biases+expert*(2816u*11u);
-if(pair){
-    const uint r1=lhs_indices[a+1u];
-    dqs_qmv<T,true,USE_QUARTETS>(ew,es,eb,
-        x+r0*704u,x+r1*704u,quartets+r0*176u,quartets+r1*176u,
-        y+a*2816u,y+(a+1u)*2816u,out_row,lane);
-}else{
-    dqs_qmv<T,false,USE_QUARTETS>(ew,es,eb,
-        x+r0*704u,x+r0*704u,quartets+r0*176u,quartets+r0*176u,
-        y+a*2816u,y+a*2816u,out_row,lane);
-}
-"""#
-
-    private static let quartetHeader = #"""
-template<typename T,bool USE>
-METAL_FUNC float dqs_load(const device T* x,thread float* v,
-                         const device float* q){
-    if(!USE)return load_vector<T,float,8,4>(x,v);
-    float sum=0.0f;
-    for(int i=0;i<8;i+=4){
-        sum+=q[i/4];
-        v[i]=x[i];
-        v[i+1]=x[i+1]/16.0f;
-        v[i+2]=x[i+2]/256.0f;
-        v[i+3]=x[i+3]/4096.0f;
-    }
-    return sum;
-}
-
-template<typename T,bool PAIR,bool USE>
-METAL_FUNC void dqs_packet(
-    const device uint8_t* ws,const device T* scales,const device T* biases,
-    const device T* x0,const device T* x1,
-    const device float* q0,const device float* q1,
-    thread float* result0,thread float* result1){
-    thread float v0[8],v1[8];
-    thread uint packed[4];
-    thread float sl[4],bl[4];
-    if(PAIR){
-        // Keep the incumbent pair's complete preloads and loaded scalar types.
-        for(int r=0;r<4;++r){
-            packed[r]=*((const device uint*)(ws+r*352));
-            sl[r]=scales[r*11];
-            bl[r]=biases[r*11];
-        }
-    }
-    const float sum0=dqs_load<T,USE>(x0,v0,q0);
-    if(PAIR){
-        const float sum1=dqs_load<T,USE>(x1,v1,q1);
-        for(int r=0;r<4;++r){
-            float dot0,dot1;
-            qdot_affine4_pair_word<float,8>(
-                packed[r],v0,v1,sl[r],bl[r],sum0,sum1,dot0,dot1);
-            result0[r]+=dot0;
-            result1[r]+=dot1;
-        }
-    }else{
-        for(int r=0;r<4;++r){
-            const float s=scales[r*11],b=biases[r*11];
-            result0[r]+=qdot<float,8,4>(ws+r*352,v0,s,b,sum0);
-        }
-    }
-}
-
-template<typename T,bool PAIR,bool USE>
-METAL_FUNC void dqs_qmv(
-    const device uint* w,const device T* scales,const device T* biases,
-    const device T* x0,const device T* x1,
-    const device float* q0,const device float* q1,
-    device T* y0,device T* y1,uint out_row,uint lane){
-    const device uint8_t* ws=(const device uint8_t*)w;
-    ws+=out_row*352u+lane*4u;
-    scales+=out_row*11u+lane/8u;
-    biases+=out_row*11u+lane/8u;
-    x0+=lane*8u;x1+=lane*8u;
-    q0+=lane*2u;q1+=lane*2u;
-    y0+=out_row;y1+=out_row;
-    thread float result0[4]={0},result1[4]={0};
-    int k=0;
-    for(;k<=704-256;k+=256){
-        dqs_packet<T,PAIR,USE>(
-            ws,scales,biases,x0,x1,q0+k/4,q1+k/4,result0,result1);
-        ws+=128;scales+=4;biases+=4;
-        x0+=256;x1+=256;
-    }
-    const uint active_tail_lanes=uint((704-k)/8);
-    if(lane<active_tail_lanes){
-        dqs_packet<T,PAIR,USE>(
-            ws,scales,biases,x0,x1,q0+k/4,q1+k/4,result0,result1);
-    }
-    for(int r=0;r<4;++r){
-        result0[r]=simd_sum(result0[r]);
-        if(PAIR)result1[r]=simd_sum(result1[r]);
-        if(lane==0u){
-            y0[r]=static_cast<T>(result0[r]);
-            if(PAIR)y1[r]=static_cast<T>(result1[r]);
-        }
-    }
-}
-"""#
-
     private static let kernel: MLXFast.MLXFastKernel = makeKernel(tagged: false)
     private static let kernelTagged: MLXFast.MLXFastKernel = makeKernel(tagged: true)
-    private static let kernelQuartetControl: MLXFast.MLXFastKernel =
-        makeKernel(tagged: true, quartets: true, reuse: false)
-    private static let kernelQuartetReuse: MLXFast.MLXFastKernel =
-        makeKernel(tagged: true, quartets: true, reuse: true)
 }

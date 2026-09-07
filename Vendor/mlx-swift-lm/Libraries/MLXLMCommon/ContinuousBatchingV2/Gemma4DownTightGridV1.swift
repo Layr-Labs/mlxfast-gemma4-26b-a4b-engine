@@ -38,42 +38,6 @@ public enum Gemma4DownTightGridV1 {
         #endif
     }()
 
-    /// The singleton QMV consumes one aligned eight-code packet per lane.
-    /// Fetch its two 16-bit halves with one 32-bit load, preserving the qdot.
-    static let packedWordLoads =
-        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_PACKED_WORD_LOAD"] != "0"
-
-    private static let compiledGateUpEnabled =
-        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_COMPILED_GU_DOWN"] != "0"
-
-    /// Check the task-local stream on every attempt, outside the trace.
-    static var compiledGateUpAvailable: Bool {
-        compiledGateUpEnabled && StreamOrDevice.default == .gpu
-    }
-
-    // One identity across layers. Every tensor, including both projections' weights
-    // and the shared RHS, is substituted from the current explicit arguments.
-    private static let compiledGateUpDown: @Sendable ([MLXArray]) -> [MLXArray] =
-        makeCompiledGateUpDown(tagged: false)
-
-    /// ROUTE-TAG needs the variant baked at trace time, so the tagged identity
-    /// is a second compiled closure rather than a branch inside one.
-    private static let compiledGateUpDownTagged: @Sendable ([MLXArray]) -> [MLXArray] =
-        makeCompiledGateUpDown(tagged: true)
-
-    private static func makeCompiledGateUpDown(
-        tagged: Bool
-    ) -> @Sendable ([MLXArray]) -> [MLXArray] {
-        MLX.compile(shapeless: false) { inputs in
-            let activated = Gemma4DecodeFusedGUV1.call(
-                [inputs[0], inputs[1], inputs[2], inputs[6], inputs[7], inputs[8]],
-                taggedRoute: tagged)
-            return [Gemma4DownTightGridV1.call(
-                [inputs[3], inputs[4], inputs[5], activated, inputs[9], inputs[8]],
-                span: tileSpan, taggedRoute: tagged)]
-        }
-    }
-
     /// Bound to the immutable sanitized checkpoint, like the fused gate/up storage.
     public final class Storage {
         private let weight: MLXArray
@@ -91,69 +55,29 @@ public enum Gemma4DownTightGridV1 {
         }
 
         static func admits(x: MLXArray, indices: MLXArray) -> Bool {
-            admits(xShape: x.shape, xDType: x.dtype, indices: indices)
-        }
-
-        static func admits(xShape: [Int], xDType: DType, indices: MLXArray) -> Bool {
-            xDType == .bfloat16 && xShape == [64, 1, 704]
+            x.dtype == .bfloat16 && x.shape == [64, 1, 704]
                 && indices.dtype == .uint32 && indices.shape == [64]
         }
 
         /// The caller supplies the incumbent identity LHS and sorted RHS keys.
-        func call(
-            x: MLXArray, lhsIndices: MLXArray, indices: MLXArray,
-            taggedRoute: Bool = false
-        ) -> MLXArray {
-            call(x: x, lhsIndices: lhsIndices, indices: indices,
-                span: tileSpan, taggedRoute: taggedRoute)
+        func call(x: MLXArray, lhsIndices: MLXArray, indices: MLXArray) -> MLXArray {
+            call(x: x, lhsIndices: lhsIndices, indices: indices, span: tileSpan)
         }
 
         func call(
-            x: MLXArray, lhsIndices: MLXArray, indices: MLXArray, span: Int,
-            taggedRoute: Bool = false
+            x: MLXArray, lhsIndices: MLXArray, indices: MLXArray, span: Int
         ) -> MLXArray {
-            Gemma4DownTightGridV1.call(
-                [weight, scales, biases, x, lhsIndices, indices], span: span,
-                taggedRoute: taggedRoute)
-        }
-
-        /// The caller has checked compiledGateUpAvailable and both projection
-        /// contracts. Storage is read here, never captured by the compiled body.
-        func callCompiledGateUp(
-            x: MLXArray, storage: SwitchGateUpFusedStorage, lhs: MLXArray,
-            rhs: MLXArray, downLHS: MLXArray, taggedRoute: Bool = false
-        ) -> MLXArray? {
-            (taggedRoute
-                ? Gemma4DownTightGridV1.compiledGateUpDownTagged
-                : Gemma4DownTightGridV1.compiledGateUpDown)(
-                [storage.weight, storage.scales, storage.biases, weight, scales, biases,
-                 x, lhs, rhs, downLHS]).first
+            kernel(
+                [weight, scales, biases, x, lhsIndices, indices],
+                template: [("T", DType.bfloat16), ("SPAN", span)],
+                grid: (32, (352 / span) * 2, 64), threadGroup: (32, 2, 1),
+                outputShapes: [[64, 1, 2816]], outputDTypes: [.bfloat16]
+            )[0]
         }
     }
 
-    /// Raw launch for callers that already passed the tight-DOWN contract.
-    static func call(
-        _ inputs: [MLXArray], span: Int, taggedRoute: Bool = false
-    ) -> MLXArray {
-        (taggedRoute ? kernelTagged : kernel)(
-            inputs,
-            template: [("T", DType.bfloat16), ("SPAN", span)],
-            grid: (32, (352 / span) * 2, 64), threadGroup: (32, 2, 1),
-            outputShapes: [[64, 1, 2816]], outputDTypes: [.bfloat16]
-        )[0]
-    }
-
-    /// DOWN-TAGGED-ROUTE. Companion to the gate/up variant: with prefix-bounds
-    /// tagged route words the raw-key fallbacks here -- a backward scan for
-    /// `run_offset` and a forward peek for `has_pair`, both data-dependent
-    /// reads of `rhs_indices` -- can never execute, yet they inline into the
-    /// tile helper and are charged to every threadgroup. Selected per call from
-    /// the producer's own contract; distinct kernel name; bit-identical output.
-    private static func makeKernel(tagged: Bool) -> MLXFast.MLXFastKernel {
-        MLXFast.metalKernel(
-        name: "gemma4_b8_down_qmv_span4_tight_zorder_v1"
-            + (packedWordLoads ? "_word32" : "")
-            + (tagged ? "_tagged_v1" : ""),
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_b8_down_qmv_span4_tight_zorder_v1",
         inputNames: ["w", "scales", "biases", "x", "lhs_indices", "rhs_indices"],
         outputNames: ["y"],
         source: #"""
@@ -170,8 +94,7 @@ gather_qmv_gemma4_down_tile<T, 64, 4, SPAN>(
     704, 2816 * 704 / 8, 2816 * 704 / 64, 2816 * 704 / 64,
     tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
 """#,
-        header: "#define DOWN_PACKED_WORD_LOAD \(packedWordLoads ? 1 : 0)\n"
-            + "#define DOWN_TAGGED_ROUTE \(tagged ? 1 : 0)\n" + #"""
+        header: #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helper bodies verified byte-identical to 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -398,20 +321,6 @@ inline U qdot(
   }
 
   else if (bits == 4) {
-#if DOWN_PACKED_WORD_LOAD
-    // Each admitted lane packet contains eight aligned 4-bit codes. Only the
-    // integer load changes: the two four-value sums and their order stay exact.
-    static_assert(values_per_thread == 8, "This kernel uses eight-value packets");
-    const uint packet = *((const device uint*)w);
-    for (int i = 0; i < (values_per_thread / 4); i++) {
-      const uint word = (packet >> (16 * i)) & 0xffffu;
-      accum +=
-          (x_thread[4 * i] * (word & 0x000f) +
-           x_thread[4 * i + 1] * (word & 0x00f0) +
-           x_thread[4 * i + 2] * (word & 0x0f00) +
-           x_thread[4 * i + 3] * (word & 0xf000));
-    }
-#else
     const device uint16_t* ws = (const device uint16_t*)w;
     for (int i = 0; i < (values_per_thread / 4); i++) {
       accum +=
@@ -420,7 +329,6 @@ inline U qdot(
            x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
            x_thread[4 * i + 3] * (ws[i] & 0xf000));
     }
-#endif
   }
 
   else if (bits == 5) {
@@ -930,10 +838,6 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   }
   const uint assignment = tid.z;
   const uint32_t route_word = rhs_indices[assignment * rhs_stride];
-#if DOWN_TAGGED_ROUTE
-  const uint32_t expert = route_word & 0xffu;
-  const uint run_offset = (route_word >> 8) & 0x3fu;
-#else
   const bool expert_prefix_bounds = (route_word & 0x80000000u) != 0u;
   const uint32_t expert =
       expert_prefix_bounds ? (route_word & 0xffu) : route_word;
@@ -948,7 +852,6 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
       run_offset++;
     }
   }
-#endif
   // Odd positions are produced by the immediately preceding pair leader.
   if ((run_offset & 1) != 0) {
     return;
@@ -959,14 +862,10 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   const device T* tile_x0 =
       x + lhs_indices[assignment * lhs_stride] * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;
-#if DOWN_TAGGED_ROUTE
-  const bool has_pair = (((route_word >> 14) & 0x3fu) + 1u) > 1u;
-#else
   const bool has_pair = expert_prefix_bounds
       ? (((route_word >> 14) & 0x3fu) + 1u) > 1u
       : assignment + 1 < 64 &&
           rhs_indices[(assignment + 1) * rhs_stride] == expert;
-#endif
   if (has_pair) {
     const device T* tile_x1 =
         x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
@@ -1010,8 +909,4 @@ constant int gemma4_tight_down_K=704;
 constant int gemma4_tight_down_N=2816;
 """#,
         ensureRowContiguous: true)
-    }
-
-    private static let kernel: MLXFast.MLXFastKernel = makeKernel(tagged: false)
-    private static let kernelTagged: MLXFast.MLXFastKernel = makeKernel(tagged: true)
 }

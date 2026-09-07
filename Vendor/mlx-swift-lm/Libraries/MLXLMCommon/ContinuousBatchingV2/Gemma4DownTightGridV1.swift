@@ -43,6 +43,20 @@ public enum Gemma4DownTightGridV1 {
     static let packedWordLoads =
         ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_PACKED_WORD_LOAD"] != "0"
 
+    /// DOWN-SOLO. The pair path here is a specialization of the pinned
+    /// affine-4 / group-64 geometry; the singleton path is not, and still
+    /// calls the generic quantized-vector body. That body carries a second
+    /// full copy of the K walk for output widths under one tile and a dynamic
+    /// safe tail for partial lane packets, neither of which this kernel's
+    /// pinned `704 x 2816` shape can ever reach, and both of which are charged
+    /// to the singleton path's register allocation. The specialization is the
+    /// pair helper with the second stream deleted.
+    ///
+    /// `DARKBLOOM_GEMMA4_DOWN_SOLO=0` restores the generic body and the
+    /// incumbent kernel names byte for byte.
+    static let soloBody =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_SOLO"] != "0"
+
     private static let compiledGateUpEnabled =
         ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_COMPILED_GU_DOWN"] != "0"
 
@@ -153,6 +167,7 @@ public enum Gemma4DownTightGridV1 {
         MLXFast.metalKernel(
         name: "gemma4_b8_down_qmv_span4_tight_zorder_v1"
             + (packedWordLoads ? "_word32" : "")
+            + (soloBody ? "_solo1" : "")
             + (tagged ? "_tagged_v1" : ""),
         inputNames: ["w", "scales", "biases", "x", "lhs_indices", "rhs_indices"],
         outputNames: ["y"],
@@ -171,7 +186,8 @@ gather_qmv_gemma4_down_tile<T, 64, 4, SPAN>(
     tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
 """#,
         header: "#define DOWN_PACKED_WORD_LOAD \(packedWordLoads ? 1 : 0)\n"
-            + "#define DOWN_TAGGED_ROUTE \(tagged ? 1 : 0)\n" + #"""
+            + "#define DOWN_TAGGED_ROUTE \(tagged ? 1 : 0)\n"
+            + "#define DOWN_SOLO \(soloBody ? 1 : 0)\n" + #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helper bodies verified byte-identical to 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -609,6 +625,33 @@ inline void qdot_affine4_pair_word(
   out1 = scale * accum1 + sum1 * bias;
 }
 
+// DOWN-SOLO. The one-stream twin of the pair word dot above, and term for term
+// the `bits == 4` branch of the generic `qdot` under `DOWN_PACKED_WORD_LOAD`:
+// the same two four-value sums, in the same order, closed with the same
+// `scale * accum + sum * bias`.
+template <typename U, int values_per_thread>
+inline U qdot_affine4_solo_word(
+    uint packedWord,
+    const thread U* x0,
+    U scale,
+    U bias,
+    U sum0) {
+  static_assert(values_per_thread == 8, "Word load expects eight 4-bit values");
+  const uint packed0 = packedWord & 0xffffu;
+  const uint packed1 = packedWord >> 16;
+  U accum0 =
+      (x0[0] * (packed0 & 0x000f) +
+       x0[1] * (packed0 & 0x00f0) +
+       x0[2] * (packed0 & 0x0f00) +
+       x0[3] * (packed0 & 0xf000));
+  accum0 +=
+      (x0[4] * (packed1 & 0x000f) +
+       x0[5] * (packed1 & 0x00f0) +
+       x0[6] * (packed1 & 0x0f00) +
+       x0[7] * (packed1 & 0xf000));
+  return scale * accum0 + sum0 * bias;
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
@@ -904,6 +947,99 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   }
 }
 
+// DOWN-SOLO. The singleton counterpart of the pair helper above, standing in
+// for the generic `qmv_impl` on the one path in this kernel that still calls
+// it. Every address, every walk bound and every arithmetic term is the pair
+// helper's with the second stream deleted; the pinned tight-DOWN geometry
+// (affine 4-bit, group 64, K = 704, N = 2816, one threadgroup in x) is what
+// lets the generic body's two shape branches and its dynamic safe tail go.
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine4_g64_solo_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    device T* y0,
+    const constant int& in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(group_size == 64, "solo path is the group-64 specialization");
+  static_assert(bits == 4, "solo path is the affine four-bit specialization");
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 8;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x0_thread[values_per_thread];
+  thread uint packed[results_per_simdgroup];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float result0[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  y0 += out_row;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_solo_word<float, values_per_thread>(
+          packed[row], x0_thread, scale_local[row], bias_local[row], sum0);
+    }
+
+    ws += block_size / 2;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+  }
+
+  // Same whole-packet tail contract as the pair helper: K is a whole number of
+  // 64-value groups, so the residue after the last full block is a whole number
+  // of eight-value lane packets (24 of them at K = 704) and no lane needs the
+  // generic dynamic safe tail.
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_solo_word<float, values_per_thread>(
+          packed[row], x0_thread, scale_local[row], bias_local[row], sum0);
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    if (simd_lid == 0) {
+      y0[row] = static_cast<T>(result0[row]);
+    }
+  }
+}
+
 template <typename T, int group_size, int bits, int span>
 METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device uint32_t* w,
@@ -992,6 +1128,18 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
+#if DOWN_SOLO
+    qmv_affine4_g64_solo_impl<T, group_size, bits>(
+        tile_w,
+        tile_scales,
+        tile_biases,
+        tile_x0,
+        tile_y0,
+        in_vec_size,
+        tile_tid,
+        simd_gid,
+        simd_lid);
+#else
     qmv_impl<T, group_size, bits>(
         tile_w,
         tile_scales,
@@ -1003,6 +1151,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
         tile_tid,
         simd_gid,
         simd_lid);
+#endif
   }
 }
 

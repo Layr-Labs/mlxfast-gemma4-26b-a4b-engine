@@ -6140,7 +6140,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// slot receives the K row the standalone kernel would have handed the
     /// incumbent store, so dispatches 1...3 read identical bytes.
     private static let ringStoreNormRopeKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1",
+        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1_nb1_ri1",
         inputNames: [
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -6213,19 +6213,22 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             sum = simd_sum(sum);
 
             threadgroup float partials[32];
-            threadgroup float inverse_rms;
             threadgroup T rounded[D];
-            if (simd_group == 0) partials[lane] = 0.0f;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // NORM-NB: 零初始化和它那道 barrier 只为让 32 lane 的 simd_sum 读到
+            // 确定值；改成有界读即可。越界 lane 贡献 0.0f，浮点加法的精确恒等。
+            // 界=4：本内核 threadGroup 固定 (128,1,1)（:6429），128/32=4 个 simdgroup，
+            // partials[4..31] 无人写。界取自发射几何，不取自注释。
             if (lane == 0) partials[simd_group] = sum;
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group == 0) {
-                sum = simd_sum(partials[lane]);
-                if (lane == 0) {
-                    inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // NORM-RI: 原来只让 simdgroup 0 算 inverse_rms，写进 threadgroup 标量，
+            // 再用第二道 barrier 广播给另外三个 simdgroup。四个 simdgroup 各自重算
+            // 同一个归约更便宜：读的是同一批 partials（上面那道 barrier 之后就不再
+            // 被写），simd_sum 的加法顺序由指令定死，precise::rsqrt 是纯函数，
+            // 四份结果逐位相同。省一个 threadgroup 标量、一次写、一道全组同步；
+            // 代价是 3 个多余的 rsqrt。
+            sum = simd_sum(lane < 4u ? partials[lane] : 0.0f);
+            const float inverse_rms =
+                metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
 
             const T4 wv = *reinterpret_cast<const device T4*>(weight);
             for (int i = 0; i < reads; ++i) {

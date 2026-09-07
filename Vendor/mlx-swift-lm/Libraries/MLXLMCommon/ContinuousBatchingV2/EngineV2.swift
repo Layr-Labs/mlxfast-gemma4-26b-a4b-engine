@@ -635,15 +635,13 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
 /// One-shot engagement markers for local diagnostics (armed by
 /// `MLXFAST_ENGAGE_MARKS=1`; stderr only — the worker's stdout is protocol).
 public enum CBv2EngageMark {
-    #if DEBUG || MLXFAST_ENABLE_ENGAGE_MARKS
     nonisolated(unsafe) private static var seen = Set<String>()
     private static let lock = NSLock()
     private static let armed =
         ProcessInfo.processInfo.environment["MLXFAST_ENGAGE_MARKS"] != nil
 
-    public static func once(_ tag: @autoclosure () -> String) {
+    public static func once(_ tag: String) {
         guard armed else { return }
-        let tag = tag()
         lock.lock()
         let fresh = seen.insert(tag).inserted
         lock.unlock()
@@ -651,16 +649,6 @@ public enum CBv2EngageMark {
             FileHandle.standardError.write(Data("[engage] \(tag)\n".utf8))
         }
     }
-    #else
-    /// Ranked release builds do not consume engagement diagnostics. Compile
-    /// the marker away completely so hot cross-module paths pay no wrapper,
-    /// environment guard, or eager tag construction. Developers can retain
-    /// the runtime `MLXFAST_ENGAGE_MARKS` facility in an optimized build with
-    /// `-Xswiftc -DMLXFAST_ENABLE_ENGAGE_MARKS`.
-    @inlinable
-    @inline(__always)
-    public static func once(_ tag: @autoclosure () -> String) {}
-    #endif
 }
 
 /// Fence for fast-ack engine shutdowns: every detached drain registers here,

@@ -61,10 +61,14 @@ final class CBv2MTPRoundInFlight {
         let k: Int
         /// Verify-batch rows, in batch row order.
         let rows: [VerifyRow]
-        /// Lazy flattened int32 packet: all [B, k] draft ids followed by all
-        /// [B, 1+k] target argmaxes. One `asArray` at finalize reads both,
-        /// preserving the single host-sync boundary.
-        let acceptancePacket: MLXArray
+        /// Legacy flattened int32 packet. When non-nil, it contains all
+        /// [B, k] draft ids followed by all [B, 1+k] target argmaxes.
+        let acceptancePacket: MLXArray?
+        /// Flattened [B * k] draft ids. The split representation avoids
+        /// materializing the concatenated acceptance packet.
+        let draftTokenIDs: MLXArray
+        /// Flattened [B * (1+k)] target argmaxes.
+        let targetArgmax: MLXArray
         /// Lazy [B, 1+k, H] pre-norm hidden — the next carry is gathered
         /// from it at the finalize sync (index = accepted position).
         let lastHidden: MLXArray

@@ -29,9 +29,18 @@ extension EngineLoopV2 {
 
         guard let verify = round.verify else { return }
         let k = verify.k
-        let host = verify.acceptancePacket.asArray(Int32.self)
         let draftCount = verify.rows.count * k
         let targetWidth = 1 + k
+        let draftHost: [Int32]
+        let targetHost: [Int32]
+        if let packet = verify.acceptancePacket {
+            let host = packet.asArray(Int32.self)
+            draftHost = Array(host[..<draftCount])
+            targetHost = Array(host[draftCount...])
+        } else {
+            draftHost = verify.draftTokenIDs.asArray(Int32.self)
+            targetHost = verify.targetArgmax.asArray(Int32.self)
+        }
         var anyRejected = false
 
         struct RowOutcome {
@@ -58,9 +67,9 @@ extension EngineLoopV2 {
                 continue
             }
             let rec = scheduler.record(for: id)!
-            let drafts = (0 ..< k).map { Int(host[batchIndex * k + $0]) }
+            let drafts = (0 ..< k).map { Int(draftHost[batchIndex * k + $0]) }
             let targets = (0 ..< targetWidth).map {
-                Int(host[draftCount + batchIndex * targetWidth + $0])
+                Int(targetHost[batchIndex * targetWidth + $0])
             }
 
             var accepted = 0
@@ -179,7 +188,7 @@ extension EngineLoopV2 {
                     requestID: id.raw,
                     k: k,
                     draftTokens: Array(
-                        host[batchIndex * k ..< (batchIndex + 1) * k].map(Int.init)),
+                        draftHost[batchIndex * k ..< (batchIndex + 1) * k].map(Int.init)),
                     targetTokens: outcome.targets,
                     accepted: accepted,
                     confirmed: confirmed,

@@ -4,6 +4,12 @@
 
 import Foundation
 import MLX
+private let cbv2MTPAcceptanceSplitEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_MTP_VERIFY_TOKEN_SPLIT"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
 
 struct CBv2MTPRowWork {
     let rec: CBv2ScheduledRequest
@@ -218,9 +224,15 @@ extension EngineLoopV2 {
             asyncEvalTargets.append(contentsOf: segment.evalTargets)
         }
         if let verify {
-            asyncEvalTargets.append(verify.acceptancePacket)
+            if let packet = verify.acceptancePacket {
+                asyncEvalTargets.append(packet)
+            } else {
+                asyncEvalTargets.append(verify.draftTokenIDs)
+                asyncEvalTargets.append(verify.targetArgmax)
+            }
             asyncEvalTargets.append(verify.lastHidden)
         }
+
         if let seedHidden { asyncEvalTargets.append(seedHidden) }
         if !cacheInnerState.isEmpty {
             asyncEvalTargets.append(contentsOf: cacheInnerState)
@@ -326,12 +338,22 @@ extension EngineLoopV2 {
             CBv2StepProfiler.record(
                 "v2.mtp.verify.build", seconds: CFAbsoluteTimeGetCurrent() - verifyStart)
         }
-        let acceptancePacket = concatenated(
-            [draftIDs.reshaped([-1]), target.argmax.reshaped([-1])], axis: 0)
+        let draftTokenIDs = draftIDs.reshaped([-1])
+        let targetArgmax = target.argmax.reshaped([-1])
+        let acceptancePacket: MLXArray?
+        if cbv2MTPAcceptanceSplitEnabled {
+            acceptancePacket = nil
+            CBv2EngageMark.once("mtp-verify-token-split")
+        } else {
+            acceptancePacket = concatenated(
+                [draftTokenIDs, targetArgmax], axis: 0)
+        }
         return CBv2MTPRoundInFlight.Verify(
             k: k,
             rows: rowMetadata,
             acceptancePacket: acceptancePacket,
+            draftTokenIDs: draftTokenIDs,
+            targetArgmax: targetArgmax,
             lastHidden: target.hidden)
     }
 

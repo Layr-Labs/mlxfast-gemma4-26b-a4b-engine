@@ -19,6 +19,17 @@ const char* quantized_nax() {
 using namespace metal;
 using namespace mlx::steel;
 
+// DARKBLOOM GEMMA4 NAX VOLATILE-FENCE ELIDE.
+// Every K-step loop body in the accelerated GEMM family declares an
+// uninitialised volatile int that is never written and is read once through
+// a discarded-value cast. With the elide on, neither the declaration nor the
+// read is emitted; no value in the kernel is derived from it.
+// Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE=0 to restore
+// the incumbent declaration and read at every site.
+#ifndef DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
+#define DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE 1
+#endif
+
 constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
 constant bool align_K [[function_constant(202)]];
@@ -1108,7 +1119,9 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
           NAXTile<T, TM, TK> Atile;
           NAXTile<T, TN, TK> Btile;
 
+#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
           volatile int compiler_barrier;
+#endif
 
           if constexpr (kAlignedM.value) {
             Atile.load(x + kk1, K);
@@ -1125,7 +1138,9 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
               Btile,
               metal::bool_constant<transpose_b>{});
 
+#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
           (void)compiler_barrier;
+#endif
         }
 
         x += BK;
@@ -1242,7 +1257,9 @@ METAL_FUNC void qmm_n_nax_tgp_impl(
       NAXTile<T, TM, TK> Atile;
       NAXTile<T, TK, TN> Btile;
 
+#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
       volatile int compiler_barrier;
+#endif
 
       Atile.load(x + kk1, K);
       Btile.template load<T, BN_padded, 1>(Ws + tn + kk1 * ldb_tgp);
@@ -1254,7 +1271,9 @@ METAL_FUNC void qmm_n_nax_tgp_impl(
           Btile,
           metal::bool_constant<transpose_b>{});
 
+#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
       (void)compiler_barrier;
+#endif
     }
 
     x += BK;
@@ -1631,17 +1650,6 @@ METAL_FUNC void gather_rhs_mma_frag_row(
 // Independent of the qmm-t family's switch.
 #ifndef DARKBLOOM_GEMMA4_NAX_GATHER_TILING
 #define DARKBLOOM_GEMMA4_NAX_GATHER_TILING 1
-#endif
-
-// DARKBLOOM GEMMA4 NAX VOLATILE-FENCE ELIDE.
-// Every K-step loop body in the accelerated GEMM family declares an
-// uninitialised volatile int that is never written and is read once through
-// a discarded-value cast. With the elide on, neither the declaration nor the
-// read is emitted; no value in the kernel is derived from it.
-// Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE=0 to restore
-// the incumbent declaration and read at every site.
-#ifndef DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
-#define DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE 1
 #endif
 
 template <

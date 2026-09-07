@@ -4912,8 +4912,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     private static let avColumnTiles: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_D512_AV_TILES"], let value = Int(raw)
-        else { return 16 }
-        return value == 8 || value == 16 ? value : 16
+        else { return 32 }
+        return value == 8 || value == 16 || value == 32 ? value : 32
     }()
 
     /// Columns one threadgroup of dispatch 3 owns, and the simdgroups it

@@ -38,6 +38,25 @@ public enum Gemma4DownTightGridV1 {
         #endif
     }()
 
+    private static let compiledGateUpEnabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_COMPILED_GU_DOWN"] != "0"
+
+    /// Check the task-local stream on every attempt, outside the trace.
+    static var compiledGateUpAvailable: Bool {
+        compiledGateUpEnabled && StreamOrDevice.default == .gpu
+    }
+
+    // One identity across layers. Every tensor, including both projections' weights
+    // and the shared RHS, is substituted from the current explicit arguments.
+    private static let compiledGateUpDown: @Sendable ([MLXArray]) -> [MLXArray] =
+        MLX.compile(shapeless: false) { inputs in
+            let activated = Gemma4DecodeFusedGUV1.call(
+                [inputs[0], inputs[1], inputs[2], inputs[6], inputs[7], inputs[8]])
+            return [Gemma4DownTightGridV1.call(
+                [inputs[3], inputs[4], inputs[5], activated, inputs[9], inputs[8]],
+                span: tileSpan)]
+        }
+
     /// Bound to the immutable sanitized checkpoint, like the fused gate/up storage.
     public final class Storage {
         private let weight: MLXArray
@@ -55,7 +74,11 @@ public enum Gemma4DownTightGridV1 {
         }
 
         static func admits(x: MLXArray, indices: MLXArray) -> Bool {
-            x.dtype == .bfloat16 && x.shape == [64, 1, 704]
+            admits(xShape: x.shape, xDType: x.dtype, indices: indices)
+        }
+
+        static func admits(xShape: [Int], xDType: DType, indices: MLXArray) -> Bool {
+            xDType == .bfloat16 && xShape == [64, 1, 704]
                 && indices.dtype == .uint32 && indices.shape == [64]
         }
 
@@ -67,13 +90,30 @@ public enum Gemma4DownTightGridV1 {
         func call(
             x: MLXArray, lhsIndices: MLXArray, indices: MLXArray, span: Int
         ) -> MLXArray {
-            kernel(
-                [weight, scales, biases, x, lhsIndices, indices],
-                template: [("T", DType.bfloat16), ("SPAN", span)],
-                grid: (32, (352 / span) * 2, 64), threadGroup: (32, 2, 1),
-                outputShapes: [[64, 1, 2816]], outputDTypes: [.bfloat16]
-            )[0]
+            Gemma4DownTightGridV1.call(
+                [weight, scales, biases, x, lhsIndices, indices], span: span)
         }
+
+        /// The caller has checked compiledGateUpAvailable and both projection
+        /// contracts. Storage is read here, never captured by the compiled body.
+        func callCompiledGateUp(
+            x: MLXArray, storage: SwitchGateUpFusedStorage, lhs: MLXArray,
+            rhs: MLXArray, downLHS: MLXArray
+        ) -> MLXArray? {
+            Gemma4DownTightGridV1.compiledGateUpDown(
+                [storage.weight, storage.scales, storage.biases, weight, scales, biases,
+                 x, lhs, rhs, downLHS]).first
+        }
+    }
+
+    /// Raw launch for callers that already passed the tight-DOWN contract.
+    static func call(_ inputs: [MLXArray], span: Int) -> MLXArray {
+        kernel(
+            inputs,
+            template: [("T", DType.bfloat16), ("SPAN", span)],
+            grid: (32, (352 / span) * 2, 64), threadGroup: (32, 2, 1),
+            outputShapes: [[64, 1, 2816]], outputDTypes: [.bfloat16]
+        )[0]
     }
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(

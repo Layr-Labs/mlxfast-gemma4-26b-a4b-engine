@@ -44,6 +44,16 @@ private let gemma4DecodeAsyncEvalLadderEnabled =
         ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_DECODE_ASYNC_EVAL_LADDER"])
 
+/// Reuse the fixed intermediate KV carrier on the scored CBv2 B=8 decode.
+/// `DARKBLOOM_GEMMA4_DECODE_INTERMEDIATE_BUFFER=0` restores per-forward
+/// allocation of the carrier array.
+private let gemma4DecodeIntermediatesReuseEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DECODE_INTERMEDIATE_BUFFER"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Pure, fail-closed policy for the Gemma 4 decode submission ladder.
 ///
 /// Layer indices name boundaries AFTER a complete decoder layer. In
@@ -6846,6 +6856,11 @@ public class Gemma4TextModelInner: Module {
     /// Used by the shared-KV capture hook for the MTP drafter.
     let lastFullAttentionNonSharedIdx: Int
     let lastSlidingAttentionNonSharedIdx: Int
+    /// Engine-thread-confined scratch for the layer-to-layer KV-sharing
+    /// carriers. The array storage is reused only for the scored serial
+    /// CBv2 decode geometry; values are reset before each layer reads them.
+    private var reusableIntermediates:
+        [(kv: (MLXArray, MLXArray)?, positionOffset: Gemma4.PositionOffset?)] = []
 
     public init(
         _ config: Gemma4TextConfiguration, forceSharedKV: Bool = false,
@@ -7174,8 +7189,21 @@ public class Gemma4TextModelInner: Module {
         }
 
         // Forward through layers, tracking intermediate KV pairs for sharing
-        var intermediates = [(kv: (MLXArray, MLXArray)?, positionOffset: Gemma4.PositionOffset?)](
-            repeating: (nil, nil), count: config.numHiddenLayers)
+        let reuseDecodeIntermediates =
+            gemma4DecodeIntermediatesReuseEnabled
+            && isCBv2 && inputBatchSize == 8 && inputLength == 1
+        if reuseDecodeIntermediates {
+            if reusableIntermediates.count != config.numHiddenLayers {
+                reusableIntermediates = Array(
+                    repeating: (kv: nil, positionOffset: nil),
+                    count: config.numHiddenLayers)
+            }
+            CBv2EngageMark.once("gemma4-decode-intermediate-buffer")
+        } else {
+            reusableIntermediates = Array(
+                repeating: (kv: nil, positionOffset: nil),
+                count: config.numHiddenLayers)
+        }
 
         // GLUE-003: one chain box per forward; layer L's fused tail hands
         // layer L+1 its input norm through it. EMB-RS0-001 seeds the same
@@ -7185,8 +7213,12 @@ public class Gemma4TextModelInner: Module {
         glueChain.pending = layerZeroInputCarry
         for (idx, layer) in layers.enumerated() {
             let prevIdx = previousKvs[idx]
-            let sharedKV = intermediates[prevIdx].kv
-            let sharedPositionOffset = intermediates[prevIdx].positionOffset
+            if reuseDecodeIntermediates {
+                reusableIntermediates[idx] = (kv: nil, positionOffset: nil)
+            }
+
+            let sharedKV = reusableIntermediates[prevIdx].kv
+            let sharedPositionOffset = reusableIntermediates[prevIdx].positionOffset
 
             // CBv2: KV-shared layers attend by borrowing the SOURCE layer's
             // cache object (attendBorrowing) instead of consuming raw K/V
@@ -7238,7 +7270,7 @@ public class Gemma4TextModelInner: Module {
                     && !capturePreNorm && dFlashHiddenCapture == nil
             )
             h = out
-            intermediates[idx] = (kvPair, positionOffset)
+            reusableIntermediates[idx] = (kvPair, positionOffset)
             captureHook?(idx, kvPair)
             dFlashHiddenCapture?.capture(h, layer: idx)
 

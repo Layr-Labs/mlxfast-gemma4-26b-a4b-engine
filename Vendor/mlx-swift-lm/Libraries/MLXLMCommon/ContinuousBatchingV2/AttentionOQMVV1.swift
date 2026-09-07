@@ -12,6 +12,39 @@ import Foundation
 import MLX
 import MLXFast
 
+// Only extracted four-bit integer codes use half matrix registers. Stored
+// weights, activation matrices, affine parameters and accumulation stay intact.
+fileprivate enum OProjHalfWeightMatricesV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_OPROJ_HALF_WEIGHT_V1"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    static func rewrite(_ original: String, expectedConsumers: Int)
+        -> (header: String, applied: Bool)
+    {
+        guard enabled else { return (original, false) }
+        let marker = "template <typename T, int KS, int KFIX>\nMETAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp("
+        guard original.components(separatedBy: marker).count == 2,
+            let boundary = original.range(of: marker)
+        else { return (original, false) }
+        let prefix = String(original[..<boundary.lowerBound])
+        let tail = String(original[boundary.lowerBound...])
+        guard tail.components(separatedBy: "simdgroup_float8x8 A;").count
+                == expectedConsumers + 1,
+            tail.components(separatedBy: "MMA8_STEP(").count
+                == expectedConsumers * 8 + 1
+        else { return (original, false) }
+        let macro = "#define O_HALF_WEIGHT_STEP(BB, J) A.thread_elements()[0] = half(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = half(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, BB, C);\n"
+        let rewritten = tail
+            .replacingOccurrences(of: "simdgroup_float8x8 A;", with: "simdgroup_half8x8 A;")
+            .replacingOccurrences(of: "MMA8_STEP(", with: "O_HALF_WEIGHT_STEP(")
+        return (prefix + macro + rewritten, true)
+    }
+}
+
 public enum CBv2AttentionOQMVV1 {
     public static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
@@ -519,6 +552,12 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         return unroll4Enabled ? applyOprojUr4(to: base, occurrences: 2) : base
     }()
 
+    private static let halfWeightRspHeader =
+        OProjHalfWeightMatricesV1.rewrite(mma8RspHeader, expectedConsumers: 1)
+
+    private static let halfWeightRsp2Header =
+        OProjHalfWeightMatricesV1.rewrite(mma8Rsp2Header, expectedConsumers: 2)
+
     public static let staticNEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_OPROJ_STATIC_N"]
@@ -542,10 +581,10 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
     }
 
     private static let mma8StaticNHeader =
-        applyOprojStaticN(to: mma8RspHeader, occurrences: 2)
+        applyOprojStaticN(to: halfWeightRspHeader.header, occurrences: 2)
 
     private static let mma8Rsp2StaticNHeader =
-        applyOprojStaticN(to: mma8Rsp2Header, occurrences: 3)
+        applyOprojStaticN(to: halfWeightRsp2Header.header, occurrences: 3)
 
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
@@ -702,7 +741,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
 
     private static let mma8RspKernelK4096 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_rsp_v1"
-            + carry2KeySuffix + unroll4KeySuffix,
+            + carry2KeySuffix + unroll4KeySuffix
+            + (halfWeightRspHeader.applied ? "_half_codes_v1" : ""),
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -715,12 +755,13 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: mma8RspHeader,
+        header: halfWeightRspHeader.header,
         ensureRowContiguous: true)
 
     private static let mma8RspKernelK8192 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp_v1"
-            + carry2KeySuffix + unroll4KeySuffix,
+            + carry2KeySuffix + unroll4KeySuffix
+            + (halfWeightRspHeader.applied ? "_half_codes_v1" : ""),
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -733,7 +774,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: mma8RspHeader,
+        header: halfWeightRspHeader.header,
         ensureRowContiguous: true)
 
     /// ORS-D512: the `_rsp` body with the run sums read as PAIRS of
@@ -835,7 +876,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
 
     private static let mma8Rsp2KernelK8192 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp2_v1"
-            + carry2KeySuffix + unroll4KeySuffix,
+            + carry2KeySuffix + unroll4KeySuffix
+            + (halfWeightRsp2Header.applied ? "_half_codes_v1" : ""),
         inputNames: ["x", "w", "scales", "biases", "rs_pairs"],
         outputNames: ["y"],
         source: """
@@ -848,12 +890,13 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: mma8Rsp2Header,
+        header: halfWeightRsp2Header.header,
         ensureRowContiguous: true)
 
     private static let mma8RspStaticNKernelK4096 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_rsp_staticn_v1"
-            + carry2KeySuffix + unroll4KeySuffix,
+            + carry2KeySuffix + unroll4KeySuffix
+            + (halfWeightRspHeader.applied ? "_half_codes_v1" : ""),
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -871,7 +914,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
 
     private static let mma8RspStaticNKernelK8192 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp_staticn_v1"
-            + carry2KeySuffix + unroll4KeySuffix,
+            + carry2KeySuffix + unroll4KeySuffix
+            + (halfWeightRspHeader.applied ? "_half_codes_v1" : ""),
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -889,7 +933,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
 
     private static let mma8Rsp2StaticNKernelK8192 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp2_staticn_v1"
-            + carry2KeySuffix + unroll4KeySuffix,
+            + carry2KeySuffix + unroll4KeySuffix
+            + (halfWeightRsp2Header.applied ? "_half_codes_v1" : ""),
         inputNames: ["x", "w", "scales", "biases", "rs_pairs"],
         outputNames: ["y"],
         source: """
@@ -969,6 +1014,9 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
                     CBv2EngageMark.once("oproj-ur4")
                 }
                 CBv2EngageMark.once("d512-ors-oproj-pairs")
+                if halfWeightRsp2Header.applied {
+                    CBv2EngageMark.once("oproj-half-weight-matrices")
+                }
                 if staticNEnabled {
                     CBv2EngageMark.once("oproj-static-n")
                     return mma8Rsp2StaticNKernelK8192(
@@ -990,6 +1038,9 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
                 )[0]
             }
             if tableReady {
+                if halfWeightRspHeader.applied {
+                    CBv2EngageMark.once("oproj-half-weight-matrices")
+                }
                 if oprojCarry2Enabled {
                     CBv2EngageMark.once("oproj-carry2")
                 }

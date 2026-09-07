@@ -6821,9 +6821,29 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    private static let nbSuffix: String = finalNormNbEnabled ? "_nb1" : ""
+    /// FINAL-NORM-RI. Tip `0beb0d76` / `e7fa339` already supplies surplus
+    /// lanes at the read (`FINAL_NORM_NB`). That tip still elects one
+    /// simdgroup to run the combine, publishes `local_inv[0]`, and barriers
+    /// again before every thread reads it. This gate removes that election
+    /// and publication: after the partials barrier, every simdgroup runs the
+    /// same surplus-aware `simd_sum`, every thread computes `inv` into a
+    /// register, and the second barrier plus `local_inv` go away.
+    /// `DARKBLOOM_GEMMA4_FINAL_NORM_RI=0` restores tip NB text and keying.
+    static let finalNormRiEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_FINAL_NORM_RI"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
 
-    private static let combine: String = finalNormNbEnabled ? """
+    private static let nameSuffix: String = {
+        if finalNormNbEnabled && finalNormRiEnabled { return "_nb1_ri1" }
+        if finalNormNbEnabled { return "_nb1" }
+        return ""
+    }()
+
+    /// Tip NB combine (election + local_inv publication). Used when RI is off.
+    private static let combineNb: String = """
             if (simd_lane_id == 0) {
                 local_sums[simd_group_id] = acc;
             }
@@ -6837,7 +6857,10 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            """ : """
+            """
+
+    /// Incumbent combine before tip NB.
+    private static let combineIncumbent: String = """
             if (simd_group_id == 0) {
                 local_sums[simd_lane_id] = 0.0f;
             }
@@ -6856,9 +6879,35 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             threadgroup_barrier(mem_flags::mem_threadgroup);
             """
 
+    /// NB + RI: surplus-at-read combine with register-local inv, no election.
+    private static let combineNbRi: String = """
+            if (simd_lane_id == 0) {
+                local_sums[simd_group_id] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            acc = simd_sum(
+                simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
+            const float inv =
+                metal::precise::rsqrt(acc / 2816.0f + 1e-06f);
+            """
+
+    private static let combine: String = {
+        if finalNormNbEnabled && finalNormRiEnabled { return combineNbRi }
+        if finalNormNbEnabled { return combineNb }
+        return combineIncumbent
+    }()
+
+    private static let localInvDecl: String =
+        (finalNormNbEnabled && finalNormRiEnabled)
+        ? ""
+        : "threadgroup float local_inv[1];\n            "
+
+    private static let invScale: String =
+        (finalNormNbEnabled && finalNormRiEnabled) ? "inv" : "local_inv[0]"
+
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v1"
-            + nbSuffix,
+            + nameSuffix,
         inputNames: ["x", "w"],
         outputNames: ["out", "xSums"],
         source: """
@@ -6866,8 +6915,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             const uint lid = thread_position_in_threadgroup.x;
             const uint simd_lane_id = thread_index_in_simdgroup;
             const uint simd_group_id = simdgroup_index_in_threadgroup;
-            threadgroup float local_inv[1];
-            threadgroup float local_sums[32];
+            \(localInvDecl)threadgroup float local_sums[32];
             threadgroup float quad_sums[704];
 
             const uint base = row * 2816 + lid * 4;
@@ -6886,7 +6934,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             for (int i = 0; i < 4; ++i) {
                 // Preserve the stock RMSNorm's BF16 boundary exactly.
                 outv[i] = w[wbase + i]
-                    * static_cast<T>((float)x[base + i] * local_inv[0]);
+                    * static_cast<T>((float)x[base + i] * \(invScale));
                 out[base + i] = outv[i];
             }
 
@@ -6940,6 +6988,9 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
         else { return nil }
         CBv2EngageMark.once("final-norm-mma-xsum")
         if finalNormNbEnabled { CBv2EngageMark.once("final-norm-nb") }
+        if finalNormNbEnabled && finalNormRiEnabled {
+            CBv2EngageMark.once("final-norm-ri")
+        }
         return (outputs[0], sums)
     }
 }

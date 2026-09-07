@@ -5730,6 +5730,20 @@ private enum Gemma4ZipRouterV1 {
         else { return 1 }
         return v
     }()
+    /// ROUTE-TABLE-UNFENCE: the fused route-table producer consumes only
+    /// `expertScores`; the dense down projection is an independent branch.
+    /// Keeping a `Depends` edge here serializes the route fold behind that
+    /// projection even though both outputs are needed only at the later
+    /// residual/expert join. The default removes that artificial launch
+    /// dependency so the route fold can overlap the dense down dispatch.
+    /// `DARKBLOOM_GEMMA4_ROUTE_TABLE_UNFENCE=0` restores the incumbent fence.
+    static let routeTableUnfenceEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTE_TABLE_UNFENCE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
 
     struct Zipped {
         let denseOut: MLXArray
@@ -5890,11 +5904,19 @@ private enum Gemma4ZipRouterV1 {
             // float32 softmax + per-expert scaling, AND the sorted route table,
             // so the standalone rank-scatter launch and the weight tail
             // (takeAlong -> softmax -> perExpertScale) leave the dependent chain.
-            // The fold consumes the identical fenced scores node the incumbent
-            // partition consumed, keeping the tape's ordering edges unchanged.
+            // The route fold reads only the scores. When the unfence is
+            // admitted, its launch can overlap the independent dense down
+            // projection; the old dependency remains one switch away.
+            let routeSelectionScores =
+                Gemma4ZipRouterV1.routeTableUnfenceEnabled
+                ? expertScores
+                : MLX.depends(input: expertScores, dependencies: [denseOut])
+            if Gemma4ZipRouterV1.routeTableUnfenceEnabled {
+                CBv2EngageMark.once("route-table-unfence")
+            }
             // Fail-closed onto the incumbent finalists + slice + weight tail.
             if let fold = Gemma4RouteGlueFoldV1.apply(
-                MLX.depends(input: expertScores, dependencies: [denseOut]),
+                routeSelectionScores,
                 perExpertScale: router.perExpertScale,
                 topK: router.topK, kth: router.kth)
             {
@@ -5902,8 +5924,7 @@ private enum Gemma4ZipRouterV1 {
                 topKWeights = fold.weights
                 routeTable = fold.table
             } else {
-                let partition = router.zipPartition(
-                    MLX.depends(input: expertScores, dependencies: [denseOut]))
+                let partition = router.zipPartition(routeSelectionScores)
                 topKIndices = router.zipSelected(partition)
                 topKWeights = router.zipWeights(
                     expertScores: expertScores, topKIndices: topKIndices)

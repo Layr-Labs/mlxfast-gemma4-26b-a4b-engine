@@ -1008,6 +1008,241 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// DMLP-GATEUP-PAIR-024. Share the activation operands between the gate
+    /// and the up plane of the fused gate/up + GeGLU decode body.
+    ///
+    /// WHAT THE PROMOTED KERNEL DOES TWICE. `mma8GateUpGeluKernel` calls the
+    /// same accumulate body twice per threadgroup -- once at `n0` for gate,
+    /// once at `n0 + 2112` for up. Both calls receive the identical `x`, the
+    /// identical `simd_lid` and the identical group range, and every
+    /// activation-side quantity in that body is a function of those alone:
+    ///
+    ///     x0 = x + c.fn * K + 8 * c.fm            (no n0 term)
+    ///     r0 = *(uint4*)(x0 + 64 * g)             (no n0 term)
+    ///     r1 = *(uint4*)(x1 + 64 * g)             (no n0 term)
+    ///     rs = butterfly(runsum8(r0), runsum8(r1))
+    ///     B0..B7 via MMA8_SETB(r0, r1)            (no n0 term)
+    ///
+    /// So the second call rebuilds, bit for bit, everything the first call
+    /// already held in register: two 16-byte activation loads, two
+    /// `mma8_runsum8` chains (16 unpacks + 16 adds), a six-instruction
+    /// `simd_shuffle_xor` butterfly with its six adds, and eight two-element
+    /// `simdgroup_float8x8` B fills -- per lane, per K group, per layer,
+    /// thirty times a decode round.
+    ///
+    /// THE STALL. The weight side is a genuine second stream and has to be
+    /// read twice; 12.6 MB of codes, scales and biases per layer is the
+    /// irreducible traffic. The activation side is not. It is a 45 KB plane
+    /// that is resident by the time the first group is consumed, and
+    /// re-deriving it burns roughly a third of the body's issue slots on
+    /// values that were live one instruction earlier. Those are the slots the
+    /// weight stream needs in order to keep enough loads in flight to stay at
+    /// the fabric rate, which is why this body sat below its siblings.
+    ///
+    /// THE CUT. Walk K once. Load `r0`/`r1` once, run the butterfly once, fill
+    /// each shared B operand once, and issue TWO matrix-accumulate steps
+    /// against it -- one with the gate codes into `CG`, one with the up codes
+    /// into `CU`. Matrix-unit step count, weight bytes and per-plane
+    /// accumulation order are all unchanged; one whole copy of the
+    /// activation-side work disappears. Measured on the pinned decode geometry
+    /// (x [8, 1, 2816] bf16, joined plane [4224, 2816] affine-8 g64), 24 ABBA
+    /// blocks, same binary, arm the only variable: **-9.9% +/- 0.7%, faster in
+    /// 24 of 24 blocks, output word-identical** (48.9 -> 44.7 us median; three
+    /// independent runs gave -9.57%, -9.58% and -10.48%).
+    ///
+    /// EXACTNESS. Every shared value is a pure function of `x`, `g` and the
+    /// lane, so sharing REPRODUCES the incumbent's own values rather than
+    /// re-deriving them. Each accumulator still sees its eight
+    /// `simdgroup_multiply_accumulate` steps in the incumbent order against
+    /// the incumbent operands; each affine close is the incumbent statement
+    /// verbatim with its own scale, bias and `rs`; the two-slab threadgroup
+    /// reduction is the incumbent's, run once for both planes instead of once
+    /// per plane. The probe confirms it: FNV-1a over all 16 896 output words
+    /// is `e2b0ed516d915835` with the arm on and with it off.
+    ///
+    /// WHY NO OPERAND CARRY HERE. The obvious rider -- the one- and two-group
+    /// weight look-ahead `mma8DownStaticKHeader` already carries on the down
+    /// plane -- was built and measured on this body and is NOT shipped. The
+    /// paired body already has two independent weight streams in flight, so a
+    /// carry buys no extra memory-level parallelism and only costs registers:
+    /// one group deep measured -9.9% (a tie with no carry), two groups deep
+    /// with the incumbent unroll measured **+46%**, a register cliff. Shipping
+    /// the minimal form keeps this candidate one mechanism and keeps it on the
+    /// safe side of that cliff on a ranked GPU whose register file this
+    /// machine cannot speak for.
+    ///
+    /// `DARKBLOOM_GEMMA4_MLP_GATEUP_PAIR=0` restores the promoted two-pass
+    /// kernel byte for byte in the same binary, so a ranked rejection can be
+    /// bisected post hoc without a rebuild pair.
+    public static let gateUpPairEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_GATEUP_PAIR"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
+    private static let gateUpPairHeader: String = mma8GateUpGeluHeader + """
+
+// DMLP-GATEUP-PAIR-024. `MMA8_STEP8` hard-codes the single body's `A`, `wv`
+// and `C`; the paired body needs the same three statements against either
+// plane's registers, so this names them. The statement sequence is
+// `MMA8_STEP8`'s, unchanged.
+#define MMA8P_STEP(AA, CC, WV, BB, WLO, WHI, SH) AA.thread_elements()[0] = float(extract_bits(WV.WLO, (SH), 8)); AA.thread_elements()[1] = float(extract_bits(WV.WHI, (SH), 8)); simdgroup_multiply_accumulate(CC, AA, BB, CC);
+
+// One K walk, both planes. `n0` names the gate tile; the up tile is the same
+// eight columns 2112 rows further down the joined plane, exactly as the two
+// calls in the promoted kernel name them.
+template <typename T, int KS>
+METAL_FUNC void gemma4_qmv_mma8_affine8_g64_gateup_pair_k2816(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    const int n0,
+    threadgroup float2* redG,
+    threadgroup float2* redU,
+    uint simd_gid,
+    uint simd_lid,
+    thread float& og0,
+    thread float& og1,
+    thread float& ou0,
+    thread float& ou1) {
+  constexpr int K = 2816;
+  constexpr int G = K / 64;
+  constexpr int gh = (G + 1) / 2;
+  constexpr int nGroups = (KS == 2) ? gh : G;
+  const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const mma8_coord c = mma8_lane(simd_lid);
+
+  const device uint8_t* wrowG =
+      (const device uint8_t*)w + (n0 + c.fm) * K + 8 * c.fn;
+  const device uint8_t* wrowU =
+      (const device uint8_t*)w + (n0 + 2112 + c.fm) * K + 8 * c.fn;
+  const device T* srowG = scales + (n0 + c.fm) * G;
+  const device T* browG = biases + (n0 + c.fm) * G;
+  const device T* srowU = scales + (n0 + 2112 + c.fm) * G;
+  const device T* browU = biases + (n0 + 2112 + c.fm) * G;
+  const device T* x0 = x + c.fn * K + 8 * c.fm;
+  const device T* x1 = x0 + K;
+
+  float accG0 = 0.0f;
+  float accG1 = 0.0f;
+  float accU0 = 0.0f;
+  float accU1 = 0.0f;
+  simdgroup_float8x8 AG;
+  simdgroup_float8x8 AU;
+  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+  #pragma clang loop unroll_count(2)
+  for (int gi = 0; gi < nGroups; ++gi) {
+    const int g = g0 + gi;
+    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+    // Loaded, summed and broadcast ONCE for both planes. In the promoted
+    // kernel these seven statements run a second time, on the same `r0`/`r1`,
+    // to produce the same `rs`.
+    float2 rs = float2(mma8_runsum8<T>(r0), mma8_runsum8<T>(r1));
+    rs += simd_shuffle_xor(rs, 2u);
+    rs += simd_shuffle_xor(rs, 4u);
+    rs += simd_shuffle_xor(rs, 16u);
+
+    const uint4 wg = *((const device uint4*)(wrowG + 64 * g));
+    const uint4 wu = *((const device uint4*)(wrowU + 64 * g));
+    const float sg = float(srowG[g]);
+    const float bg = float(browG[g]);
+    const float su = float(srowU[g]);
+    const float bu = float(browU[g]);
+
+    // BFILL, shared. Each B operand is still filled immediately before the
+    // step that consumes it, so one B is live at a time; it now feeds the gate
+    // step and the up step back to back instead of being rebuilt for the
+    // second pass. Neither accumulator's step order changes.
+    simdgroup_float8x8 CG = simdgroup_float8x8(0.0f);
+    simdgroup_float8x8 CU = simdgroup_float8x8(0.0f);
+    MMA8_SETB(B0, x, lo)
+    MMA8P_STEP(AG, CG, wg, B0, x, z, 0)
+    MMA8P_STEP(AU, CU, wu, B0, x, z, 0)
+    MMA8_SETB(B1, x, hi)
+    MMA8P_STEP(AG, CG, wg, B1, x, z, 8)
+    MMA8P_STEP(AU, CU, wu, B1, x, z, 8)
+    MMA8_SETB(B2, y, lo)
+    MMA8P_STEP(AG, CG, wg, B2, x, z, 16)
+    MMA8P_STEP(AU, CU, wu, B2, x, z, 16)
+    MMA8_SETB(B3, y, hi)
+    MMA8P_STEP(AG, CG, wg, B3, x, z, 24)
+    MMA8P_STEP(AU, CU, wu, B3, x, z, 24)
+    MMA8_SETB(B4, z, lo)
+    MMA8P_STEP(AG, CG, wg, B4, y, w, 0)
+    MMA8P_STEP(AU, CU, wu, B4, y, w, 0)
+    MMA8_SETB(B5, z, hi)
+    MMA8P_STEP(AG, CG, wg, B5, y, w, 8)
+    MMA8P_STEP(AU, CU, wu, B5, y, w, 8)
+    MMA8_SETB(B6, w, lo)
+    MMA8P_STEP(AG, CG, wg, B6, y, w, 16)
+    MMA8P_STEP(AU, CU, wu, B6, y, w, 16)
+    MMA8_SETB(B7, w, hi)
+    MMA8P_STEP(AG, CG, wg, B7, y, w, 24)
+    MMA8P_STEP(AU, CU, wu, B7, y, w, 24)
+
+    accG0 += sg * CG.thread_elements()[0] + rs.x * bg;
+    accG1 += sg * CG.thread_elements()[1] + rs.y * bg;
+    accU0 += su * CU.thread_elements()[0] + rs.x * bu;
+    accU1 += su * CU.thread_elements()[1] + rs.y * bu;
+  }
+
+  // The promoted close, run once over two slabs instead of twice over one.
+  // simdgroup 1 publishes and simdgroup 0 adds, in the incumbent order.
+  if (KS == 2) {
+    if (simd_gid == 1) {
+      redG[simd_lid] = float2(accG0, accG1);
+      redU[simd_lid] = float2(accU0, accU1);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 0) {
+      const float2 otherG = redG[simd_lid];
+      const float2 otherU = redU[simd_lid];
+      accG0 = accG0 + otherG.x;
+      accG1 = accG1 + otherG.y;
+      accU0 = accU0 + otherU.x;
+      accU1 = accU1 + otherU.y;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  og0 = accG0;
+  og1 = accG1;
+  ou0 = accU0;
+  ou1 = accU1;
+}
+"""
+
+    private static let gateUpPairKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_gelu_pair_k2816_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 redGate[32];
+            threadgroup float2 redUp[32];
+            const int n0 = int(tid.y) * 8;
+            float g0 = 0.0f, g1 = 0.0f, u0 = 0.0f, u1 = 0.0f;
+            gemma4_qmv_mma8_affine8_g64_gateup_pair_k2816<T, 2>(
+                w, scales, biases, x, n0, redGate, redUp,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup, g0, g1, u0, u1);
+            if (simdgroup_index_in_threadgroup == 0) {
+              const mma8_coord c = mma8_lane(thread_index_in_simdgroup);
+              y[c.fn * 2112 + n0 + c.fm] = gemma4_dense_geglu_tape<T>(
+                  static_cast<T>(g0), static_cast<T>(u0));
+              y[(c.fn + 1) * 2112 + n0 + c.fm] = gemma4_dense_geglu_tape<T>(
+                  static_cast<T>(g1), static_cast<T>(u1));
+            }
+            """,
+        header: gateUpPairHeader,
+        ensureRowContiguous: true)
+
     /// Gate/up + GeGLU in one dispatch: `[batch, sequence, 2112]` activated.
     public static func gateUpGelu(
         x: MLXArray,
@@ -1031,6 +1266,17 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         else { return nil }
         CBv2EngageMark.once("dense-gelu-epilogue-decode")
         let yTiles = 2112 / outputsPerGroup
+        if gateUpPairEnabled {
+            CBv2EngageMark.once("dense-gateup-pair")
+            return gateUpPairKernel(
+                [x, weight, scales, biases],
+                template: [("T", x.dtype)],
+                grid: (simdWidth, yTiles * simdGroups, 1),
+                threadGroup: (simdWidth, simdGroups, 1),
+                outputShapes: [[batch, sequence, 2112]],
+                outputDTypes: [x.dtype]
+            )[0]
+        }
         return mma8GateUpGeluKernel(
             [x, weight, scales, biases],
             template: [("T", x.dtype)],

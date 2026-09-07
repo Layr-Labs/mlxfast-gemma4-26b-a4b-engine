@@ -4484,6 +4484,93 @@ private enum Gemma4FusedLayerGlue {
         source: pairedRmsTailSource(tailSource),
         ensureRowContiguous: true
     )
+    /// PLE-TAIL-DECODE: the PLE-bearing decode path cannot use `tail`, because
+    /// its layer scalar must remain after the PLE residual. Remove that scalar
+    /// from the existing exact tail body instead of paying five dependent
+    /// post-branch dispatches before the PLE chain.
+    private static let pleBranchTailEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DECODE_PLE_BRANCH_TAIL"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let tailNoScalarSource: String = {
+        var source = tailSource
+        let scalarBlock = """
+            const T scalar = s[0];
+            for (int i = 0; i < 4; i++) {
+                // Same double rounding as the stock norm-then-add pair, then
+                // the layer-scalar multiply with its own stock rounding: the
+                // residual sum rounds to T in a register exactly where the
+                // stock graph stored it to memory, and the T*T product rounds
+                // once on the store exactly like the stock multiply kernel.
+                const T normed = static_cast<T>(
+                    w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
+                const T summed = res[base + i] + normed;
+                out[base + i] = summed * scalar;
+            }
+        """
+        let noScalarBlock = """
+            for (int i = 0; i < 4; i++) {
+                // Keep the stock BF16 boundary at the residual add.
+                const T normed = static_cast<T>(
+                    w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
+                const T summed = res[base + i] + normed;
+                out[base + i] = summed;
+            }
+        """
+        precondition(source.components(separatedBy: scalarBlock).count == 2)
+        return source.replacingOccurrences(of: scalarBlock, with: noScalarBlock)
+    }()
+
+    private static let tailNoScalarKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_tail_no_scalar_2816_bf16_v1_nb1",
+            inputNames: ["a", "b", "res", "w1", "w2", "w3"],
+            outputNames: ["out"],
+            source: tailNoScalarSource,
+            ensureRowContiguous: true
+        )
+
+    private static let pairedTailNoScalarKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_tail_no_scalar_paired_rms_2816_bf16_v1_nb1",
+            inputNames: ["a", "b", "res", "w1", "w2", "w3"],
+            outputNames: ["out"],
+            source: pairedRmsTailSource(tailNoScalarSource),
+            ensureRowContiguous: true
+        )
+
+    /// `res + rmsNorm(rmsNorm(h1, w1) + rmsNorm(h2, w2), w3)`, without the
+    /// terminal layer scalar. The scalar must stay after the PLE epilogue.
+    static func tailNoScalar(
+        mlpOut: MLXArray, expertOut: MLXArray, residual: MLXArray,
+        w1: MLXArray, w2: MLXArray, w3: MLXArray, eps: Float
+    ) -> MLXArray? {
+        guard pleBranchTailEnabled,
+            admits(mlpOut, weight: w1, eps: eps),
+            expertOut.shape == mlpOut.shape, expertOut.dtype == .bfloat16,
+            residual.shape == mlpOut.shape, residual.dtype == .bfloat16,
+            w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
+            w3.ndim == 1, w3.dim(0) == axis, w3.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("glue-ple-branch-tail")
+        if pairedRmsEnabled {
+            CBv2EngageMark.once("glue-ple-branch-tail-paired-rms")
+        }
+        let selected =
+            pairedRmsEnabled ? pairedTailNoScalarKernel : tailNoScalarKernel
+        return selected(
+            [mlpOut, expertOut, residual, w1, w2, w3],
+            template: [("T", mlpOut.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [[rows, 1, axis]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+
 
     private static func admits(_ x: MLXArray, weight: MLXArray, eps: Float) -> Bool {
         enabled
@@ -6398,6 +6485,20 @@ public class Gemma4DecoderLayer: Module {
                     chain.pending = (source: chained.out, normed: chained.normedNext, rs: nil)
                     tailApplied = true
                     scalarFolded = true
+                // PLE keeps the layer scalar after this branch tail. On the
+                // scored CBv2 decode cell, fuse the five pre-PLE glue
+                // dispatches without consuming that scalar.
+                } else if !canFoldScalar,
+                    cache is any CBv2AttendingLayerCache,
+                    let fusedTail = Gemma4FusedLayerGlue.tailNoScalar(
+                        mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
+                        w1: postFeedforwardLayernorm1.weight,
+                        w2: postFeedforwardLayernorm2.weight,
+                        w3: postFeedforwardLayernorm.weight,
+                        eps: config.rmsNormEps)
+                {
+                    out = fusedTail
+                    tailApplied = true
                 } else if let fusedTail = Gemma4PrefillGlueV1.branchTail(
                     h1: h1Raw,
                     h2: h2Raw,

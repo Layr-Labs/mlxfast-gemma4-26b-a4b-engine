@@ -1630,18 +1630,7 @@ METAL_FUNC void gather_rhs_mma_frag_row(
 // fold back to WM/WN, reproducing the shipped expressions byte for byte.
 // Independent of the qmm-t family's switch.
 #ifndef DARKBLOOM_GEMMA4_NAX_GATHER_TILING
-#define DARKBLOOM_GEMMA4_NAX_GATHER_TILING 1
-#endif
-
-// DARKBLOOM GEMMA4 NAX VOLATILE-FENCE ELIDE.
-// Every K-step loop body in the accelerated GEMM family declares an
-// uninitialised volatile int that is never written and is read once through
-// a discarded-value cast. With the elide on, neither the declaration nor the
-// read is emitted; no value in the kernel is derived from it.
-// Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE=0 to restore
-// the incumbent declaration and read at every site.
-#ifndef DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
-#define DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE 1
+#define DARKBLOOM_GEMMA4_NAX_GATHER_TILING 0
 #endif
 
 template <
@@ -1847,9 +1836,7 @@ template <
               NAXTile<T, TM, TK> Atile;
               NAXTile<T, BR, BC> Btile;
 
-#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
               volatile int compiler_barrier;
-#endif
 
               if constexpr (transpose) {
                 Btile.template load<T, BK_padded, 1>(
@@ -1873,9 +1860,7 @@ template <
                 }
               }
 
-#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
               (void)compiler_barrier;
-#endif
             }
           } else if (!seg_empty) {
             STEEL_PRAGMA_NO_UNROLL
@@ -1883,9 +1868,7 @@ template <
               NAXTile<T, TM, TK> Atile;
               NAXTile<T, BR, BC> Btile;
 
-#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
               volatile int compiler_barrier;
-#endif
 
               if constexpr (kAlignedM.value) {
                 Atile.load(xn + kk1, K);
@@ -1908,9 +1891,7 @@ template <
                   Btile,
                   metal::bool_constant<transpose>{});
 
-#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
               (void)compiler_barrier;
-#endif
             }
           }
 
@@ -1932,9 +1913,7 @@ template <
               NAXTile<T, TM, TK> Atile;
               NAXTile<T, BR, BC> Btile;
 
-#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
               volatile int compiler_barrier;
-#endif
 
               const short psk = min(int(SK), max(0, (BK - kk1)));
               Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
@@ -1954,9 +1933,7 @@ template <
                   Btile,
                   metal::bool_constant<transpose>{});
 
-#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
               (void)compiler_barrier;
-#endif
             }
           }
         }

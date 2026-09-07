@@ -1435,6 +1435,15 @@ public struct WeightedExpertUnsortCarrier {
 }
 
 public class SwitchGLU: Module {
+    private static let decodePlaneDirectReshapeEnabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DECODE_PLANE_DIRECT_RESHAPE_V1"]
+        return raw.map {
+            !["0", "false", "no", "off"].contains(
+                $0.trimmingCharacters(in: .whitespaces).lowercased())
+        } ?? true
+    }()
+
     @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear?
     @ModuleInfo(key: "up_proj") var upProj: SwitchLinear?
     @ModuleInfo(key: "gate_up_proj") var gateUpProj: SwitchLinear?
@@ -1648,7 +1657,15 @@ public class SwitchGLU: Module {
             && useLhsIndices
             && indices.dtype == .uint32 && x.dtype == .bfloat16
             && expertPrefixBoundsProjectionsEligible
-        var x = MLX.expandedDimensions(x, axes: [-2, -3])
+        // The admitted B8 plane reaches [8, 1, 2816] after the existing
+        // expansion and flatten. Build that exact view in one operation,
+        // preserving strides as well as values; every other path is unchanged.
+        let useDirectDecodePlane = Self.decodePlaneDirectReshapeEnabled
+            && useLhsIndices && inputDims == 2816
+            && x.dtype == .bfloat16 && indices.dtype == .uint32
+        var x = useDirectDecodePlane
+            ? x.reshaped([8, 1, 2816])
+            : MLX.expandedDimensions(x, axes: [-2, -3])
         let doSort = indices.size >= 64
 
         var idx = indices
@@ -1661,7 +1678,11 @@ public class SwitchGLU: Module {
         var lhsIndices: MLXArray?
         if doSort {
             if useLhsIndices {
-                x = x.flattened(start: 0, end: -3)
+                if useDirectDecodePlane {
+                    CBv2EngageMark.once("decode-plane-direct-reshape")
+                } else {
+                    x = x.flattened(start: 0, end: -3)
+                }
                 // GLUE-FOLD: an upstream producer already emitted the exact
                 // route table beside the top-8 selection; consume it and the
                 // standalone `mlx_lm_route_simd_rank_scatter` dispatch never

@@ -1724,7 +1724,16 @@ template <
 
   constexpr short SM = BM / SGM;
   constexpr short SN = BN / SGN;
-  constexpr short SK = 32;
+  // NAX-GATHER-SK64: one pass over the K tile instead of two. BK / SK becomes 1,
+  // so the kk1 loop has a single trip and no interior boundary. TK doubles with
+  // it, and no k moves: each accumulator still walks the same k values in the
+  // same order, only in one trip instead of two.
+#ifndef DARKBLOOM_GEMMA4_NAX_GATHER_SK64
+#define DARKBLOOM_GEMMA4_NAX_GATHER_SK64 1
+#endif
+  constexpr short SK = (DARKBLOOM_GEMMA4_NAX_GATHER_SK64 != 0) ? 64 : 32;
+  static_assert(SK >= 16 && (SK % 16) == 0, "SK must be a fragment multiple");
+  static_assert(SK <= BK, "SK may not exceed the K tile");
 
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;

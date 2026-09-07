@@ -474,16 +474,6 @@ private let routeSimdRank64Enabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
-/// The rank-64 route kernel indexes the contiguous pointer linearly, so its
-/// accepted `[8, 8]` input does not need a separate flattened view.
-/// `DARKBLOOM_ROUTE_SIMD_RANK64_DIRECT_INPUT=0` restores that view.
-private let routeSimdRank64DirectInputEnabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_ROUTE_SIMD_RANK64_DIRECT_INPUT"]
-    else { return true }
-    return !["0", "false", "no", "off"].contains(raw.lowercased())
-}()
-
 // MARK: - ROUTE-CSORT-64: fused counting-sort route table (donor port)
 
 /// Stable counting sort for the flattened B=8 decode route table (64 uint32
@@ -1172,12 +1162,7 @@ public func gatherSort(
         (indices.shape == [8, 8] || (indices.ndim == 1 && indices.size == 64)),
         indices.dtype == .uint32
     {
-        if routeSimdRank64DirectInputEnabled {
-            CBv2EngageMark.once("route-simd-direct-input")
-        }
-        let flat: MLXArray = routeSimdRank64DirectInputEnabled
-            ? indices
-            : indices.flattened()
+        let flat = indices.flattened()
         let outputs = routeSimdRank64Kernel(
             [flat],
             grid: (64, 1, 1),
@@ -1260,12 +1245,7 @@ public func gatherSortIndices(
         if expertPrefixBounds {
             CBv2EngageMark.once("expert-prefix-bounds")
         }
-        if routeSimdRank64DirectInputEnabled {
-            CBv2EngageMark.once("route-simd-direct-input")
-        }
-        let flat: MLXArray = routeSimdRank64DirectInputEnabled
-            ? indices
-            : indices.flattened()
+        let flat = indices.flattened()
         let kernel = expertPrefixBounds
             ? routeSimdRank64PrefixBoundsKernel : routeSimdRank64Kernel
         let outputs = kernel(
@@ -1473,11 +1453,9 @@ public class SwitchGLU: Module {
         tightDownContract = false
     }
 
-    private func resolveTightDownStorage(
-        xShape: [Int], xDType: DType, indices: MLXArray, sorted: Bool
-    ) -> Gemma4DownTightGridV1.Storage? {
+    private func tightDecodeDown(_ x: MLXArray, _ indices: MLXArray, sorted: Bool) -> MLXArray? {
         guard Gemma4DownTightGridV1.enabled, sorted, let storage = tightDownStorage,
-            Gemma4DownTightGridV1.Storage.admits(xShape: xShape, xDType: xDType, indices: indices)
+            Gemma4DownTightGridV1.Storage.admits(x: x, indices: indices)
         else { return nil }
         if !tightDownResolved {
             tightDownResolved = true
@@ -1491,18 +1469,7 @@ public class SwitchGLU: Module {
             }
         }
         guard tightDownContract else { return nil }
-        return storage
-    }
-
-    private func tightDecodeDown(
-        _ x: MLXArray, _ indices: MLXArray, sorted: Bool, taggedRoute: Bool = false
-    ) -> MLXArray? {
-        guard let storage = resolveTightDownStorage(
-            xShape: x.shape, xDType: x.dtype, indices: indices, sorted: sorted)
-        else { return nil }
-        return storage.call(
-            x: x, lhsIndices: switchDownIdentity64, indices: indices,
-            taggedRoute: taggedRoute)
+        return storage.call(x: x, lhsIndices: switchDownIdentity64, indices: indices)
     }
 
     private var fusedGateUpStorage: SwitchGateUpFusedStorage?
@@ -1720,22 +1687,9 @@ public class SwitchGLU: Module {
             let lhsIndices, lhsIndices.dtype == .uint32,
             let fused = fusedGateUpDispatch()
         {
-            if Gemma4DownTightGridV1.compiledGateUpAvailable,
-                let down = resolveTightDownStorage(
-                    xShape: Gemma4DecodeFusedGUV1.outputShape,
-                    xDType: Gemma4DecodeFusedGUV1.outputDType, indices: idx, sorted: true),
-                let output = down.callCompiledGateUp(
-                    x: x, storage: fused.storage, lhs: lhsIndices,
-                    rhs: idx, downLHS: switchDownIdentity64,
-                    taggedRoute: useExpertPrefixBounds)
-            {
-                return (output, inverseOrder, true)
-            }
             let activated = Gemma4DecodeFusedGUV1.call(
-                x: x, storage: fused.storage, lhs: lhsIndices, rhs: idx,
-                taggedRoute: useExpertPrefixBounds)
-            let output = tightDecodeDown(
-                activated, idx, sorted: true, taggedRoute: useExpertPrefixBounds)
+                x: x, storage: fused.storage, lhs: lhsIndices, rhs: idx)
+            let output = tightDecodeDown(activated, idx, sorted: true)
                 ?? downProj(activated, idx, lhsIndices: switchDownIdentity64, sortedIndices: true)
             return (output, inverseOrder, true)
         }

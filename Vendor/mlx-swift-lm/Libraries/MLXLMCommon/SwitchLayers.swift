@@ -474,16 +474,6 @@ private let routeSimdRank64Enabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
-/// The rank-64 route kernel indexes the contiguous pointer linearly, so its
-/// accepted `[8, 8]` input does not need a separate flattened view.
-/// `DARKBLOOM_ROUTE_SIMD_RANK64_DIRECT_INPUT=0` restores that view.
-private let routeSimdRank64DirectInputEnabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_ROUTE_SIMD_RANK64_DIRECT_INPUT"]
-    else { return true }
-    return !["0", "false", "no", "off"].contains(raw.lowercased())
-}()
-
 // MARK: - ROUTE-CSORT-64: fused counting-sort route table (donor port)
 
 /// Stable counting sort for the flattened B=8 decode route table (64 uint32
@@ -1007,7 +997,7 @@ private let routeCsortPrefillScatterKernel: MLXFast.MLXFastKernel = MLXFast.meta
 /// disjoint position bits; the barrier makes the final words visible before
 /// any rank is read. Tail positions never set a bit or write an output.
 private let routeCsortPrefillBitsetScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "mlx_lm_route_csort128_scatter_bitset_v1",
+    name: "mlx_lm_route_csort128_scatter_bitset_ne_v2",
     inputNames: ["keys", "block_offset"],
     outputNames: ["row_order", "sorted_keys", "inverse_order"],
     source: """
@@ -1019,8 +1009,11 @@ private let routeCsortPrefillBitsetScatterKernel: MLXFast.MLXFastKernel = MLXFas
         const uint n = keys_shape[0];
         const uint idx = b * BLOCK + k;
         // Each bit names one input position; equal keys occupy distinct bits.
-        threadgroup atomic_uint bitsets[WIDTH * WORDS];
-        for (uint i = k; i < WIDTH * WORDS; i += BLOCK) {
+        // Admission proves keys < NE. Compact only scratch; block offsets
+        // retain the histogram's WIDTH stride.
+        constexpr uint SCRATCH_WIDTH = (uint)NE;
+        threadgroup atomic_uint bitsets[SCRATCH_WIDTH * WORDS];
+        for (uint i = k; i < SCRATCH_WIDTH * WORDS; i += BLOCK) {
             atomic_store_explicit(&bitsets[i], 0u, memory_order_relaxed);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1028,7 +1021,7 @@ private let routeCsortPrefillBitsetScatterKernel: MLXFast.MLXFastKernel = MLXFas
         const uint word = k / 32u;
         const uint bit = k & 31u;
         if (idx < n) {
-            atomic_fetch_or_explicit(&bitsets[word * WIDTH + key], 1u << bit, memory_order_relaxed);
+            atomic_fetch_or_explicit(&bitsets[word * SCRATCH_WIDTH + key], 1u << bit, memory_order_relaxed);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (idx < n) {
@@ -1036,9 +1029,9 @@ private let routeCsortPrefillBitsetScatterKernel: MLXFast.MLXFastKernel = MLXFas
             // The current-word mask is valid even when bit is zero or 31.
             uint rank = 0u;
             for (uint w = 0; w < word; ++w) {
-                rank += popcount(atomic_load_explicit(&bitsets[w * WIDTH + key], memory_order_relaxed));
+                rank += popcount(atomic_load_explicit(&bitsets[w * SCRATCH_WIDTH + key], memory_order_relaxed));
             }
-            rank += popcount(atomic_load_explicit(&bitsets[word * WIDTH + key], memory_order_relaxed)
+            rank += popcount(atomic_load_explicit(&bitsets[word * SCRATCH_WIDTH + key], memory_order_relaxed)
                 & ((1u << bit) - 1u));
             const uint pos = block_offset[b * WIDTH + key] + rank;
             row_order[pos] = idx / uint(M);
@@ -1122,7 +1115,7 @@ private func routeCountingSortPrefill(
     if useBitset { CBv2EngageMark.once("route-csort-prefill-bitset") }
     let outputs = scatter(
         [indices, offsets],
-        template: [("M", m)],
+        template: [("M", m), ("NE", numExperts)],
         grid: (blocks * width, 1, 1),
         threadGroup: (width, 1, 1),
         outputShapes: [[n], [n], [n]],
@@ -1172,12 +1165,7 @@ public func gatherSort(
         (indices.shape == [8, 8] || (indices.ndim == 1 && indices.size == 64)),
         indices.dtype == .uint32
     {
-        if routeSimdRank64DirectInputEnabled {
-            CBv2EngageMark.once("route-simd-direct-input")
-        }
-        let flat: MLXArray = routeSimdRank64DirectInputEnabled
-            ? indices
-            : indices.flattened()
+        let flat = indices.flattened()
         let outputs = routeSimdRank64Kernel(
             [flat],
             grid: (64, 1, 1),
@@ -1260,12 +1248,7 @@ public func gatherSortIndices(
         if expertPrefixBounds {
             CBv2EngageMark.once("expert-prefix-bounds")
         }
-        if routeSimdRank64DirectInputEnabled {
-            CBv2EngageMark.once("route-simd-direct-input")
-        }
-        let flat: MLXArray = routeSimdRank64DirectInputEnabled
-            ? indices
-            : indices.flattened()
+        let flat = indices.flattened()
         let kernel = expertPrefixBounds
             ? routeSimdRank64PrefixBoundsKernel : routeSimdRank64Kernel
         let outputs = kernel(
@@ -1648,8 +1631,10 @@ public class SwitchGLU: Module {
             && useLhsIndices
             && indices.dtype == .uint32 && x.dtype == .bfloat16
             && expertPrefixBoundsProjectionsEligible
-        var x = MLX.expandedDimensions(x, axes: [-2, -3])
-        let doSort = indices.size >= 64
+        // Decode already supplies [rows, inputDims]; avoid constructing then
+        // immediately flattening two singleton axes on that path.
+        var x = useLhsIndices ? x : MLX.expandedDimensions(x, axes: [-2, -3])
+        let doSort = useLhsIndices || indices.size >= 64
 
         var idx = indices
         // ROUTE-LAZY-INVERSE-ORDER: the sentinel `MLXArray()` this variable
@@ -1661,7 +1646,6 @@ public class SwitchGLU: Module {
         var lhsIndices: MLXArray?
         if doSort {
             if useLhsIndices {
-                x = x.flattened(start: 0, end: -3)
                 // GLUE-FOLD: an upstream producer already emitted the exact
                 // route table beside the top-8 selection; consume it and the
                 // standalone `mlx_lm_route_simd_rank_scatter` dispatch never

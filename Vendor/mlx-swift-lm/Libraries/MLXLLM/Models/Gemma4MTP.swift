@@ -1079,57 +1079,6 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
             masks: masks)
     }
 
-    /// Run the drafter and return one greedy token per batch row.
-    ///
-    /// When the drafter is a tied affine-4 quantized model and the caller
-    /// supplies the B=8 decode cohort, the existing fused MMA head can select
-    /// the token without materializing the vocabulary logits plane. All other
-    /// geometries retain the ordinary logits-plus-argmax path.
-    internal func callForGreedy(
-        inputsEmbeds: MLXArray,
-        sharedKV: Gemma4SharedKV,
-        positionOffset: Gemma4.PositionOffset,
-        masks: Gemma4DrafterMasks
-    ) -> (lastHidden: MLXArray, nextToken: MLXArray) {
-        let h = preProjection(inputsEmbeds)
-        let states = forwardProjectedStates(
-            h,
-            sharedKV: sharedKV,
-            positionOffset: positionOffset,
-            masks: masks)
-
-        if Self.directArgmaxEnabled,
-            maskedEmbedder == nil,
-            lmHead == nil,
-            let quantized = model.embedTokens as? QuantizedEmbedding,
-            quantized.mode == .affine,
-            let next = Gemma4MMAQuantizedGEMV.applyArgmax(
-                x: states.normalized,
-                w: quantized.weight,
-                scales: quantized.scales,
-                biases: quantized.biases,
-                groupSize: quantized.groupSize,
-                bits: quantized.bits)
-        {
-            CBv2EngageMark.once("mtp-assistant-direct-argmax")
-            return (states.lastHidden, next)
-        }
-
-        let logits = applyLMHead(states.normalized)
-        let next = logits.squeezed(axis: 1).argMax(axis: -1).asType(.int32)
-        return (states.lastHidden, next)
-    }
-
-    private static let directArgmaxEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_MTP_ASSISTANT_ARGMAX"
-        ] else { return true }
-        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
-        case "0", "false", "no", "off": return false
-        default: return true
-        }
-    }()
-
     internal func makeMasks(
         queryLen: Int,
         sharedKV: Gemma4SharedKV,
@@ -1161,20 +1110,6 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         positionOffset: Gemma4.PositionOffset,
         masks: Gemma4DrafterMasks
     ) -> (lastHidden: MLXArray, logits: MLXArray) {
-        let states = forwardProjectedStates(
-            projected,
-            sharedKV: sharedKV,
-            positionOffset: positionOffset,
-            masks: masks)
-        return (states.lastHidden, applyLMHead(states.normalized))
-    }
-
-    private func forwardProjectedStates(
-        _ projected: MLXArray,
-        sharedKV: Gemma4SharedKV,
-        positionOffset: Gemma4.PositionOffset,
-        masks: Gemma4DrafterMasks
-    ) -> (normalized: MLXArray, lastHidden: MLXArray) {
         let textCfg = config.textConfig
         var h = projected
         // Run each drafter layer with the appropriate shared-KV + mask.
@@ -1207,7 +1142,9 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         }
 
         h = model.norm(h)
-        return (h, postProjection(h))
+        let lastHidden = postProjection(h)
+        let logits = applyLMHead(h)
+        return (lastHidden, logits)
     }
 
     /// Dispatch the LM head: masked-centroid if `useOrderedEmbeddings`,

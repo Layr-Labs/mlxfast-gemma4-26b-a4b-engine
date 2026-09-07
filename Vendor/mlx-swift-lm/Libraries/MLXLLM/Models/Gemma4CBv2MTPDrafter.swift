@@ -196,11 +196,12 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         // the token, carried hidden) along the feature axis.
         let inputsEmbeds = concatenated(
             [target.embedTokensForDrafter(tokens), rotatedHidden], axis: -1)
-        let (newHidden, next) = drafter.callForGreedy(
+        let (newHidden, logits) = drafter(
             inputsEmbeds: inputsEmbeds,
             sharedKV: prepared.sharedKV,
             positionOffset: prepared.positionOffset,
             masks: prepared.masks)
+        let next = logits.squeezed(axis: 1).argMax(axis: -1).asType(.int32)
         return (next, newHidden)
     }
 

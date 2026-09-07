@@ -1113,7 +1113,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
           if constexpr (kAlignedM.value) {
             Atile.load(x + kk1, K);
           } else {
-            Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+            Atile.load_rows(x + kk1, K, sgp_sm);
           }
 
           Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
@@ -1890,7 +1890,7 @@ template <
               if constexpr (kAlignedM.value) {
                 Atile.load(xn + kk1, K);
               } else {
-                Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+                Atile.load_rows(xn + kk1, K, sgp_sm);
               }
 
               if constexpr (transpose) {

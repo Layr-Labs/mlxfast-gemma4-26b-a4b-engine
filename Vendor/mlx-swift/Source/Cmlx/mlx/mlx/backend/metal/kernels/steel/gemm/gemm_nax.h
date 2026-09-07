@@ -29,6 +29,17 @@ inline T gemma4_dense_geglu_compiled_tape(T gate, T up) {
 
 namespace mlx::steel {
 
+// DARKBLOOM GEMMA4 NAX VOLATILE-FENCE ELIDE.
+// Every K-step loop body in the accelerated GEMM family declares an
+// uninitialised volatile int that is never written and is read once through
+// a discarded-value cast. With the elide on, neither the declaration nor the
+// read is emitted; no value in the kernel is derived from it.
+// Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE=0 to restore
+// the incumbent declaration and read at every site.
+#ifndef DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
+#define DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE 1
+#endif
+
 template <
     typename T,
     short SM,
@@ -114,7 +125,9 @@ auto gemm_loop(
       NAXTile<T, RB, CB> Btile;
       const int k = kk1;
 
+#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
       volatile int compiler_barrier;
+#endif
 
       const int A_offset = transpose_a ? k * lda : k;
       const int B_offset = transpose_b ? k : k * ldb;
@@ -142,7 +155,9 @@ auto gemm_loop(
           Btile,
           metal::bool_constant<transpose_b>{});
 
+#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
       (void)compiler_barrier;
+#endif
     }
 
     A += transpose_a ? (BK * lda) : BK;
@@ -316,7 +331,9 @@ auto gemm_loop_softmax(
       NAXTile<T, RB, CB> Btile;
       const int k = kk1;
 
+#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
       volatile int compiler_barrier;
+#endif
 
       const int A_offset = transpose_a ? k * lda : k;
       const int B_offset = transpose_b ? k : k * ldb;
@@ -351,7 +368,9 @@ auto gemm_loop_softmax(
           Btile,
           metal::bool_constant<transpose_b>{});
 
+#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
       (void)compiler_barrier;
+#endif
     }
 
     A += transpose_a ? (BK * lda) : BK;

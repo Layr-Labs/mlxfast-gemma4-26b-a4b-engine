@@ -2331,15 +2331,9 @@ private enum Gemma4PrefillDeqGEMMV1 {
 
 // MARK: - Attention
 
-/// QKFUSE-SLIDING. Default ON: sliding attention layers (vProj != nil) take
-/// the fused Q|K dispatch alongside the K-eq-V global layers, while V keeps
-/// its separate tierProjection. The fused kernels admit the sliding widths
-/// (qWidth 4096, kWidth 2048) and compute each output column from that
-/// column's own plane row, so the Q and K halves are bit-identical to the
-/// separate q_proj/k_proj dispatches. The per-layer cached concatenated
-/// planes ([6144, 352] uint32 + [6144, 44] bf16 scales + same-size biases)
-/// add 9,732,096 bytes (~9.3 MiB) of resident memory per sliding layer,
-/// 243,302,400 bytes (~232 MiB) across the 25 sliding layers.
+/// QKFUSE-SLIDING. Default ON: sliding decode first tries Q/K/V on their
+/// original planes, then the cached Q|K dispatch with separate V. The
+/// three-output route avoids entering the Q|K concatenation cache.
 /// `DARKBLOOM_GEMMA4_QKFUSE_SLIDING=0` (also false/no/off) restores the
 /// vProj == nil gate.
 private let gemma4QKFuseSlidingEnabled: Bool = {
@@ -2497,6 +2491,26 @@ private class Gemma4Attention: Module {
             kWeight: k.weight, kScales: k.scales, kBiases: k.biases,
             groupSize: q.groupSize, bits: q.bits, mode: q.mode,
             cacheKey: ObjectIdentifier(q),
+            rsTable: rsTable)
+    }
+
+    @inline(__always)
+    private func fusedSlidingQKVProjection(
+        _ x: MLXArray, rsTable: MLXArray? = nil
+    ) -> (q: MLXArray, k: MLXArray, v: MLXArray)? {
+        guard let q = qProj as? QuantizedLinear, q.bias == nil,
+            let kProj, let k = kProj as? QuantizedLinear, k.bias == nil,
+            let vProj, let v = vProj as? QuantizedLinear, v.bias == nil,
+            q.groupSize == k.groupSize, q.groupSize == v.groupSize,
+            q.bits == k.bits, q.bits == v.bits,
+            q.mode == k.mode, q.mode == v.mode
+        else { return nil }
+        return CBv2AttentionQKVMMA8V1.fusedSlidingQKVMatmul(
+            x: x,
+            qWeight: q.weight, qScales: q.scales, qBiases: q.biases,
+            kWeight: k.weight, kScales: k.scales, kBiases: k.biases,
+            vWeight: v.weight, vScales: v.scales, vBiases: v.biases,
+            groupSize: q.groupSize, bits: q.bits, mode: q.mode,
             rsTable: rsTable)
     }
 
@@ -2738,24 +2752,20 @@ private class Gemma4Attention: Module {
         // custom helper would silently bypass the winning kernel.
         // QKFUSE-001: `queryInput === x` unless last-query prefill narrowed it,
         // which is the only case where Q and K cannot share a dispatch.
-        // QKFUSE-SLIDING: sliding layers (vProj != nil) take the fused Q|K
-        // dispatch too; V keeps its separate tierProjection below, and the
-        // K-eq-V structure is untouched (keyValueShared stays vProj == nil).
-        // `DARKBLOOM_GEMMA4_QKFUSE_SLIDING=0` restores the vProj == nil gate.
-        // The relaxation is only reachable here; fusedQKProjection's own
-        // admission still requires the exact B=8/L=1 decode shape, so
-        // prefill, last-query, shared-KV and other batch widths keep their
-        // incumbent dispatches.
-        // MMA-RS-001: the fused Q|K dispatch consumes the shared run-sum
-        // table — the table is per activation row and per 64-group of K,
-        // independent of N, so the concatenated-N dispatch reads the same
-        // entries the separate Q and K dispatches would.
+        // The exact sliding B8/L1 route binds Q/K/V directly. A successful
+        // dispatch bypasses the lazy Q|K concatenation and separate V launch.
+        // Both routes consume the same input and carried run-sum table.
+        let fusedQKV: (q: MLXArray, k: MLXArray, v: MLXArray)? =
+            (isSliding && lastQueryCache == nil && !usesSharedKV
+                && gemma4QKFuseSlidingEnabled)
+            ? fusedSlidingQKVProjection(x, rsTable: qkvRunsumTable) : nil
         let fusedQK: (MLXArray, MLXArray)? =
-            (lastQueryCache == nil && !usesSharedKV
+            (fusedQKV == nil && lastQueryCache == nil && !usesSharedKV
                 && (vProj == nil || gemma4QKFuseSlidingEnabled))
             ? fusedQKProjection(x, rsTable: qkvRunsumTable) : nil
         let queryRaw = (
-            fusedQK?.0 ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
+            fusedQKV?.q ?? fusedQK?.0
+                ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
         ).reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
@@ -2819,12 +2829,14 @@ private class Gemma4Attention: Module {
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
         let kRaw = (
-            fusedQK?.1 ?? tierProjection(kProj, x, rsTable: qkvRunsumTable)
+            fusedQKV?.k ?? fusedQK?.1
+                ?? tierProjection(kProj, x, rsTable: qkvRunsumTable)
         ).reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
-            vRaw = tierProjection(vProj, x, rsTable: qkvRunsumTable)
-                .reshaped(B, L, nKvHeads, effectiveHeadDim)
+            vRaw = (
+                fusedQKV?.v ?? tierProjection(vProj, x, rsTable: qkvRunsumTable)
+            ).reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw
         }
@@ -6875,28 +6887,11 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             """
     }()
 
-    /// HEAD-XT. The tied head reads each contraction index across all eight
-    /// activation rows; publishing the same values a second time with the
-    /// rows adjacent lets it take the pair as one word. The values are the
-    /// producer's own `outv[i]`, stored twice, never recomputed.
-    private static let xtEnabled: Bool =
-        Gemma4MMAQuantizedGEMV.consumesTransposedActivation
-
-    private static let xtSuffix: String = xtEnabled ? "_xt1" : ""
-
-    private static let xtOutputNames: [String] =
-        xtEnabled ? ["out", "xSums", "xT"] : ["out", "xSums"]
-
-    /// Appended to the existing store statement, so with HEAD-XT off the
-    /// producer source is the incumbent's byte for byte.
-    private static let xtStore: String = xtEnabled
-        ? "\n                xT[(wbase + i) * 8 + row] = outv[i];" : ""
-
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v1"
-            + nbSuffix + xtSuffix,
+            + nbSuffix,
         inputNames: ["x", "w"],
-        outputNames: xtOutputNames,
+        outputNames: ["out", "xSums"],
         source: """
             const uint row = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
@@ -6923,7 +6918,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
                 // Preserve the stock RMSNorm's BF16 boundary exactly.
                 outv[i] = w[wbase + i]
                     * static_cast<T>((float)x[base + i] * \(finalNormRiEnabled ? "inv" : "local_inv[0]"));
-                out[base + i] = outv[i];\(xtStore)
+                out[base + i] = outv[i];
             }
 
             // This four-value expression is exactly one addend of the head's
@@ -6949,11 +6944,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
 
     static func apply(
         _ x: MLXArray, weight: MLXArray, eps: Float
-    ) -> (
-        postNorm: MLXArray,
-        sums: Gemma4MMAQuantizedGEMV.ActivationSums,
-        transposed: Gemma4MMAQuantizedGEMV.TransposedActivation?
-    )? {
+    ) -> (postNorm: MLXArray, sums: Gemma4MMAQuantizedGEMV.ActivationSums)? {
         guard Gemma4MMAQuantizedGEMV.consumesActivationSums,
             eps == Self.eps,
             x.dtype == .bfloat16,
@@ -6972,26 +6963,16 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             template: [("T", x.dtype)],
             grid: (rows * threadgroupSize, 1, 1),
             threadGroup: (threadgroupSize, 1, 1),
-            outputShapes: xtEnabled
-                ? [[rows, 1, axis], [rows * (axis / groupSize)], [axis, rows]]
-                : [[rows, 1, axis], [rows * (axis / groupSize)]],
-            outputDTypes: xtEnabled
-                ? [.bfloat16, .float32, .bfloat16]
-                : [.bfloat16, .float32]
+            outputShapes: [[rows, 1, axis], [rows * (axis / groupSize)]],
+            outputDTypes: [.bfloat16, .float32]
         )
         guard let sums = Gemma4MMAQuantizedGEMV.activationSums(
             produced: outputs[1], for: outputs[0])
         else { return nil }
-        let transposed: Gemma4MMAQuantizedGEMV.TransposedActivation? =
-            xtEnabled
-            ? Gemma4MMAQuantizedGEMV.transposedActivation(
-                produced: outputs[2], for: outputs[0])
-            : nil
         CBv2EngageMark.once("final-norm-mma-xsum")
         if finalNormNbEnabled { CBv2EngageMark.once("final-norm-nb") }
         if finalNormRiEnabled { CBv2EngageMark.once("final-norm-ri") }
-        if transposed != nil { CBv2EngageMark.once("final-norm-xt") }
-        return (outputs[0], sums, transposed)
+        return (outputs[0], sums)
     }
 }
 
@@ -7124,14 +7105,13 @@ public class Gemma4TextModelInner: Module {
         cache: [KVCache]? = nil
     ) -> (
         postNorm: MLXArray,
-        activationSums: Gemma4MMAQuantizedGEMV.ActivationSums?,
-        transposedActivation: Gemma4MMAQuantizedGEMV.TransposedActivation?
+        activationSums: Gemma4MMAQuantizedGEMV.ActivationSums?
     ) {
         let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
         let result = forwardTrunk(
             inputs, cache: cache, captureHook: nil, capturePreNorm: false,
             emitMMAHeadSums: true)
-        return (result.postNorm, result.mmaHeadSums, result.mmaHeadXT)
+        return (result.postNorm, result.mmaHeadSums)
     }
 
     /// CBv2 prompt-forward entry point. Keeping the scheduled-prefill
@@ -7213,8 +7193,7 @@ public class Gemma4TextModelInner: Module {
     ) -> (
         postNorm: MLXArray,
         preNorm: MLXArray?,
-        mmaHeadSums: Gemma4MMAQuantizedGEMV.ActivationSums?,
-        mmaHeadXT: Gemma4MMAQuantizedGEMV.TransposedActivation?
+        mmaHeadSums: Gemma4MMAQuantizedGEMV.ActivationSums?
     ) {
         // Shape queries cross the Swift/C boundary. Cache the two immutable
         // input dimensions once rather than paying for them at every ladder
@@ -7476,20 +7455,17 @@ public class Gemma4TextModelInner: Module {
 
         let postNorm: MLXArray
         let mmaHeadSums: Gemma4MMAQuantizedGEMV.ActivationSums?
-        let mmaHeadXT: Gemma4MMAQuantizedGEMV.TransposedActivation?
         if emitMMAHeadSums,
             let produced = Gemma4FinalNormMMAHeadSumsV1.apply(
                 h, weight: norm.weight, eps: norm.eps)
         {
             postNorm = produced.postNorm
             mmaHeadSums = produced.sums
-            mmaHeadXT = produced.transposed
         } else {
             postNorm = norm(h)
             mmaHeadSums = nil
-            mmaHeadXT = nil
         }
-        return (postNorm, capturePreNorm ? h : nil, mmaHeadSums, mmaHeadXT)
+        return (postNorm, capturePreNorm ? h : nil, mmaHeadSums)
     }
 }
 
@@ -8222,7 +8198,6 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
         // only this path was still paying for both dispatches.
         let hidden: MLXArray
         let carriedSums: Gemma4MMAQuantizedGEMV.ActivationSums?
-        let carriedXT: Gemma4MMAQuantizedGEMV.TransposedActivation?
         if gemma4DecodeHeadNormXSumFoldEnabled,
             lmHead == nil,
             tokens.ndim == 2,
@@ -8237,11 +8212,9 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
             let produced = model.callWithMMAHeadSums(tokens, cache: caches)
             hidden = produced.postNorm
             carriedSums = produced.activationSums
-            carriedXT = produced.transposedActivation
         } else {
             hidden = model(tokens, cache: caches)
             carriedSums = nil
-            carriedXT = nil
         }
         let rows = tokens.dim(0)
         guard lmHead == nil,
@@ -8254,8 +8227,7 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
                 biases: quantized.biases,
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
-                activationSums: carriedSums,
-                transposedActivation: carriedXT)
+                activationSums: carriedSums)
         else {
             return applyLMHead(hidden).argMax(axis: -1).asType(.int32).reshaped([rows])
         }

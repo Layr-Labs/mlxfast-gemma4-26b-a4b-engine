@@ -731,7 +731,9 @@ private func routeCountingSortFusedT64(
 /// Three dispatches, no comparisons:
 ///   1. `_hist_v1`    — one threadgroup per 256-key block builds a 256-entry
 ///                      threadgroup histogram (commutative integer atomics) and
-///                      writes it to `H[block][key]`.
+///                      writes it to `H[block][key]`. For the 128-expert large
+///                      prefill path, one position bitset instead emits both
+///                      the histogram and every assignment's stable local rank.
 ///   2. `_scan_v1`    — ONE threadgroup: thread `e` sums `H[.][e]` over blocks
 ///                      to get `total[e]`, a simd exclusive prefix over the 256
 ///                      totals gives the global bin base `base[e]`, and a second
@@ -739,7 +741,8 @@ private func routeCountingSortFusedT64(
 ///   3. `_scatter_v1` — one threadgroup per block stages the block's 256 keys in
 ///                      threadgroup memory; thread `k` counts how many earlier
 ///                      keys IN ITS OWN BLOCK carry its key (`rank`) and lands at
-///                      `pos = O[block][key] + rank`.
+///                      `pos = O[block][key] + rank`. The large 128-expert path
+///                      consumes the rank retained by its first dispatch.
 ///
 /// Exactness (why this is `argSort`-identical, not merely equal on tests): for
 /// the key at flat index `idx` in block `b`, `O[b][key] + rank` is by
@@ -775,7 +778,8 @@ private let routeCsortPrefillEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
-/// Disable only the bitset scatter to retain the original local-rank loop.
+/// Disable the bitset local-rank paths to retain the original histogram and
+/// local-rank loop.
 private let routeCsortPrefillBitsetEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_ROUTE_CSORT_PREFILL_BITSET"]
@@ -840,6 +844,56 @@ private let routeCsortPrefillHistKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
         // interleaving the hardware picks.
         block_hist[b * WIDTH + k] =
             atomic_load_explicit(&tg_count[k], memory_order_relaxed);
+        """,
+    ensureRowContiguous: true
+)
+
+private let routeCsortPrefillBitsetHistRankKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128_hist_rank_bitset_v1",
+    inputNames: ["keys"],
+    outputNames: ["block_hist", "local_rank"],
+    source: """
+        constexpr uint BLOCK = \(routeCsortPrefillBlock);
+        constexpr uint WIDTH = \(routeCsortPrefillWidth);
+        constexpr uint EXPERTS = 128;
+        constexpr uint WORDS = BLOCK / 32;
+        const uint b = threadgroup_position_in_grid.x;
+        const uint k = thread_position_in_threadgroup.x;
+        const uint n = keys_shape[0];
+        const uint idx = b * BLOCK + k;
+        threadgroup atomic_uint bitsets[EXPERTS * WORDS];
+        for (uint i = k; i < EXPERTS * WORDS; i += BLOCK) {
+            atomic_store_explicit(&bitsets[i], 0u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint key = idx < n ? keys[idx] : 0u;
+        const uint word = k / 32u;
+        const uint bit = k & 31u;
+        if (idx < n) {
+            atomic_fetch_or_explicit(
+                &bitsets[word * EXPERTS + key], 1u << bit,
+                memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (idx < n) {
+            uint rank = 0u;
+            for (uint w = 0; w < word; ++w) {
+                rank += popcount(atomic_load_explicit(
+                    &bitsets[w * EXPERTS + key], memory_order_relaxed));
+            }
+            rank += popcount(atomic_load_explicit(
+                &bitsets[word * EXPERTS + key], memory_order_relaxed)
+                & ((1u << bit) - 1u));
+            local_rank[idx] = rank;
+        }
+        uint count = 0u;
+        if (k < EXPERTS) {
+            for (uint w = 0; w < WORDS; ++w) {
+                count += popcount(atomic_load_explicit(
+                    &bitsets[w * EXPERTS + k], memory_order_relaxed));
+            }
+        }
+        block_hist[b * WIDTH + k] = count;
         """,
     ensureRowContiguous: true
 )
@@ -1052,6 +1106,28 @@ private let routeCsortPrefillBitsetScatterKernel: MLXFast.MLXFastKernel = MLXFas
     ensureRowContiguous: true
 )
 
+private let routeCsortPrefillRankScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128_scatter_rank_v1",
+    inputNames: ["keys", "block_offset", "local_rank"],
+    outputNames: ["row_order", "sorted_keys", "inverse_order"],
+    source: """
+        constexpr uint BLOCK = \(routeCsortPrefillBlock);
+        constexpr uint WIDTH = \(routeCsortPrefillWidth);
+        const uint b = threadgroup_position_in_grid.x;
+        const uint k = thread_position_in_threadgroup.x;
+        const uint n = keys_shape[0];
+        const uint idx = b * BLOCK + k;
+        if (idx < n) {
+            const uint key = keys[idx];
+            const uint pos = block_offset[b * WIDTH + key] + local_rank[idx];
+            row_order[pos] = idx / uint(M);
+            sorted_keys[pos] = key;
+            inverse_order[idx] = pos;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 /// Exact stable counting sort of a flat uint32 route table. Returns nil (fail
 /// closed onto `argSort`) unless every precondition of the kernels holds.
 private func routeCountingSortPrefill(
@@ -1071,13 +1147,30 @@ private func routeCountingSortPrefill(
     CBv2EngageMark.once("route-csort-prefill")
     let blocks = (n + routeCsortPrefillBlock - 1) / routeCsortPrefillBlock
     let width = routeCsortPrefillWidth
-    let hist = routeCsortPrefillHistKernel(
-        [indices],
-        grid: (blocks * width, 1, 1),
-        threadGroup: (width, 1, 1),
-        outputShapes: [[blocks, width]],
-        outputDTypes: [.uint32]
-    )[0]
+    let useSharedBitset = routeCsortPrefillBitsetEnabled
+        && numExperts == 128 && n >= 4096
+    let hist: MLXArray
+    let localRanks: MLXArray?
+    if useSharedBitset {
+        let outputs = routeCsortPrefillBitsetHistRankKernel(
+            [indices],
+            grid: (blocks * width, 1, 1),
+            threadGroup: (width, 1, 1),
+            outputShapes: [[blocks, width], [n]],
+            outputDTypes: [.uint32, .uint32]
+        )
+        hist = outputs[0]
+        localRanks = outputs[1]
+    } else {
+        hist = routeCsortPrefillHistKernel(
+            [indices],
+            grid: (blocks * width, 1, 1),
+            threadGroup: (width, 1, 1),
+            outputShapes: [[blocks, width]],
+            outputDTypes: [.uint32]
+        )[0]
+        localRanks = nil
+    }
     let offsets: MLXArray
     // PROMPT-GLUE2 (pg2): the prompt plane's key table takes the eight-part
     // scan; every other table keeps the incumbent dispatch.
@@ -1117,20 +1210,33 @@ private func routeCountingSortPrefill(
             outputDTypes: [.uint32]
         )[0]
     }
-    // Large route tables amortize the 8 KiB bitset initialization. Smaller
-    // tables retain the compact incumbent scratch and rank loop.
-    let useBitset = routeCsortPrefillBitsetEnabled && n >= 4096
-    let scatter = useBitset
-        ? routeCsortPrefillBitsetScatterKernel : routeCsortPrefillScatterKernel
-    if useBitset { CBv2EngageMark.once("route-csort-prefill-bitset") }
-    let outputs = scatter(
-        [indices, offsets],
-        template: [("M", m), ("NE", numExperts)],
-        grid: (blocks * width, 1, 1),
-        threadGroup: (width, 1, 1),
-        outputShapes: [[n], [n], [n]],
-        outputDTypes: [.uint32, .uint32, .uint32]
-    )
+    let outputs: [MLXArray]
+    if let localRanks {
+        CBv2EngageMark.once("route-csort-prefill-bitset")
+        outputs = routeCsortPrefillRankScatterKernel(
+            [indices, offsets, localRanks],
+            template: [("M", m)],
+            grid: (blocks * width, 1, 1),
+            threadGroup: (width, 1, 1),
+            outputShapes: [[n], [n], [n]],
+            outputDTypes: [.uint32, .uint32, .uint32]
+        )
+    } else {
+        // Large non-128-expert route tables retain their current bitset rank
+        // path; smaller tables keep the compact local-rank loop.
+        let useBitset = routeCsortPrefillBitsetEnabled && n >= 4096
+        let scatter = useBitset
+            ? routeCsortPrefillBitsetScatterKernel : routeCsortPrefillScatterKernel
+        if useBitset { CBv2EngageMark.once("route-csort-prefill-bitset") }
+        outputs = scatter(
+            [indices, offsets],
+            template: [("M", m), ("NE", numExperts)],
+            grid: (blocks * width, 1, 1),
+            threadGroup: (width, 1, 1),
+            outputShapes: [[n], [n], [n]],
+            outputDTypes: [.uint32, .uint32, .uint32]
+        )
+    }
     return (outputs[0], outputs[1], outputs[2])
 }
 

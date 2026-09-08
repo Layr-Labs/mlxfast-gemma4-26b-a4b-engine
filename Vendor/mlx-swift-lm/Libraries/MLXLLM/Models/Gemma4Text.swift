@@ -4311,9 +4311,9 @@ private enum Gemma4FusedLayerGlue {
 // T28 second sample marker (r2): content identical to ranked 32f5d19f apart from this comment.
     private static let attentionBranchPrefixKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v1_nb1",
-            inputNames: ["attn", "res", "wa", "wd", "we", "wr"],
-            outputNames: ["out", "dense", "expert", "router", "xSums"],
+            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v1_nb1_rs1",
+            inputNames: ["attn", "res", "wa", "wd", "we", "wr", "rqw", "rqs", "rqb"],
+            outputNames: ["out", "dense", "expert", "router", "xSums", "rscores"],
             source: """
                 const uint row = threadgroup_position_in_grid.x;
                 const uint lid = thread_position_in_threadgroup.x;
@@ -4348,16 +4348,17 @@ private enum Gemma4FusedLayerGlue {
                     xsum += densev;
                 }
                 xSums[lid * 8 + row] = xsum;
+            \(routerScoresPrologue)
             """,
             ensureRowContiguous: true
         )
 
     private static let attentionBranchPrefixKernelV2: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v2_nb1"
+            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v2_nb1_rs1"
                 + tbSuffix,
-            inputNames: ["attn", "res", "wa", "wd", "we", "wr"],
-            outputNames: ["out", "dense", "expert", "router"],
+            inputNames: ["attn", "res", "wa", "wd", "we", "wr", "rqw", "rqs", "rqb"],
+            outputNames: ["out", "dense", "expert", "router", "rscores"],
             source: """
                 const uint row = threadgroup_position_in_grid.x;
                 const uint lid = thread_position_in_threadgroup.x;
@@ -4389,9 +4390,138 @@ private enum Gemma4FusedLayerGlue {
                     expert[base + i] = we[wbase + i] * nx;
                     router[base + i] = wr[wbase + i] * nx;
                 }
+            \(routerScoresPrologue)
             """,
             ensureRowContiguous: true
         )
+
+    /// ROUTER-SCORES-FOLD kill switch. Default ON. Off (or a router projection
+    /// outside the pinned affine-4/group-64 contract) leaves the prefix kernels
+    /// byte-identical to the incumbent emission and the stock router
+    /// projection runs; the fold below never engages.
+    private static let routerScoresFoldEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTER_SCORES_FOLD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+    /// ROUTER-SCORES-FOLD prologue, appended to the attention branch prefix
+    /// kernels. Recomputes NOTHING the prefix already staged: it re-reads the
+    /// just-stored router norm row and scores it against the router's
+    /// quantized plane with the bit-exact operation order of the stock
+    /// `affine_qmv` dispatch the ZIP consumer otherwise pays
+    /// (`quantized.h::qmv_impl`, bits 4, K 2816 = 11 blocks of 256, no tail,
+    /// N 128 so the whole-N main path with no output clamp): per lane the
+    /// same eight-value packets in the same block sequence, the same
+    /// nibble-mask dot (`load_vector`/`qdot` bits-4 arms verbatim, including
+    /// the shift-folded activation scaling), the same per-block
+    /// `result += scale * accum + sum * bias` accumulation, and the same
+    /// `simd_sum` over the same 32 lanes before the single bf16 store.
+    /// The 128 virtual threadgroups of that dispatch (M 8 rows x 16
+    /// eight-column tiles, two simdgroups each) run as 256 virtual simdgroups
+    /// over this launch's own 176 physical simdgroups (8 threadgroups of 22):
+    /// physical simdgroup p serves virtual simdgroups p and p + 176, so every
+    /// lane keeps its stock packet mapping and every `simd_sum` still spans
+    /// exactly the 32 lanes the stock kernel reduced. No threadgroup memory:
+    /// everything is registers plus one intra-simdgroup reduction per output.
+    /// A `mem_device` barrier orders the prefix's own router stores before
+    /// this prologue re-reads them; the prefix body is otherwise untouched.
+    private static let routerScoresPrologue = """
+        threadgroup_barrier(mem_flags::mem_device);
+        {
+            const uint rs_t = row;
+            const uint rs_s = simd_group_id;
+            const uint rs_l = simd_lane_id;
+            const uint rs_p = rs_t * 22u + rs_s;
+            const device uint16_t* rs_w = (const device uint16_t*)rqw;
+            for (uint rs_r = 0u; rs_r < 2u; ++rs_r) {
+                const uint rs_g = rs_p + rs_r * 176u;
+                if (rs_g >= 256u) { break; }
+                const uint rs_vtg = rs_g >> 1u;
+                const uint rs_phase = rs_g & 1u;
+                const uint rs_m = rs_vtg >> 4u;
+                const uint rs_n8 = rs_vtg & 15u;
+                float rs_acc0 = 0.0f;
+                float rs_acc1 = 0.0f;
+                float rs_acc2 = 0.0f;
+                float rs_acc3 = 0.0f;
+                for (uint rs_b = 0u; rs_b < 11u; ++rs_b) {
+                    const uint rs_xbase = rs_m * 2816u + rs_b * 256u + rs_l * 8u;
+                    const float rs_x0 = (float)router[rs_xbase];
+                    const float rs_x1 = (float)router[rs_xbase + 1u];
+                    const float rs_x2 = (float)router[rs_xbase + 2u];
+                    const float rs_x3 = (float)router[rs_xbase + 3u];
+                    const float rs_x4 = (float)router[rs_xbase + 4u];
+                    const float rs_x5 = (float)router[rs_xbase + 5u];
+                    const float rs_x6 = (float)router[rs_xbase + 6u];
+                    const float rs_x7 = (float)router[rs_xbase + 7u];
+                    float rs_sum = rs_x0 + rs_x1 + rs_x2 + rs_x3;
+                    rs_sum += rs_x4 + rs_x5 + rs_x6 + rs_x7;
+                    const float rs_xt0 = rs_x0;
+                    const float rs_xt1 = rs_x1 / 16.0f;
+                    const float rs_xt2 = rs_x2 / 256.0f;
+                    const float rs_xt3 = rs_x3 / 4096.0f;
+                    const float rs_xt4 = rs_x4;
+                    const float rs_xt5 = rs_x5 / 16.0f;
+                    const float rs_xt6 = rs_x6 / 256.0f;
+                    const float rs_xt7 = rs_x7 / 4096.0f;
+                    const uint rs_woff = rs_b * 64u + rs_l * 2u;
+                    const uint rs_soff = rs_b * 4u + (rs_l >> 3u);
+                    const uint rs_n0 = (rs_n8 << 3u) + (rs_phase << 2u);
+                    const uint16_t rs_ws00 = rs_w[rs_n0 * 704u + rs_woff];
+                    const uint16_t rs_ws01 = rs_w[rs_n0 * 704u + rs_woff + 1u];
+                    const float rs_sc0 = (float)rqs[rs_n0 * 44u + rs_soff];
+                    const float rs_bi0 = (float)rqb[rs_n0 * 44u + rs_soff];
+                    float rs_d0 = rs_xt0 * (rs_ws00 & 0x000f) + rs_xt1 * (rs_ws00 & 0x00f0) + rs_xt2 * (rs_ws00 & 0x0f00) + rs_xt3 * (rs_ws00 & 0xf000);
+                    float rs_d1 = rs_xt4 * (rs_ws01 & 0x000f) + rs_xt5 * (rs_ws01 & 0x00f0) + rs_xt6 * (rs_ws01 & 0x0f00) + rs_xt7 * (rs_ws01 & 0xf000);
+                    float rs_a0 = rs_d0;
+                    rs_a0 += rs_d1;
+                    rs_acc0 += rs_sc0 * rs_a0 + rs_sum * rs_bi0;
+                    const uint rs_n1 = rs_n0 + 1u;
+                    const uint16_t rs_ws10 = rs_w[rs_n1 * 704u + rs_woff];
+                    const uint16_t rs_ws11 = rs_w[rs_n1 * 704u + rs_woff + 1u];
+                    const float rs_sc1 = (float)rqs[rs_n1 * 44u + rs_soff];
+                    const float rs_bi1 = (float)rqb[rs_n1 * 44u + rs_soff];
+                    float rs_e0 = rs_xt0 * (rs_ws10 & 0x000f) + rs_xt1 * (rs_ws10 & 0x00f0) + rs_xt2 * (rs_ws10 & 0x0f00) + rs_xt3 * (rs_ws10 & 0xf000);
+                    float rs_e1 = rs_xt4 * (rs_ws11 & 0x000f) + rs_xt5 * (rs_ws11 & 0x00f0) + rs_xt6 * (rs_ws11 & 0x0f00) + rs_xt7 * (rs_ws11 & 0xf000);
+                    float rs_a1 = rs_e0;
+                    rs_a1 += rs_e1;
+                    rs_acc1 += rs_sc1 * rs_a1 + rs_sum * rs_bi1;
+                    const uint rs_n2 = rs_n0 + 2u;
+                    const uint16_t rs_ws20 = rs_w[rs_n2 * 704u + rs_woff];
+                    const uint16_t rs_ws21 = rs_w[rs_n2 * 704u + rs_woff + 1u];
+                    const float rs_sc2 = (float)rqs[rs_n2 * 44u + rs_soff];
+                    const float rs_bi2 = (float)rqb[rs_n2 * 44u + rs_soff];
+                    float rs_f0 = rs_xt0 * (rs_ws20 & 0x000f) + rs_xt1 * (rs_ws20 & 0x00f0) + rs_xt2 * (rs_ws20 & 0x0f00) + rs_xt3 * (rs_ws20 & 0xf000);
+                    float rs_f1 = rs_xt4 * (rs_ws21 & 0x000f) + rs_xt5 * (rs_ws21 & 0x00f0) + rs_xt6 * (rs_ws21 & 0x0f00) + rs_xt7 * (rs_ws21 & 0xf000);
+                    float rs_a2 = rs_f0;
+                    rs_a2 += rs_f1;
+                    rs_acc2 += rs_sc2 * rs_a2 + rs_sum * rs_bi2;
+                    const uint rs_n3 = rs_n0 + 3u;
+                    const uint16_t rs_ws30 = rs_w[rs_n3 * 704u + rs_woff];
+                    const uint16_t rs_ws31 = rs_w[rs_n3 * 704u + rs_woff + 1u];
+                    const float rs_sc3 = (float)rqs[rs_n3 * 44u + rs_soff];
+                    const float rs_bi3 = (float)rqb[rs_n3 * 44u + rs_soff];
+                    float rs_g0 = rs_xt0 * (rs_ws30 & 0x000f) + rs_xt1 * (rs_ws30 & 0x00f0) + rs_xt2 * (rs_ws30 & 0x0f00) + rs_xt3 * (rs_ws30 & 0xf000);
+                    float rs_g1 = rs_xt4 * (rs_ws31 & 0x000f) + rs_xt5 * (rs_ws31 & 0x00f0) + rs_xt6 * (rs_ws31 & 0x0f00) + rs_xt7 * (rs_ws31 & 0xf000);
+                    float rs_a3 = rs_g0;
+                    rs_a3 += rs_g1;
+                    rs_acc3 += rs_sc3 * rs_a3 + rs_sum * rs_bi3;
+                }
+                rs_acc0 = simd_sum(rs_acc0);
+                rs_acc1 = simd_sum(rs_acc1);
+                rs_acc2 = simd_sum(rs_acc2);
+                rs_acc3 = simd_sum(rs_acc3);
+                if (rs_l == 0u) {
+                    const uint rs_cbase = rs_m * 128u + (rs_n8 << 3u) + (rs_phase << 2u);
+                    rscores[rs_cbase] = static_cast<T>(rs_acc0);
+                    rscores[rs_cbase + 1u] = static_cast<T>(rs_acc1);
+                    rscores[rs_cbase + 2u] = static_cast<T>(rs_acc2);
+                    rscores[rs_cbase + 3u] = static_cast<T>(rs_acc3);
+                }
+            }
+        }
+        """
 
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v2_nb1",
@@ -4528,12 +4658,19 @@ private enum Gemma4FusedLayerGlue {
         let denseNorm: MLXArray
         let expertNorm: MLXArray
         let routerNorm: MLXArray
+        let routerScores: MLXArray?
         let denseSums: CBv2DenseMLPQMVV1.ActivationSums?
     }
 
     /// PREFIX-001. The returned `out` is still materialized because the layer
     /// tail consumes it as its residual. Only its otherwise-serial reread and
     /// the second dispatch disappear.
+    /// ROUTER-SCORES-FOLD: `routerProj` is the MoE router's projection. When
+    /// it is the pinned affine-4/group-64 quantized plane, the prefix kernels
+    /// score the router norm rows with the stock QMV order as a fifth output,
+    /// so the ZIP consumer's standalone router projection never enters the
+    /// chain. Any mismatch (or the kill switch) restores the incumbent chain:
+    /// the whole prefix is declined and the stock norms plus projection run.
     static func attentionBranchPrefix(
         attn: MLXArray,
         residual: MLXArray,
@@ -4541,6 +4678,7 @@ private enum Gemma4FusedLayerGlue {
         denseWeight: MLXArray,
         expertWeight: MLXArray,
         routerWeight: MLXArray,
+        routerProj: Linear,
         eps: Float
     ) -> AttentionBranchPrefix? {
         guard CBv2DenseMLPQMVV1.enabled,
@@ -4552,14 +4690,27 @@ private enum Gemma4FusedLayerGlue {
             expertWeight.ndim == 1, expertWeight.dim(0) == axis,
             expertWeight.dtype == .bfloat16,
             routerWeight.ndim == 1, routerWeight.dim(0) == axis,
-            routerWeight.dtype == .bfloat16
+            routerWeight.dtype == .bfloat16,
+            routerScoresFoldEnabled,
+            let routerQuantized = routerProj as? QuantizedLinear,
+            routerQuantized.bias == nil,
+            routerQuantized.groupSize == 64, routerQuantized.bits == 4,
+            routerQuantized.mode == .affine,
+            routerQuantized.weight.dtype == .uint32,
+            routerQuantized.weight.shape == [128, 352],
+            routerQuantized.scales.dtype == .bfloat16,
+            routerQuantized.scales.shape == [128, 44],
+            let routerBiases = routerQuantized.biases,
+            routerBiases.dtype == .bfloat16,
+            routerBiases.shape == [128, 44]
         else { return nil }
         if denseXSumElideEnabled {
             CBv2EngageMark.once("dense-xsum-elide")
             let outs = attentionBranchPrefixKernelV2(
                 [
                     attn, residual, postAttentionWeight, denseWeight,
-                    expertWeight, routerWeight,
+                    expertWeight, routerWeight, routerQuantized.weight,
+                    routerQuantized.scales, routerBiases,
                 ],
                 template: [("T", attn.dtype)],
                 grid: (rows * tgThreads, 1, 1),
@@ -4569,23 +4720,27 @@ private enum Gemma4FusedLayerGlue {
                     [rows, 1, axis],
                     [rows, 1, axis],
                     [rows, 1, axis],
+                    [rows, 1, 128],
                 ],
                 outputDTypes: [
-                    .bfloat16, .bfloat16, .bfloat16, .bfloat16,
+                    .bfloat16, .bfloat16, .bfloat16, .bfloat16, .bfloat16,
                 ]
             )
             CBv2EngageMark.once("attention-branch-prefix")
+            CBv2EngageMark.once("router-scores-fold")
             return AttentionBranchPrefix(
                 out: outs[0],
                 denseNorm: outs[1],
                 expertNorm: outs[2],
                 routerNorm: outs[3],
+                routerScores: outs[4],
                 denseSums: nil)
         }
         let outs = attentionBranchPrefixKernel(
             [
                 attn, residual, postAttentionWeight, denseWeight,
-                expertWeight, routerWeight,
+                expertWeight, routerWeight, routerQuantized.weight,
+                routerQuantized.scales, routerBiases,
             ],
             template: [("T", attn.dtype)],
             grid: (rows * tgThreads, 1, 1),
@@ -4596,20 +4751,23 @@ private enum Gemma4FusedLayerGlue {
                 [rows, 1, axis],
                 [rows, 1, axis],
                 [(axis / 128) * 32 * rows],
+                [rows, 1, 128],
             ],
             outputDTypes: [
-                .bfloat16, .bfloat16, .bfloat16, .bfloat16, .float32,
+                .bfloat16, .bfloat16, .bfloat16, .bfloat16, .float32, .bfloat16,
             ]
         )
         guard let denseSums = CBv2DenseMLPQMVV1.activationSums(
             produced: outs[4], for: outs[1])
         else { return nil }
         CBv2EngageMark.once("attention-branch-prefix")
+        CBv2EngageMark.once("router-scores-fold")
         return AttentionBranchPrefix(
             out: outs[0],
             denseNorm: outs[1],
             expertNorm: outs[2],
             routerNorm: outs[3],
+            routerScores: outs[5],
             denseSums: denseSums)
     }
 
@@ -5792,6 +5950,7 @@ private enum Gemma4ZipRouterV1 {
             denseWeight: denseWeight,
             expertWeight: expertWeight,
             routerWeight: router.zipEffectiveScale(),
+            routerProj: router.proj,
             eps: eps)
     }
 
@@ -5819,16 +5978,19 @@ private enum Gemma4ZipRouterV1 {
         let n2: MLXArray
         let producerSums: CBv2DenseMLPQMVV1.ActivationSums?
         let carriedRouterNorm: MLXArray?
+        let carriedScores: MLXArray?
         if let prefix, prefix.out === out {
-            (n1, n2, producerSums, carriedRouterNorm) = (
+            (n1, n2, producerSums, carriedRouterNorm, carriedScores) = (
                 prefix.denseNorm,
                  prefix.expertNorm,
                  prefix.denseSums,
-                 prefix.routerNorm)
+                 prefix.routerNorm,
+                 prefix.routerScores)
         } else if let (d1, d2, dSums) = Gemma4FusedLayerGlue.dualPreNorm(
             x: out, w1: w1, w2: w2, eps: eps)
         {
-            (n1, n2, producerSums, carriedRouterNorm) = (d1, d2, dSums, nil)
+            (n1, n2, producerSums, carriedRouterNorm, carriedScores) = (
+                d1, d2, dSums, nil, nil)
         } else {
             return nil
         }
@@ -5846,7 +6008,7 @@ private enum Gemma4ZipRouterV1 {
             Gemma4FusedLayerGlue.denseXSumElideEnabled,
             CBv2DenseMLPQMVV1.compiledPairAvailable
         {
-            let expertScores = router.zipScores(normed)
+            let expertScores = carriedScores ?? router.zipScores(normed)
             let denseIn = MLX.depends(input: n1, dependencies: [normed])
             if let denseOut = mlp.zipCompiledGateUpGeluDown(
                 denseIn, expertScores: expertScores)
@@ -5876,7 +6038,7 @@ private enum Gemma4ZipRouterV1 {
         if CBv2DenseMLPQMVV1.denseGeluEpilogueEnabled,
             Gemma4FusedLayerGlue.denseXSumElideEnabled
         {
-            expertScores = router.zipScores(normed)
+            expertScores = carriedScores ?? router.zipScores(normed)
             let denseIn = MLX.depends(input: n1, dependencies: [normed])
             if let act = mlp.zipGateUpGelu(denseIn) {
                 fusedActivated = act
@@ -5889,7 +6051,7 @@ private enum Gemma4ZipRouterV1 {
                 up = mlp.zipUp(denseIn, nil)
             }
         } else if Gemma4FusedLayerGlue.denseXSumElideEnabled {
-            expertScores = router.zipScores(normed)
+            expertScores = carriedScores ?? router.zipScores(normed)
             let denseIn = MLX.depends(input: n1, dependencies: [normed])
             if let joined = mlp.zipGateUp(denseIn, nil) {
                 (gate, up) = joined
@@ -5899,7 +6061,7 @@ private enum Gemma4ZipRouterV1 {
             }
         } else {
             guard let sums = producerSums ?? mlp.zipActivationSums(n1) else { return nil }
-            expertScores = router.zipScores(
+            expertScores = carriedScores ?? router.zipScores(
                 MLX.depends(input: normed, dependencies: [sums.dependencyHandle]))
             let denseIn = MLX.depends(input: n1, dependencies: [normed])
             if let joined = mlp.zipGateUp(denseIn, sums) {

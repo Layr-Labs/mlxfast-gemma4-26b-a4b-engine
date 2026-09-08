@@ -14,6 +14,55 @@ import os
 
 private let log = Logger(subsystem: "darkbloom", category: "CBv2Engine")
 
+/// A bounded free-buffer reuse budget installed once when an engine starts.
+/// Existing disabled or larger budgets remain authoritative. No active-memory
+/// limit, allocation, kernel, request result, or shutdown behavior changes.
+private enum CBv2EngineAllocatorCacheBudgetV1 {
+    private static let lock = NSLock()
+    private static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_ALLOCATOR_CACHE_BUDGET_V1"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }()
+
+    private static let requestedLowProfile = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_STARTUP_MEMORY_PROFILE"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "low"
+
+    static func desiredLimit(
+        physicalMemoryBytes: UInt64, memoryLimitBytes: Int,
+        activeMemoryBytes: Int, currentCacheLimitBytes: Int,
+        lowMemoryProfile: Bool
+    ) -> Int {
+        guard enabled, currentCacheLimitBytes > 0 else { return currentCacheLimitBytes }
+        let active = max(0, activeMemoryBytes)
+        guard memoryLimitBytes > active else { return currentCacheLimitBytes }
+        let remaining = memoryLimitBytes - active
+        let reserve = 4 << 30
+        guard remaining > reserve else { return currentCacheLimitBytes }
+        let target = !lowMemoryProfile && physicalMemoryBytes >= (UInt64(96) << 30)
+            ? (32 << 30) : (8 << 30)
+        return max(currentCacheLimitBytes, min(target, remaining - reserve))
+    }
+
+    static func install() {
+        guard enabled else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        let current = Memory.cacheLimit
+        let desired = desiredLimit(
+            physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
+            memoryLimitBytes: Memory.memoryLimit,
+            activeMemoryBytes: Memory.activeMemory,
+            currentCacheLimitBytes: current, lowMemoryProfile: requestedLowProfile)
+        if desired > current {
+            Memory.cacheLimit = desired
+        }
+    }
+}
+
 // MARK: - Shared gauges (submit-side admission ⇄ engine-thread truth)
 
 /// Lock-protected counters bridging the caller-thread `submit`/`capacity`
@@ -178,6 +227,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         mtpDrafter: (any CBv2MTPDrafter)? = nil,
         mtpConfig: CBv2MTPConfig = CBv2MTPConfig()
     ) {
+        CBv2EngineAllocatorCacheBudgetV1.install()
         self.schedulerConfig = schedulerConfig
         self.loopConfig = loopConfig
         self.layerKinds = layerKinds

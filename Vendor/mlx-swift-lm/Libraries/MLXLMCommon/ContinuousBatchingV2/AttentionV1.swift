@@ -507,8 +507,6 @@ enum CBv2AttentionV1 {
             {
                 var cachedKeyRows: [MLXArray] = []
                 var cachedValueRows: [MLXArray] = []
-                cachedKeyRows.reserveCapacity(B)
-                cachedValueRows.reserveCapacity(B)
                 let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
                 if ringRows.count == B && ringRows.allSatisfy({ $0.decodeRingView != nil }) {
                     // Q4-LIVE-WRITE: admit all rows before any host state
@@ -632,12 +630,16 @@ enum CBv2AttentionV1 {
                     {
                         return output
                     }
+                    cachedKeyRows.reserveCapacity(B)
+                    cachedValueRows.reserveCapacity(B)
                     for row in ringRows {
                         let view = row.snapshot()
                         cachedKeyRows.append(view.keys)
                         cachedValueRows.append(view.values)
                     }
                 } else {
+                    cachedKeyRows.reserveCapacity(B)
+                    cachedValueRows.reserveCapacity(B)
                     for (index, row) in rows.enumerated() {
                         let (cachedKeys, cachedValues) = row.update(
                             keys: keys[index ..< (index + 1)],

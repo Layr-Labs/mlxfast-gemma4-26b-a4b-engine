@@ -751,16 +751,19 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// every live stream is force-finished with `.error`, live requests
     /// are marked for cancellation (cleaned up if the loop ever resumes),
     /// and `drain()` returns — the wedged step may still be executing.
-    func drain() async {
+    /// `waitForStop` requires actual retirement before the model can be reused.
+    func drain(waitForStop: Bool = false) async {
         await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
             let waiter = CBv2DrainWaiter(c)
-            watchdogQueue.asyncAfter(deadline: .now() + config.shutdownTimeout) { [weak self] in
-                guard let self else {
-                    waiter.resume()
-                    return
-                }
-                if waiter.resume() {
-                    self.forceFinishStreamsOnShutdownTimeout()
+            if !waitForStop {
+                watchdogQueue.asyncAfter(deadline: .now() + config.shutdownTimeout) { [weak self] in
+                    guard let self else {
+                        waiter.resume()
+                        return
+                    }
+                    if waiter.resume() {
+                        self.forceFinishStreamsOnShutdownTimeout()
+                    }
                 }
             }
             engineQueue.async { [self] in

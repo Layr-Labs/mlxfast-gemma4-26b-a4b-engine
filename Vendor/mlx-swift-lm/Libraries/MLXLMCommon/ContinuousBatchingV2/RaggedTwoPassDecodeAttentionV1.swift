@@ -2601,7 +2601,112 @@ for (int element = 0; element < values_per_lane; ++element) {
         "}",
     ]
 
-    private static let slidingAffineFoldScoreBlock = """
+    /// Mode 2, the shipped value, uses the hardware unpack
+    /// `unpack_unorm4x8_to_float`, which returns all four bytes of a group as
+    /// a `float4` divided by 255. The 255 is folded back into the affine
+    /// scale that SLIDE-AFFFOLD already applies ONCE per token -- `ks * 255`
+    /// in the score fold, `vs * 255` in the value scale -- so it costs one
+    /// multiply per token per loop instead of one per element.
+    static let slidingValuePackMode: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_SLIDE_VPACK"]?
+            .trimmingCharacters(in: .whitespaces).lowercased()
+        else { return 2 }
+        if ["0", "false", "no", "off"].contains(raw) { return 0 }
+        if let value = Int(raw), value == 0 || value == 1 || value == 2 {
+            return value
+        }
+        return 2
+    }()
+
+    /// The rewrite is only legal when a lane owns exactly eight elements of
+    /// one quantisation group, which is what makes the eight codes the eight
+    /// nibbles of a single word. That is `headDim == 256` over a 32-wide
+    /// simdgroup; any other geometry falls back to the promoted blocks.
+    private static var slidingValuePackActive: Bool {
+        slidingAffineFoldActive && slidingValuePackMode != 0 && headDim == 256
+    }
+
+    private static var slidingValuePackKey: String {
+        slidingValuePackActive ? "_vp\(slidingValuePackMode)" : ""
+    }
+
+    /// The two byte-aligned code groups for one packed word.
+    private static func slidingValuePackHeader(
+        _ word: String, _ name: String
+    ) -> String {
+        let type = slidingValuePackMode == 1 ? "uchar4" : "float4"
+        let unpack = slidingValuePackMode == 1
+            ? "as_type<uchar4>"
+            : "unpack_unorm4x8_to_float"
+        return """
+            const \(type) \(name)_e = \(unpack)(\(word) & 0x0F0F0F0Fu);
+            const \(type) \(name)_o = \(unpack)((\(word) >> 4) & 0x0F0F0F0Fu);
+            """
+    }
+
+    /// Element `e` of that word, in the promoted element order.
+    private static func slidingValuePackCode(
+        _ name: String, _ element: Int
+    ) -> String {
+        let group = element % 2 == 0 ? "\(name)_e" : "\(name)_o"
+        let lane = ["x", "y", "z", "w"][element / 2]
+        return slidingValuePackMode == 1
+            ? "float(\(group).\(lane))"
+            : "\(group).\(lane)"
+    }
+
+    private static var slidingAffineFoldScoreBlock: String {
+        guard slidingValuePackActive else {
+            return slidingAffineFoldScoreBlockPromoted
+        }
+        let scale = slidingValuePackMode == 1 ? "ks" : "ks * 255.0f"
+        var body = slidingValuePackHeader("kw", "kc") + "\n"
+        body += "float score_lo = 0.0f;\n"
+        body += "float score_hi = 0.0f;\n"
+        for element in 0..<8 {
+            let code = slidingValuePackCode("kc", element)
+            body += "score_lo += q_lo[\(element)] * \(code);\n"
+            body += "score_hi += q_hi[\(element)] * \(code);\n"
+        }
+        body += "score_lo = fma(\(scale), score_lo, kb * qsum_lo);\n"
+        body += "score_hi = fma(\(scale), score_hi, kb * qsum_hi);\n"
+        return body
+    }
+
+    private static var slidingAffineFoldStepBlock: String {
+        guard slidingValuePackActive else {
+            return slidingAffineFoldStepBlockPromoted
+        }
+        var body = """
+            const float weight_lo = fast::exp(min(score_lo - max_lo, 60.0f));
+            const float weight_hi = fast::exp(min(score_hi - max_hi, 60.0f));
+            sum_lo += weight_lo;
+            sum_hi += weight_hi;
+
+            """
+        if slidingValuePackMode == 1 {
+            body += "const float value_scale_lo = weight_lo * vs;\n"
+            body += "const float value_scale_hi = weight_hi * vs;\n"
+        } else {
+            body += "const float vs255 = vs * 255.0f;\n"
+            body += "const float value_scale_lo = weight_lo * vs255;\n"
+            body += "const float value_scale_hi = weight_hi * vs255;\n"
+        }
+        body += "vbias_lo = fma(weight_lo, vb, vbias_lo);\n"
+        body += "vbias_hi = fma(weight_hi, vb, vbias_hi);\n"
+        body += slidingValuePackHeader("vw", "vc") + "\n"
+        for element in 0..<8 {
+            let code = slidingValuePackCode("vc", element)
+            body += "acc_lo[\(element)] = "
+                + "fma(value_scale_lo, \(code), acc_lo[\(element)]);\n"
+            body += "acc_hi[\(element)] = "
+                + "fma(value_scale_hi, \(code), acc_hi[\(element)]);\n"
+        }
+        return body
+    }
+
+    private static let slidingAffineFoldScoreBlockPromoted = """
 float score_lo = 0.0f;
 float score_hi = 0.0f;
 #pragma clang loop unroll(full)
@@ -2614,7 +2719,7 @@ score_lo = fma(ks, score_lo, kb * qsum_lo);
 score_hi = fma(ks, score_hi, kb * qsum_hi);
 """
 
-    private static let slidingAffineFoldStepBlock = """
+    private static let slidingAffineFoldStepBlockPromoted = """
 const float weight_lo = fast::exp(min(score_lo - max_lo, 60.0f));
 const float weight_hi = fast::exp(min(score_hi - max_hi, 60.0f));
 sum_lo += weight_lo;
@@ -2745,7 +2850,9 @@ for (int element = 0; element < values_per_lane; ++element) {
     private static let slidingSoftRefKey: String = {
         guard slidingSoftRefWalks.applied else { return "" }
         if slidingSoftRefMode == 2 {
-            return slidingAffineFoldActive ? "_sr2_af1" : "_sr2"
+            return slidingAffineFoldActive
+                ? "_sr2_af1" + slidingValuePackKey
+                : "_sr2"
         }
         return slidingSoftRefSpan == 32
             ? "_sr1"
@@ -3950,6 +4057,9 @@ for (int element = 0; element < values_per_lane; ++element) {
                     CBv2EngageMark.once("sliding-softmax-ref")
                     if slidingAffineFoldActive {
                         CBv2EngageMark.once("sliding-affine-fold")
+                    }
+                    if slidingValuePackActive {
+                        CBv2EngageMark.once("sliding-value-pack")
                     }
                 }
                 return (resident[0], resident[1])

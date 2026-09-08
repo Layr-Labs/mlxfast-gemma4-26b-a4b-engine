@@ -126,7 +126,7 @@ enum CBv2GroupedPrefillPVV1 {
                 bidirectional: false, sinks: sinks,
                 queryPlaneSlice: queryPlane[0..., 0..., 0..., start..<end, 0...]),
                 let statistics = CBv2PrefillAttnTrafficV1.statistics(
-                    scores: stage.scores, values: stage.values)
+                    scores: stage.scores, values: stage.values, causalRows: 128)
             else { return nil }
             scores.append(stage.scores)
             stats.append(statistics)

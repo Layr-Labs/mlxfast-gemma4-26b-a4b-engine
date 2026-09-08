@@ -695,6 +695,19 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Z-STACK-QKV. Default ON: the sliding V walk shares the fused Q|K
+    /// dispatch. Threadgroups 0..<384 keep the incumbent concatenated-N
+    /// Q||K body; 384..<512 keep the incumbent N=2048 V body. Same 512
+    /// threadgroups the two launches already submitted, one encoder.
+    /// `DARKBLOOM_GEMMA4_SLIDING_QKV_ZSTACK=0` restores the two launches.
+    public static let fuseVEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_SLIDING_QKV_ZSTACK"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+
     private static let fusedSlidingKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_v1",
         inputNames: ["x", "w", "scales", "biases"],
@@ -767,6 +780,59 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             """,
         header: mma8KernelHeader,
         ensureRowContiguous: true)
+
+    private static let slidingQKVGridY = 768 + 256
+
+    private static let fusedSlidingQKVKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_v2048_zstack_v1",
+        inputNames: ["x", "wqk", "sqk", "bqk", "wv", "sv", "bv"],
+        outputNames: ["yq", "yk", "yv"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            if (tid.y < 384) {
+              qkv_mma8_affine4_g64_mt<T, 2, 2, 2816, 4096, 6144>(
+                  wqk, sqk, bqk, x, yq,
+                  6144, int(tid.y) * 16, red,
+                  simdgroup_index_in_threadgroup,
+                  thread_index_in_simdgroup, yk);
+            } else {
+              qkv_mma8_affine4_g64_mt<T, 2, 2, 2816, 0, 2048>(
+                  wv, sv, bv, x, yv,
+                  2048, int(tid.y - 384) * 16, red,
+                  simdgroup_index_in_threadgroup,
+                  thread_index_in_simdgroup);
+            }
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    private static let fusedSlidingQKVRspKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_v2048_zstack_rsp_v1",
+        inputNames: ["x", "wqk", "sqk", "bqk", "wv", "sv", "bv", "rs_table"],
+        outputNames: ["yq", "yk", "yv"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            if (tid.y < 384) {
+              qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816, 4096, 6144>(
+                  wqk, sqk, bqk, x, rs_table, yq,
+                  6144, int(tid.y) * 16, red,
+                  simdgroup_index_in_threadgroup,
+                  thread_index_in_simdgroup, yk);
+            } else {
+              qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816, 0, 2048>(
+                  wv, sv, bv, x, rs_table, yv,
+                  2048, int(tid.y - 384) * 16, red,
+                  simdgroup_index_in_threadgroup,
+                  thread_index_in_simdgroup);
+            }
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
 
     private static let mma8Kernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_bfill_v4",
@@ -1035,6 +1101,89 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             outputDTypes: [x.dtype, x.dtype])
         return (outputs[0], outputs[1])
     }
+
+    /// Z-STACK-QKV. Sliding decode only (Q=4096, K=2048, V=2048). One
+    /// dispatch submits the 384 Q||K threadgroups and the 128 V
+    /// threadgroups the two incumbent launches already owned. Each
+    /// threadgroup runs the identical body it ran under the split
+    /// launches, with the identical n0, SPLIT, NFIX and store. The V
+    /// weight plane is not concatenated onto Q||K — that walk stays
+    /// 6144 columns. Nil keeps fusedQKMatmul plus the separate V
+    /// tierProjection.
+    public static func fusedQKVMatmul(
+        x: MLXArray,
+        qWeight: MLXArray, qScales: MLXArray, qBiases: MLXArray?,
+        kWeight: MLXArray, kScales: MLXArray, kBiases: MLXArray?,
+        vWeight: MLXArray, vScales: MLXArray, vBiases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode,
+        cacheKey: ObjectIdentifier,
+        rsTable: MLXArray? = nil
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard enabled, fuseQKEnabled, fuseVEnabled, multiTileEnabled,
+            groupSize == Self.groupSize,
+            bits == Self.bits,
+            mode == .affine,
+            let qBiases, let kBiases, let vBiases,
+            x.dtype == .bfloat16,
+            qScales.dtype == x.dtype, qBiases.dtype == x.dtype,
+            kScales.dtype == x.dtype, kBiases.dtype == x.dtype,
+            vScales.dtype == x.dtype, vBiases.dtype == x.dtype,
+            qWeight.dtype == .uint32, kWeight.dtype == .uint32,
+            vWeight.dtype == .uint32,
+            x.ndim == 3,
+            x.dim(0) == batch, x.dim(1) == sequence, x.dim(2) == inputWidth,
+            x.size == batch * sequence * inputWidth,
+            qWeight.ndim == 2, kWeight.ndim == 2, vWeight.ndim == 2,
+            qWeight.dim(0) == 4096, kWeight.dim(0) == 2048, vWeight.dim(0) == 2048,
+            qWeight.dim(1) == inputWidth * Self.bits / 32,
+            kWeight.dim(1) == inputWidth * Self.bits / 32,
+            vWeight.dim(1) == inputWidth * Self.bits / 32,
+            qScales.shape == [4096, inputWidth / Self.groupSize],
+            qBiases.shape == qScales.shape,
+            kScales.shape == [2048, inputWidth / Self.groupSize],
+            kBiases.shape == kScales.shape,
+            vScales.shape == [2048, inputWidth / Self.groupSize],
+            vBiases.shape == vScales.shape
+        else { return nil }
+
+        let tableReady =
+            rsTable != nil
+            && rsTable!.dtype == .float32
+            && rsTable!.shape == [batch, inputWidth / Self.groupSize]
+
+        fusedLock.lock()
+        var plane = fusedPlanes[cacheKey]
+        if plane == nil {
+            let w = concatenated([qWeight, kWeight], axis: 0)
+            let s = concatenated([qScales, kScales], axis: 0)
+            let b = concatenated([qBiases, kBiases], axis: 0)
+            eval(w, s, b)
+            plane = (w, s, b)
+            fusedPlanes[cacheKey] = plane
+        }
+        fusedLock.unlock()
+        guard let (fw, fs, fb) = plane else { return nil }
+
+        let kernel = tableReady ? fusedSlidingQKVRspKernel : fusedSlidingQKVKernel
+        CBv2EngageMark.once("sliding-qkv-zstack")
+        let outputs = kernel(
+            tableReady
+                ? [x, fw, fs, fb, vWeight, vScales, vBiases, rsTable!]
+                : [x, fw, fs, fb, vWeight, vScales, vBiases],
+            template: [("T", x.dtype)],
+            grid: (simdWidth, slidingQKVGridY, 1),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [
+                [batch, sequence, 4096],
+                [batch, sequence, 2048],
+                [batch, sequence, 2048],
+            ],
+            outputDTypes: [x.dtype, x.dtype, x.dtype])
+        return (outputs[0], outputs[1], outputs[2])
+    }
+
 
     /// Q widths the fused kernels bake as a compile-time split point.
     private static func liveFusedSplit(_ width: Int) -> Bool {

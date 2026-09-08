@@ -1662,6 +1662,9 @@ public class SwitchGLU: Module {
         // layer per forward.
         var inverseOrder: MLXArray?
         var lhsIndices: MLXArray?
+        var pendingSortedPlane: SwitchSortedPlaneProducer?
+        var pendingRowOrder: MLXArray?
+        var pendingUnsortedX: MLXArray?
         if doSort {
             if useLhsIndices {
                 x = x.flattened(start: 0, end: -3)
@@ -1693,17 +1696,13 @@ public class SwitchGLU: Module {
                 }
             } else if let sortedPlane {
                 // PRENORM-GATHER: the producer writes the sorted plane from
-                // the inverse order; `x` is only read if it declines.
+                // the inverse order. Keep the unsorted plane and row order
+                // until the exact indirect-GU admission has had a chance to
+                // consume them; its fallback below restores this producer.
                 let order = gatherSortOrder(indices: indices, numExperts: numExperts)
-                if let plane = sortedPlane(order.inverseOrder),
-                    plane.ndim == 3, plane.dim(0) == indices.size,
-                    plane.dim(1) == 1, plane.dim(2) == inputDims,
-                    plane.dtype == x.dtype
-                {
-                    x = plane
-                } else {
-                    x = x.flattened(start: 0, end: -3)[order.rowOrder]
-                }
+                pendingSortedPlane = sortedPlane
+                pendingRowOrder = order.rowOrder
+                pendingUnsortedX = x
                 idx = order.sortedKeys
                 inverseOrder = order.inverseOrder
             } else {
@@ -1741,6 +1740,41 @@ public class SwitchGLU: Module {
                 activated, idx, sorted: true, taggedRoute: useExpertPrefixBounds)
                 ?? downProj(activated, idx, lhsIndices: switchDownIdentity64, sortedIndices: true)
             return (output, inverseOrder, true)
+        }
+
+        if doSort, !useLhsIndices, lhsIndices == nil,
+            inputDims == 2816, hiddenDims == 704, numExperts == 128,
+            weightedReductionProfile == .gemma4ProductionGeGLU,
+            activationProduct == nil, isGeluActivation,
+            switchGeluShapedFuseEnabled,
+            let unsortedX = pendingUnsortedX,
+            let rowOrder = pendingRowOrder,
+            let fused = fusedGateUpDispatch(),
+            let activated = Gemma4IndirectExpertGUV1.call(
+                x: unsortedX,
+                storage: fused.storage,
+                rowOrder: rowOrder,
+                indices: idx)
+        {
+            let output = downProj(
+                activated, idx, lhsIndices: nil, sortedIndices: true)
+            return (output, inverseOrder, true)
+        }
+
+        if let sortedPlane = pendingSortedPlane,
+            let rowOrder = pendingRowOrder,
+            let unsortedX = pendingUnsortedX,
+            let inverseOrder
+        {
+            if let plane = sortedPlane(inverseOrder),
+                plane.ndim == 3, plane.dim(0) == indices.size,
+                plane.dim(1) == 1, plane.dim(2) == inputDims,
+                plane.dtype == unsortedX.dtype
+            {
+                x = plane
+            } else {
+                x = unsortedX.flattened(start: 0, end: -3)[rowOrder]
+            }
         }
 
         let xGate: MLXArray

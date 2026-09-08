@@ -3833,7 +3833,9 @@ for (int element = 0; element < values_per_lane; ++element) {
         scale: Float,
         slidingWindowLength: Int
     ) -> (output: MLXArray, nextWriteFence: MLXArray)? {
-        guard CBv2WindowedSequenceKV.q4FusedMirrorWriteEnabled,
+        let batch = queries.dim(0)
+        guard (1 ... Self.batch).contains(batch),
+            CBv2WindowedSequenceKV.q4FusedMirrorWriteEnabled,
             CBv2WindowedSequenceKV.quantEnabled,
             !CBv2WindowedSequenceKV.quantSimulate,
             !CBv2WindowedSequenceKV.gpuPackCheck,
@@ -3858,10 +3860,15 @@ for (int element = 0; element < values_per_lane; ++element) {
         else { return nil }
 
         let startArray = getStartArray(starts: starts, batch: batch)
+        // The fixed Metal ABI has eight mirror arguments, but its row work is
+        // bounded solely by grid.y. Bind unused slots without dispatching any
+        // extra row: no dummy queries, aliasing writes, or padded output work.
+        let kernelMirrors = batch == Self.batch ? mirrors
+            : mirrors + Array(repeating: mirrors[batch - 1], count: Self.batch - batch)
         if Q4InputAssemblyV1.enabled { CBv2EngageMark.once("q4-input-assembly-v1") }
         func fallbackInputs() -> [MLXArray] {
             Q4InputAssemblyV1.build(
-                first: queries, mirrors: mirrors,
+                first: queries, mirrors: kernelMirrors,
                 tail: [startArray, newKeys, newValues, previousWriteFence])
         }
         if q4ResidentMergeEnabled,
@@ -6115,6 +6122,32 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         """,
         ensureRowContiguous: true)
 
+    /// Preserve the accepted bounded D512 partial read alongside HEAD-XT.
+    /// Off emits the original complete factory body and registration name.
+    private static let normPaddingRestoreEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_NORM_PADDING_RESTORE_V1"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }()
+
+    private static func normPaddingRestoredSource(_ original: String) -> String {
+        guard normPaddingRestoreEnabled else { return original }
+        var source = original
+        func replaceOnce(_ old: String, _ new: String) {
+            precondition(source.components(separatedBy: old).count == 2)
+            source = source.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(
+            "if (simd_group == 0) partials[lane] = 0.0f;\n    threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "// NORM-NB: 零初始化和它那道 barrier 只为让 32 lane 的 simd_sum 读到\n    // 确定值；改成有界读即可，省一次 threadgroup 写和一道全组同步。\n    // 越界 lane 贡献 0.0f，浮点加法的精确恒等，逐位相同。\n    // 界=4：本内核 threadGroup 固定 (128,1,1)，128/32=4 个 simdgroup。")
+        replaceOnce(
+            "sum = simd_sum(partials[lane]);",
+            "sum = simd_sum(lane < 4u ? partials[lane] : 0.0f);")
+        return source
+    }
+
     /// NORMROPE-D512: the WRITE-022 store dispatch with the full layers' Q/K
     /// RMSNorm + RoPE folded in, so the standalone
     /// `gemma4_b8_qkv_rms_norm_rope_v2_vec1` dispatch leaves the chain.
@@ -6140,7 +6173,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// slot receives the K row the standalone kernel would have handed the
     /// incumbent store, so dispatches 1...3 read identical bytes.
     private static let ringStoreNormRopeKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1",
+        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1"
+            + (normPaddingRestoreEnabled ? "_nb1" : ""),
         inputNames: [
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -6148,7 +6182,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             "position_offsets", "rope_freqs", "write_fence",
         ],
         outputNames: ["fence", "q_out", "k_out", "v_out"],
-        source: """
+        source: normPaddingRestoredSource("""
             constexpr int D = 512;
             constexpr int KV_ROWS = 16;
             constexpr int Q_HEADS = 16;
@@ -6272,7 +6306,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             if (z == 0 && lid == 0) {
                 fence[0] = write_fence[0] + 1;
             }
-        """,
+        """),
         ensureRowContiguous: true)
 
     /// WRITE-022 kill switch: `DARKBLOOM_GEMMA4_D512_STORE_DISPATCH=0` falls

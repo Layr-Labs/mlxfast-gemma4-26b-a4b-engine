@@ -50,7 +50,7 @@ public enum Gemma4DecodeFusedGUV1 {
     /// bit-identical.
     private static func makeKernel(tagged: Bool) -> MLXFast.MLXFastKernel {
         MLXFast.metalKernel(
-        name: "gemma4_b8_decode_gateup_geglu_threadgroup_v2_solo1"
+        name: "gemma4_b8_decode_gateup_geglu_threadgroup_v2_solo1_guk2"
             + (tagged ? "_tagged_v1" : ""),
         inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"],
         outputNames: ["y"],
@@ -735,7 +735,7 @@ METAL_FUNC void tg_qmv_impl(
   }
 }
 
-template <typename T, const int group_size, const int bits>
+template <typename T, const int group_size, const int bits, const int K = 2816>
 METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -744,10 +744,16 @@ METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
     const device T* x1,
     threadgroup T* y0,
     threadgroup T* y1,
-    const constant int& in_vec_size,
+    const constant int& runtime_in_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
+  // GU-K: this helper is only ever dispatched for the admitted K=2816 gate/up
+  // projection -- `tg_execute_projection` passes the program-scope constant
+  // `guK` and nothing else. Keep the launch ABI, but expose the bound to the
+  // Metal optimizer. 2816 / 256 = 11 whole blocks, so the tail loop below is
+  // provably dead once the bound is a compile-time constant.
+  constexpr int in_vec_size = K;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
@@ -778,6 +784,7 @@ METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
   y1 += out_row;
 
   int k = 0;
+  #pragma unroll
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
@@ -841,17 +848,23 @@ METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
   }
 }
 
-template <typename T, const int group_size, const int bits>
+template <typename T, const int group_size, const int bits, const int K = 2816>
 METAL_FUNC void tg_qmv_affine4_g64_solo_impl(
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
     const device T* x0,
     threadgroup T* y0,
-    const constant int& in_vec_size,
+    const constant int& runtime_in_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
+  // GU-K: this helper is only ever dispatched for the admitted K=2816 gate/up
+  // projection -- `tg_execute_projection` passes the program-scope constant
+  // `guK` and nothing else. Keep the launch ABI, but expose the bound to the
+  // Metal optimizer. 2816 / 256 = 11 whole blocks, so the tail loop below is
+  // provably dead once the bound is a compile-time constant.
+  constexpr int in_vec_size = K;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
@@ -878,6 +891,7 @@ METAL_FUNC void tg_qmv_affine4_g64_solo_impl(
   y0 += out_row;
 
   int k = 0;
+  #pragma unroll
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));

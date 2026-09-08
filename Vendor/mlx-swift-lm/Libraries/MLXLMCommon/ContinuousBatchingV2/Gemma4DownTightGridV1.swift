@@ -151,7 +151,7 @@ public enum Gemma4DownTightGridV1 {
     /// the producer's own contract; distinct kernel name; bit-identical output.
     private static func makeKernel(tagged: Bool) -> MLXFast.MLXFastKernel {
         MLXFast.metalKernel(
-        name: "gemma4_b8_down_qmv_span4_tight_zorder_v2_solo1"
+        name: "gemma4_b8_down_qmv_span4_tight_zorder_v2_solo1_dk1"
             + (packedWordLoads ? "_word32" : "")
             + (tagged ? "_tagged_v1" : ""),
         inputNames: ["w", "scales", "biases", "x", "lhs_indices", "rhs_indices"],
@@ -1017,7 +1017,7 @@ METAL_FUNC void qmv_affine4_g64_solo_impl(
   }
 }
 
-template <typename T, int group_size, int bits, int span>
+template <typename T, int group_size, int bits, int span, int K = 704, int N = 2816>
 METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device uint32_t* w,
     const device T* scales,
@@ -1026,8 +1026,8 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device uint32_t* lhs_indices,
     const device uint32_t* rhs_indices,
     device T* y,
-    const constant int& in_vec_size,
-    const constant int& out_vec_size,
+    const constant int& runtime_in_vec_size,
+    const constant int& runtime_out_vec_size,
     const uint lhs_stride,
     const uint rhs_stride,
     const int64_t x_stride,
@@ -1037,6 +1037,13 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
+  // DOWN-K: the single dispatch (:167) passes `gemma4_tight_down_K` and
+  // `gemma4_tight_down_N` -- program-scope constants 704 and 2816. The callee
+  // helpers already carry these as template constants; the tile that walks
+  // them still took them as references, so its own `assignment * out_vec_size`
+  // address arithmetic stayed a runtime multiply. Launch ABI unchanged.
+  constexpr int in_vec_size = K;
+  constexpr int out_vec_size = N;
   constexpr int gemma4_down_tile_span = span; // dispatch-selected: 4 or 2
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;

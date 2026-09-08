@@ -111,16 +111,21 @@ public enum CBv2DenseMLPQMVV1 {
     }()
 
     /// Reuse each down-plane lane's exact affine bias sum across output
-    /// tiles. Disabling this restores the original per-tile MMA8 reduction.
+    /// tiles. Shipped ON: one producer dispatch retains each lane's original
+    /// g64 reduction tree, and every down tile reads that exact float2 instead
+    /// of rebuilding `mma8_runsum8` + the three xor butterflies per group.
+    /// Values and order are unchanged; only the issue point of the sum moves
+    /// earlier. `DARKBLOOM_GEMMA4_MLP_MMA8_DOWN_LANE_SUMS=0` restores the
+    /// original per-tile MMA8 reduction byte for byte.
     private static let mma8DownLaneSumsEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_MLP_MMA8_DOWN_LANE_SUMS"]
-        else { return false }
+        else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
     /// Down-only compile-time K/group walk; the odd 33-group split remains
-    /// 17+16. The lane-sum opt-in and gate/up paths retain their old kernels.
+    /// 17+16. The lane-sum path and gate/up paths retain their own kernels.
     private static let mma8DownStaticKEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_MLP_DOWN_STATIC_K"]
@@ -1562,6 +1567,7 @@ inline U qdot_affine8_registered_v4(
             if isGateUp { CBv2EngageMark.once("mlp-mma8-gateup") }
             let yTiles = outDim / outputsPerGroup
             if !isGateUp && mma8DownLaneSumsEnabled {
+                CBv2EngageMark.once("mlp-mma8-down-lane-sums")
                 let groups = inDim / Self.groupSize
                 let laneSums = mma8DownLaneSumKernel(
                     [x],

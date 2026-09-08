@@ -9,6 +9,22 @@ enum CBv2GroupedPrefillPVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Keep the eight causal blocks of a batch/head adjacent in the Z grid.
+    private static let headLocalityEnabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_GROUPED_PV_HEAD_LOCALITY_V1"] ?? "1"
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }()
+
+    /// GROUPED-PV-SWIZZLE-TIGHT: A swizzle of 1 (tile 2) spans the two row tiles
+    /// exactly for bm: 64, eliminating surplus threadgroups.
+    private static let swizzleTight: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_GROUPED_PV_SWIZZLE"] else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private struct Geometry {
         let bm: Int
         let bk: Int
@@ -29,7 +45,7 @@ enum CBv2GroupedPrefillPVV1 {
             generation >= (suffix == "p" ? 18 : 17)
         else { return nil }
         if suffix == "s" || suffix == "c" || suffix == "d" {
-            return Geometry(bm: 64, bk: 256, wm: 2, swizzle: 2)
+            return Geometry(bm: 64, bk: 256, wm: 2, swizzle: swizzleTight ? 1 : 2)
         }
         return Geometry(bm: 128, bk: 512, wm: 4, swizzle: 0)
         #else
@@ -37,7 +53,7 @@ enum CBv2GroupedPrefillPVV1 {
         #endif
     }()
 
-    private static let source = #"""
+    private static let originalSource = #"""
         using namespace mlx::steel;
         const uint3 tid = threadgroup_position_in_grid;
         const int block = int(tid.z) / (BATCH * 16);
@@ -82,8 +98,19 @@ enum CBv2GroupedPrefillPVV1 {
         });
         """#
 
+    private static let source: String = {
+        guard headLocalityEnabled else { return originalSource }
+        return originalSource.replacingOccurrences(
+            of: "const int block = int(tid.z) / (BATCH * 16);\nconst int batchHead = int(tid.z) % (BATCH * 16);",
+            with: "const int block = int(tid.z) % 8;\nconst int batchHead = int(tid.z) / 8;")
+    }()
+
+    private static let kernelName = headLocalityEnabled
+        ? "cbv2_grouped_prefill_pv_nax_v1_bhz1"
+        : "cbv2_grouped_prefill_pv_nax_v1"
+
     private static let kernel = MLXFast.metalKernel(
-        name: "cbv2_grouped_prefill_pv_nax_v1",
+        name: kernelName,
         inputNames: (0..<8).map { "s\($0)" } + (0..<8).map { "r\($0)" } + ["values"],
         outputNames: ["output"],
         source: source,
@@ -126,7 +153,7 @@ enum CBv2GroupedPrefillPVV1 {
                 bidirectional: false, sinks: sinks,
                 queryPlaneSlice: queryPlane[0..., 0..., 0..., start..<end, 0...]),
                 let statistics = CBv2PrefillAttnTrafficV1.statistics(
-                    scores: stage.scores, values: stage.values)
+                    scores: stage.scores, values: stage.values, causalRows: 128)
             else { return nil }
             scores.append(stage.scores)
             stats.append(statistics)
@@ -137,6 +164,7 @@ enum CBv2GroupedPrefillPVV1 {
         let tilesN = dim / 128 * swizzleTile
         let tilesM = (128 / geometry.bm + swizzleTile - 1) / swizzleTile
         CBv2EngageMark.once("prefill-grouped-pv-final")
+        if headLocalityEnabled { CBv2EngageMark.once("grouped-pv-head-locality") }
         return kernel(
             scores + stats + [values],
             template: [("T", queries.dtype), ("BATCH", batch), ("D", dim),

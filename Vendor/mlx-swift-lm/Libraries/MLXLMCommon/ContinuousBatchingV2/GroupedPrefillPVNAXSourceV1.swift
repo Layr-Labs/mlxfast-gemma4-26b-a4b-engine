@@ -1,6 +1,21 @@
+import Foundation
+
 // NAX helpers from the pinned MLX steel sources; keep their arithmetic in step.
 enum CBv2GroupedPrefillPVNAXSourceV1 {
-    static let header = #"""
+    static let header: String = {
+        let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_GROUPED_PV_PAIR_SYNC_V1"]
+        guard raw.map({ !["0", "false", "no", "off"].contains($0.lowercased()) })
+            ?? true
+        else { return originalHeader }
+        // Keep the first rendezvous and then rendezvous every two BK blocks.
+        // The SIMD-local arithmetic and the separate remainder stay unchanged.
+        return originalHeader.replacingOccurrences(
+            of: "  for (int kk0 = 0; kk0 < gemm_k_iterations_; kk0++) {\n    threadgroup_barrier(mem_flags::mem_none);\n",
+            with: "  for (int kk0 = 0; kk0 < gemm_k_iterations_; kk0++) {\n    if ((kk0 & 1) == 0) {\n      threadgroup_barrier(mem_flags::mem_none);\n    }\n")
+    }()
+
+    private static let originalHeader = #"""
 // Copyright (c) 2024 Apple Inc.
 
 

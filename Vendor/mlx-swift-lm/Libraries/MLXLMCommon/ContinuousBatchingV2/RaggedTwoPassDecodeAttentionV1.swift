@@ -1809,7 +1809,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp3_ey51_yrp1_ey130_ey186",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp3_ey51_yrp1_ey130_ey186_ey307",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -6139,8 +6139,71 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// of `L * inv_freq`, and the same two rotation expressions. The ring
     /// slot receives the K row the standalone kernel would have handed the
     /// incumbent store, so dispatches 1...3 read identical bytes.
+    /// NORMROPE-RR: delete two of the three barriers around the ringstore
+    /// norm reduction by having every simdgroup recompute the identical
+    /// cross-simd `simd_sum` itself and keep the normalizer in a per-thread
+    /// register, instead of zero-filling the scratch plane, electing
+    /// simdgroup 0 to combine, publishing through `inverse_rms`, and
+    /// broadcasting behind a second barrier. Same election-to-redundancy
+    /// trade as the promoted NORM-TB1 switch: the publish barrier remains,
+    /// the fill barrier and the broadcast barrier go away, and 4 redundant
+    /// `simd_sum` + `precise::rsqrt` evaluate in parallel across the
+    /// threadgroup's 4 simdgroups for near-zero wall time.
+    ///
+    /// Bit-identical: `simd_sum` is deterministic in its input vector and
+    /// every simdgroup runs it after the publish barrier over
+    /// byte-identical `partials[0..3]` (lanes 4..31 are never read; the
+    /// `< 4` predicate substitutes an exact `0.0f`, matching the four
+    /// published partials the incumbent fill used to zero around). Nothing
+    /// is reassociated, and fast math stays disabled on this path.
+    /// `DARKBLOOM_GEMMA4_NORMROPE_RR=0` restores the incumbent text and name
+    /// byte for byte.
+    static let normRopeRrEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_NORMROPE_RR"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let normRopeRrSuffix: String =
+        normRopeRrEnabled ? "_nrr1" : ""
+
+    /// RR keeps the normalizer in the per-thread `normrope_inv_rr` register
+    /// the RR reduction declares, so the threadgroup `inverse_rms` plane is
+    /// not declared at all.
+    private static let normRopeInvDecl: String =
+        normRopeRrEnabled ? "" : "threadgroup float inverse_rms;"
+
+    /// The normalizer read the norm body uses: the per-thread register in
+    /// the RR emission, the published threadgroup slot otherwise.
+    private static let normRopeInvRead: String =
+        normRopeRrEnabled ? "normrope_inv_rr" : "inverse_rms"
+
+    private static let normRopeRrReduce: String = """
+            if (lane == 0) partials[simd_group] = sum;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            sum = simd_sum(lane < 4 ? partials[lane] : 0.0f);
+            float normrope_inv_rr =
+                metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+            """
+
+    private static let normRopeReduce: String = normRopeRrEnabled ? normRopeRrReduce : """
+            if (simd_group == 0) partials[lane] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) partials[simd_group] = sum;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group == 0) {
+                sum = simd_sum(partials[lane]);
+                if (lane == 0) {
+                    inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            """
+
     private static let ringStoreNormRopeKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1",
+        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1"
+            + normRopeRrSuffix,
         inputNames: [
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -6213,24 +6276,14 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             sum = simd_sum(sum);
 
             threadgroup float partials[32];
-            threadgroup float inverse_rms;
+            \(normRopeInvDecl)
             threadgroup T rounded[D];
-            if (simd_group == 0) partials[lane] = 0.0f;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (lane == 0) partials[simd_group] = sum;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group == 0) {
-                sum = simd_sum(partials[lane]);
-                if (lane == 0) {
-                    inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            \(normRopeReduce)
 
             const T4 wv = *reinterpret_cast<const device T4*>(weight);
             for (int i = 0; i < reads; ++i) {
                 const int element = lid * reads + i;
-                const T normalized = T(float(vin[i]) * inverse_rms);
+                const T normalized = T(float(vin[i]) * \(normRopeInvRead));
                 // Reproduce the separate norm kernel's BF16 output-store
                 // boundary before any RoPE arithmetic reads the value.
                 rounded[element] = T(wv[i] * normalized);
@@ -6241,7 +6294,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             if (is_key) {
                 T4 sharedv;
                 for (int i = 0; i < reads; ++i) {
-                    const T normalized = T(float(vin[i]) * inverse_rms);
+                    const T normalized = T(float(vin[i]) * \(normRopeInvRead));
                     sharedv[i] = T(1) * normalized;
                 }
                 *reinterpret_cast<device T4*>(value_slot + lid * reads) = sharedv;
@@ -6441,6 +6494,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             normalizedKeys = stored[2]
             normalizedValues = stored[3]
             CBv2EngageMark.once("d512-normrope-store")
+            if normRopeRrEnabled { CBv2EngageMark.once("d512-normrope-rr") }
         } else {
             storeFence = ringStoreKernel(
                 keyBuffers + valueBuffers

@@ -876,6 +876,77 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
+    /// QKV-STATIC-N-001. The rsp bodies read N only in their store epilogues
+    /// (`y[c.fn * N + ...]`, and `n2 = N - SPLIT` on the fused road), where it
+    /// is loop-invariant per dispatch. The live decode widths are admission
+    /// pins, so each static-N kernel below passes its admitted total as a
+    /// literal: the inlined body folds the store addresses exactly as the
+    /// header-constexpr folds on the o_proj and dense-down roads, with no
+    /// shared-header surgery. No floating-point expression changes; integer
+    /// addressing only, bit-identical by construction.
+    /// `DARKBLOOM_GEMMA4_QKV_STATIC_N=0` restores the promoted rsp dispatches
+    /// under their promoted names.
+    public static let staticNEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_STATIC_N"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Fused sliding Q|K pair (4096 + 2048): N = 6144.
+    private static let fusedSlidingRspStaticNKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_staticn_v1",
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y", "y2"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816, 4096>(
+                w, scales, biases, x, rs_table, y,
+                6144, int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup, y2);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    /// Fused full Q|K pair (8192 + 1024): N = 9216.
+    private static let fusedFullRspStaticNKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_staticn_v1",
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y", "y2"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816, 8192>(
+                w, scales, biases, x, rs_table, y,
+                9216, int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup, y2);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    /// Standalone V plane on sliding layers: N = 2048.
+    private static let multiTileRspStaticNKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_staticn2048_v1",
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816>(
+                w, scales, biases, x, rs_table, y,
+                2048, int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
     /// MMA-RS-001 table for one activation tensor. Returns nil unless the
     /// tensor matches the exact decode shape the rsp bodies admit, so a nil
     /// table always means "use the incumbent dispatch".
@@ -1005,10 +1076,25 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             && rsTable!.dtype == .float32
             && rsTable!.shape == [batch, inputWidth / Self.groupSize]
 
-        let kernel =
+        let promotedKernel =
             qWidth == 4096
             ? (tableReady ? fusedSlidingRspKernel : fusedSlidingKernel)
             : (tableReady ? fusedFullRspKernel : fusedFullKernel)
+        // QKV-STATIC-N-001: the rsp store epilogue's N is the admitted pair
+        // total. Gate each static-N kernel on its exact (Q, K) pair so any
+        // other geometry keeps the promoted dispatch.
+        let kernel = {
+            guard staticNEnabled, tableReady else { return promotedKernel }
+            if qWidth == 4096, kWidth == 2048 {
+                CBv2EngageMark.once("qkv-static-n-qk6144")
+                return fusedSlidingRspStaticNKernel
+            }
+            if qWidth == 8192, kWidth == 1024 {
+                CBv2EngageMark.once("qkv-static-n-qk9216")
+                return fusedFullRspStaticNKernel
+            }
+            return promotedKernel
+        }()
         let total = qWidth + kWidth
         let yTiles = total / outputsPerGroup
         guard yTiles % tilesPerGroup == 0 else { return nil }
@@ -1107,6 +1193,19 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
                 )[0]
             }
             if tableReady {
+                // QKV-STATIC-N-001: the sliding V plane is always 2048 wide;
+                // any other width keeps the promoted kernel.
+                if staticNEnabled, outputWidth == 2048 {
+                    CBv2EngageMark.once("qkv-static-n-v2048")
+                    return multiTileRspStaticNKernel(
+                        [x, weight, scales, biases, rsTable!],
+                        template: [("T", x.dtype)],
+                        grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),
+                        threadGroup: (simdWidth, simdGroups, 1),
+                        outputShapes: [[batch, sequence, outputWidth]],
+                        outputDTypes: [x.dtype]
+                    )[0]
+                }
                 return multiTileRspKernel(
                     [x, weight, scales, biases, rsTable!],
                     template: [("T", x.dtype)],

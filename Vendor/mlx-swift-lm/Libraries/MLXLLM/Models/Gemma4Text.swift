@@ -54,6 +54,14 @@ private let gemma4DecodeIntermediatesReuseEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// Group the early completed decode prefix at layers0 and3.
+private let gemma4DecodePrefix03Enabled: Bool = {
+    let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DECODE_PREFIX_03_V1"] ?? "1"
+    return !["0", "false", "no", "off"].contains(
+        raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+}()
+
 /// Pure, fail-closed policy for the Gemma 4 decode submission ladder.
 ///
 /// Layer indices name boundaries AFTER a complete decoder layer. In
@@ -75,25 +83,15 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     if let set = gemma4DecodeAsyncEvalLadderSet {
         return set.contains(layerIndex)
     }
-    // Only the two EARLY boundaries pay. Submitting after layers 0 and 1
-    // starts GPU work while the host is still building the remaining 28
-    // layers; by layer 5 the device already has queued work, so the middle
-    // cadence {5, 11, 17, 23, 27} adds no overlap and only fragments the
-    // command buffer. Measured on an M1 Ultra at the ranked B=8 geometry,
-    // paired and interleaved, tokens identical in every arm:
-    //
-    //     {} (no boundaries)          +0.17%   <- overlap genuinely lost
-    //     {0,1}                       -0.52%   (64-step)  -0.51% (128-step)
-    //     {0,1,11,23}                 -0.53%
-    //     {0,1,5,11,17,23,27}          baseline (previous default)
-    //     {0,1,5,11,17,23,27,29}      +0.13%
-    //     A/A control                 -0.09%   <- the noise floor
-    //
-    // The empty-set row is the control that matters: this is not "fewer is
-    // always better", it is "the early pair carries all of the overlap".
+    // Keep the first completed layer available to the GPU immediately.
+    // The next early submission includes the completed prefix through layer3,
+    // allowing construction of layers1 and2 to proceed without another submit.
+    // Disabling this option restores all four original early boundaries.
     switch layerIndex {
-    case 0, 1, 2, 3:
+    case 0, 3:
         return true
+    case 1, 2:
+        return !gemma4DecodePrefix03Enabled
     default:
         return false
     }

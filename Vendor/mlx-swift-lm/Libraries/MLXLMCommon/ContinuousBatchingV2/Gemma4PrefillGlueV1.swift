@@ -202,6 +202,31 @@ public enum Gemma4PrefillGlueV1 {
           return local_inv[0];
         }
 
+        // Single-use reduction: its caller never reuses local_sums after
+        // this call. Every simdgroup combines the same published partials
+        // into a register, so no scalar publication barrier is needed.
+        // Multi-reduction tails keep glue_inv_rms and its reuse barrier.
+        inline float glue_inv_rms_once(
+            thread const float* xv,
+            threadgroup float* local_sums,
+            uint simd_lane_id,
+            uint simd_group_id,
+            float eps) {
+          float acc = 0;
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < GLUE_NREADS; i++) {
+            acc += xv[i] * xv[i];
+          }
+          acc = simd_sum(acc);
+          if (simd_lane_id == 0) {
+            local_sums[simd_group_id] = acc;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          acc = simd_sum(
+              simd_lane_id < GLUE_SIMDGROUPS ? local_sums[simd_lane_id] : 0.0f);
+          return metal::precise::rsqrt(acc / GLUE_AXIS + eps);
+        }
+
         /// Both reductions of the tail in one pass, so `h1` and `h2` are each
         /// read from device memory exactly once.
         inline void glue_inv_rms2(
@@ -248,12 +273,11 @@ public enum Gemma4PrefillGlueV1 {
     // MARK: - norm + residual (2 dispatches -> 1)
 
     private static let normResidualKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_norm_residual_2816_unroll_v2\(vec4Suffix)",
+        name: "gemma4_prefill_glue_norm_residual_2816_unroll_v2_ri1\(vec4Suffix)",
         inputNames: ["x", "w", "res"],
         outputNames: ["out"],
         source: """
             threadgroup float local_sums[32];
-            threadgroup float local_inv[1];
 
             const uint row = threadgroup_position_in_grid.y;
             const uint lid = thread_position_in_threadgroup.x;
@@ -265,8 +289,8 @@ public enum Gemma4PrefillGlueV1 {
             float xv[GLUE_NREADS];
             GLUE_LOADF(xv, x, base);
 
-            const float inv = glue_inv_rms(
-                xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+            const float inv = glue_inv_rms_once(
+                xv, local_sums, simd_lane_id, simd_group_id, GLUE_EPS);
 
             T resv[GLUE_NREADS];
             GLUE_LOADT(resv, res, base);
@@ -446,12 +470,11 @@ public enum Gemma4PrefillGlueV1 {
     // MARK: - dual pre-norm (2 dispatches -> 1)
 
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_dual_prenorm_2816_unroll_v2\(vec4Suffix)",
+        name: "gemma4_prefill_glue_dual_prenorm_2816_unroll_v2_ri1\(vec4Suffix)",
         inputNames: ["x", "w1", "w2"],
         outputNames: ["out1", "out2"],
         source: """
             threadgroup float local_sums[32];
-            threadgroup float local_inv[1];
 
             const uint row = threadgroup_position_in_grid.y;
             const uint lid = thread_position_in_threadgroup.x;
@@ -465,8 +488,8 @@ public enum Gemma4PrefillGlueV1 {
 
             // One sum-of-squares serves both weights: the two stock kernels
             // reduce the identical input and differ only in the weight vector.
-            const float inv = glue_inv_rms(
-                xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+            const float inv = glue_inv_rms_once(
+                xv, local_sums, simd_lane_id, simd_group_id, GLUE_EPS);
 
             T out1v[GLUE_NREADS];
             T out2v[GLUE_NREADS];
@@ -628,12 +651,11 @@ public enum Gemma4PrefillGlueV1 {
     /// `preNormScatterKernel` with the `K` index reads lifted above the stores.
     private static let preNormScatterHoistKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_prefill_glue_prenorm_scatter_2816_idxhoist_v3\(vec4Suffix)",
+            name: "gemma4_prefill_glue_prenorm_scatter_2816_idxhoist_v3_ri1\(vec4Suffix)",
             inputNames: ["x", "w", "inverse"],
             outputNames: ["out"],
             source: """
                 threadgroup float local_sums[32];
-                threadgroup float local_inv[1];
 
                 const uint row = threadgroup_position_in_grid.y;
                 const uint lid = thread_position_in_threadgroup.x;
@@ -645,8 +667,8 @@ public enum Gemma4PrefillGlueV1 {
                 float xv[GLUE_NREADS];
                 GLUE_LOADF(xv, x, base);
 
-                const float inv = glue_inv_rms(
-                    xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+                const float inv = glue_inv_rms_once(
+                    xv, local_sums, simd_lane_id, simd_group_id, GLUE_EPS);
 
                 // The stored value is the identical expression `dualPreNorm`
                 // stores for its second output; it is rounded to T here, once,
@@ -686,12 +708,11 @@ public enum Gemma4PrefillGlueV1 {
     /// each integer changes; the normalized values and store order do not.
     private static let preNormScatterThreadgroupIndexKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_prefill_glue_prenorm_scatter_2816_idx_tgcache_v4\(vec4Suffix)",
+            name: "gemma4_prefill_glue_prenorm_scatter_2816_idx_tgcache_v4_ri1\(vec4Suffix)",
             inputNames: ["x", "w", "inverse"],
             outputNames: ["out"],
             source: """
                 threadgroup float local_sums[32];
-                threadgroup float local_inv[1];
                 threadgroup uint cached_positions[8];
 
                 const uint row = threadgroup_position_in_grid.y;
@@ -714,8 +735,8 @@ public enum Gemma4PrefillGlueV1 {
                 float xv[GLUE_NREADS];
                 GLUE_LOADF(xv, x, base);
 
-                const float inv = glue_inv_rms(
-                    xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+                const float inv = glue_inv_rms_once(
+                    xv, local_sums, simd_lane_id, simd_group_id, GLUE_EPS);
 
                 T normed[GLUE_NREADS];
                 #pragma clang loop unroll(full)
@@ -741,12 +762,11 @@ public enum Gemma4PrefillGlueV1 {
     /// values are computed once into registers and stored to each of the
     /// row's K sorted positions.
     private static let preNormScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_prenorm_scatter_2816_unroll_v2\(vec4Suffix)",
+        name: "gemma4_prefill_glue_prenorm_scatter_2816_unroll_v2_ri1\(vec4Suffix)",
         inputNames: ["x", "w", "inverse"],
         outputNames: ["out"],
         source: """
             threadgroup float local_sums[32];
-            threadgroup float local_inv[1];
 
             const uint row = threadgroup_position_in_grid.y;
             const uint lid = thread_position_in_threadgroup.x;
@@ -758,8 +778,8 @@ public enum Gemma4PrefillGlueV1 {
             float xv[GLUE_NREADS];
             GLUE_LOADF(xv, x, base);
 
-            const float inv = glue_inv_rms(
-                xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+            const float inv = glue_inv_rms_once(
+                xv, local_sums, simd_lane_id, simd_group_id, GLUE_EPS);
 
             // The stored value is the identical expression `dualPreNorm`
             // stores for its second output; it is rounded to T here, once,

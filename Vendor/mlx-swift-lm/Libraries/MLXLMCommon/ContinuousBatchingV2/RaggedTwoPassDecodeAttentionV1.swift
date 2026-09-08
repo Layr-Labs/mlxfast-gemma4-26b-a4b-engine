@@ -1809,7 +1809,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp3_ey51_yrp1_ey130_ey186",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp3_ey51_yrp1_ey130_ey186_ey276",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -6139,8 +6139,39 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// of `L * inv_freq`, and the same two rotation expressions. The ring
     /// slot receives the K row the standalone kernel would have handed the
     /// incumbent store, so dispatches 1...3 read identical bytes.
+    /// The 32-lane cross-simdgroup sum below reads `partials[lane]` for every
+    /// lane, while only one entry per simdgroup is written. The zero-fill and
+    /// the barrier that follows it exist solely to give the lanes above the
+    /// simdgroup count a defined value. Bounding the read does the same thing
+    /// without the threadgroup write or the full-group sync: the out-of-range
+    /// lanes contribute `0.0f`, which is the exact identity of floating-point
+    /// addition, so the reduced sum is bit-identical. The bound is four
+    /// because this kernel launches at `threadGroup: (128, 1, 1)` and
+    /// 128 / 32 = 4.
+    ///
+    /// `DARKBLOOM_GEMMA4_D512_RING_NB=0` restores the incumbent body and the
+    /// incumbent kernel name.
+    static let d512RingNbEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_RING_NB"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let d512RingNbSuffix: String = d512RingNbEnabled ? "_nb1" : ""
+
+    private static let d512RingNbReduce: String = d512RingNbEnabled ? """
+            if (lane == 0) partials[simd_group] = sum;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group == 0) {
+                sum = simd_sum(lane < 4u ? partials[lane] : 0.0f);
+            """ : """
+            \(d512RingNbReduce)
+            """
+
     private static let ringStoreNormRopeKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1",
+        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1"
+            + d512RingNbSuffix,
         inputNames: [
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",

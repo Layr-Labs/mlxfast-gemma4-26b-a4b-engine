@@ -821,7 +821,7 @@ METAL_FUNC void qmv_impl(
   }
 }
 
-template <typename T, const int group_size, const int bits, const int K = 704>
+template <typename T, const int group_size, const int bits>
 METAL_FUNC void qmv_affine4_g64_pair_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -830,13 +830,10 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     const device T* x1,
     device T* y0,
     device T* y1,
-    const constant int& runtime_in_vec_size,
+    const constant int& in_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  // This helper is only dispatched for the admitted K=704 expert projection.
-  // Keep the launch ABI, but expose the bound to the Metal optimizer.
-  constexpr int in_vec_size = K;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
@@ -867,7 +864,6 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   y1 += out_row;
 
   int k = 0;
-  #pragma unroll
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));

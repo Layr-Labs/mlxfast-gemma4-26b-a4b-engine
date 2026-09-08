@@ -5652,28 +5652,6 @@ private class Gemma4MLP: Module {
     fileprivate func zipDown(_ activated: MLXArray) -> MLXArray {
         denseProjection(downProj, activated)
     }
-
-    /// Resolve immutable storage outside the trace; every tensor is explicit.
-    fileprivate func zipCompiledGateUpGeluDown(
-        _ x: MLXArray, expertScores: MLXArray
-    ) -> MLXArray? {
-        guard gemma4DenseGateUpJoinEnabled,
-            let storage = fusedGateUpStorage,
-            let gate = gateProj as? QuantizedLinear,
-            let up = upProj as? QuantizedLinear,
-            let down = downProj as? QuantizedLinear,
-            gate.bias == nil, up.bias == nil, down.bias == nil,
-            gate.groupSize == 64, up.groupSize == gate.groupSize,
-            down.groupSize == gate.groupSize,
-            gate.bits == 8, up.bits == gate.bits, down.bits == gate.bits,
-            gate.mode == .affine, up.mode == gate.mode, down.mode == gate.mode,
-            let downBiases = down.biases
-        else { return nil }
-        return CBv2DenseMLPQMVV1.compiledGateUpGeluDown(
-            [x, storage.weight, storage.scales, storage.biases,
-             down.weight, down.scales, downBiases, expertScores],
-            groupSize: gate.groupSize, bits: gate.bits, mode: gate.mode)
-    }
 }
 
 /// ZIP-ROUTER-001 -- interleave the MoE layer's router chain with the
@@ -5753,25 +5731,6 @@ private enum Gemma4ZipRouterV1 {
         let routeTable: SwitchRouteTable?
     }
 
-    /// Preserve the default route-selection tail after the compiled dense pair.
-    private static func selectAfterDense(
-        router: Gemma4Router, expertScores: MLXArray, denseOut: MLXArray
-    ) -> (indices: MLXArray, weights: MLXArray, table: SwitchRouteTable?) {
-        if let fold = Gemma4RouteGlueFoldV1.apply(
-            MLX.depends(input: expertScores, dependencies: [denseOut]),
-            perExpertScale: router.perExpertScale,
-            topK: router.topK, kth: router.kth)
-        {
-            return (fold.indices, fold.weights, fold.table)
-        }
-        let partition = router.zipPartition(
-            MLX.depends(input: expertScores, dependencies: [denseOut]))
-        let indices = router.zipSelected(partition)
-        let weights = router.zipWeights(
-            expertScores: expertScores, topKIndices: indices)
-        return (indices, weights, nil)
-    }
-
     /// PREFIX-001 admission lives beside the ZIP admission so the eager
     /// custom producer is never built unless this exact consumer will use all
     /// of its outputs.
@@ -5839,29 +5798,6 @@ private enum Gemma4ZipRouterV1 {
         // dual pre-norm arrays unreferenced, so MLX never evaluates them and
         // the caller's stock path rebuilds the identical pair.
         let normed = carriedRouterNorm ?? router.zipNorm(out)
-
-        // Default ZIP only. The trace keeps the score dependency BETWEEN the
-        // same two dense kernels; incoming and outgoing fences stay outside it.
-        if plan == 1, gemma4DenseGateUpJoinEnabled,
-            Gemma4FusedLayerGlue.denseXSumElideEnabled,
-            CBv2DenseMLPQMVV1.compiledPairAvailable
-        {
-            let expertScores = router.zipScores(normed)
-            let denseIn = MLX.depends(input: n1, dependencies: [normed])
-            if let denseOut = mlp.zipCompiledGateUpGeluDown(
-                denseIn, expertScores: expertScores)
-            {
-                let selected = selectAfterDense(
-                    router: router, expertScores: expertScores, denseOut: denseOut)
-                Gemma4RouterProbe.recorder?(expertScores, selected.indices)
-                let expertNorm = MLX.depends(input: n2, dependencies: [denseOut])
-                CBv2EngageMark.once("zip-router")
-                return Zipped(
-                    denseOut: denseOut, expertNorm: expertNorm,
-                    topKIndices: selected.indices, topKWeights: selected.weights,
-                    routeTable: selected.table)
-            }
-        }
 
         // Stage 2: router QMV | dense gate + up.
         //
@@ -6939,28 +6875,11 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             """
     }()
 
-    /// HEAD-XT. The tied head reads each contraction index across all eight
-    /// activation rows; publishing the same values a second time with the
-    /// rows adjacent lets it take the pair as one word. The values are the
-    /// producer's own `outv[i]`, stored twice, never recomputed.
-    private static let xtEnabled: Bool =
-        Gemma4MMAQuantizedGEMV.consumesTransposedActivation
-
-    private static let xtSuffix: String = xtEnabled ? "_xt1" : ""
-
-    private static let xtOutputNames: [String] =
-        xtEnabled ? ["out", "xSums", "xT"] : ["out", "xSums"]
-
-    /// Appended to the existing store statement, so with HEAD-XT off the
-    /// producer source is the incumbent's byte for byte.
-    private static let xtStore: String = xtEnabled
-        ? "\n                xT[(wbase + i) * 8 + row] = outv[i];" : ""
-
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v1"
-            + nbSuffix + xtSuffix,
+            + nbSuffix,
         inputNames: ["x", "w"],
-        outputNames: xtOutputNames,
+        outputNames: ["out", "xSums"],
         source: """
             const uint row = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
@@ -6987,7 +6906,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
                 // Preserve the stock RMSNorm's BF16 boundary exactly.
                 outv[i] = w[wbase + i]
                     * static_cast<T>((float)x[base + i] * \(finalNormRiEnabled ? "inv" : "local_inv[0]"));
-                out[base + i] = outv[i];\(xtStore)
+                out[base + i] = outv[i];
             }
 
             // This four-value expression is exactly one addend of the head's
@@ -7013,11 +6932,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
 
     static func apply(
         _ x: MLXArray, weight: MLXArray, eps: Float
-    ) -> (
-        postNorm: MLXArray,
-        sums: Gemma4MMAQuantizedGEMV.ActivationSums,
-        transposed: Gemma4MMAQuantizedGEMV.TransposedActivation?
-    )? {
+    ) -> (postNorm: MLXArray, sums: Gemma4MMAQuantizedGEMV.ActivationSums)? {
         guard Gemma4MMAQuantizedGEMV.consumesActivationSums,
             eps == Self.eps,
             x.dtype == .bfloat16,
@@ -7036,26 +6951,16 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             template: [("T", x.dtype)],
             grid: (rows * threadgroupSize, 1, 1),
             threadGroup: (threadgroupSize, 1, 1),
-            outputShapes: xtEnabled
-                ? [[rows, 1, axis], [rows * (axis / groupSize)], [axis, rows]]
-                : [[rows, 1, axis], [rows * (axis / groupSize)]],
-            outputDTypes: xtEnabled
-                ? [.bfloat16, .float32, .bfloat16]
-                : [.bfloat16, .float32]
+            outputShapes: [[rows, 1, axis], [rows * (axis / groupSize)]],
+            outputDTypes: [.bfloat16, .float32]
         )
         guard let sums = Gemma4MMAQuantizedGEMV.activationSums(
             produced: outputs[1], for: outputs[0])
         else { return nil }
-        let transposed: Gemma4MMAQuantizedGEMV.TransposedActivation? =
-            xtEnabled
-            ? Gemma4MMAQuantizedGEMV.transposedActivation(
-                produced: outputs[2], for: outputs[0])
-            : nil
         CBv2EngageMark.once("final-norm-mma-xsum")
         if finalNormNbEnabled { CBv2EngageMark.once("final-norm-nb") }
         if finalNormRiEnabled { CBv2EngageMark.once("final-norm-ri") }
-        if transposed != nil { CBv2EngageMark.once("final-norm-xt") }
-        return (outputs[0], sums, transposed)
+        return (outputs[0], sums)
     }
 }
 
@@ -7188,14 +7093,13 @@ public class Gemma4TextModelInner: Module {
         cache: [KVCache]? = nil
     ) -> (
         postNorm: MLXArray,
-        activationSums: Gemma4MMAQuantizedGEMV.ActivationSums?,
-        transposedActivation: Gemma4MMAQuantizedGEMV.TransposedActivation?
+        activationSums: Gemma4MMAQuantizedGEMV.ActivationSums?
     ) {
         let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
         let result = forwardTrunk(
             inputs, cache: cache, captureHook: nil, capturePreNorm: false,
             emitMMAHeadSums: true)
-        return (result.postNorm, result.mmaHeadSums, result.mmaHeadXT)
+        return (result.postNorm, result.mmaHeadSums)
     }
 
     /// CBv2 prompt-forward entry point. Keeping the scheduled-prefill
@@ -7277,8 +7181,7 @@ public class Gemma4TextModelInner: Module {
     ) -> (
         postNorm: MLXArray,
         preNorm: MLXArray?,
-        mmaHeadSums: Gemma4MMAQuantizedGEMV.ActivationSums?,
-        mmaHeadXT: Gemma4MMAQuantizedGEMV.TransposedActivation?
+        mmaHeadSums: Gemma4MMAQuantizedGEMV.ActivationSums?
     ) {
         // Shape queries cross the Swift/C boundary. Cache the two immutable
         // input dimensions once rather than paying for them at every ladder
@@ -7540,20 +7443,17 @@ public class Gemma4TextModelInner: Module {
 
         let postNorm: MLXArray
         let mmaHeadSums: Gemma4MMAQuantizedGEMV.ActivationSums?
-        let mmaHeadXT: Gemma4MMAQuantizedGEMV.TransposedActivation?
         if emitMMAHeadSums,
             let produced = Gemma4FinalNormMMAHeadSumsV1.apply(
                 h, weight: norm.weight, eps: norm.eps)
         {
             postNorm = produced.postNorm
             mmaHeadSums = produced.sums
-            mmaHeadXT = produced.transposed
         } else {
             postNorm = norm(h)
             mmaHeadSums = nil
-            mmaHeadXT = nil
         }
-        return (postNorm, capturePreNorm ? h : nil, mmaHeadSums, mmaHeadXT)
+        return (postNorm, capturePreNorm ? h : nil, mmaHeadSums)
     }
 }
 
@@ -8286,7 +8186,6 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
         // only this path was still paying for both dispatches.
         let hidden: MLXArray
         let carriedSums: Gemma4MMAQuantizedGEMV.ActivationSums?
-        let carriedXT: Gemma4MMAQuantizedGEMV.TransposedActivation?
         if gemma4DecodeHeadNormXSumFoldEnabled,
             lmHead == nil,
             tokens.ndim == 2,
@@ -8301,11 +8200,9 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
             let produced = model.callWithMMAHeadSums(tokens, cache: caches)
             hidden = produced.postNorm
             carriedSums = produced.activationSums
-            carriedXT = produced.transposedActivation
         } else {
             hidden = model(tokens, cache: caches)
             carriedSums = nil
-            carriedXT = nil
         }
         let rows = tokens.dim(0)
         guard lmHead == nil,
@@ -8318,8 +8215,7 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
                 biases: quantized.biases,
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
-                activationSums: carriedSums,
-                transposedActivation: carriedXT)
+                activationSums: carriedSums)
         else {
             return applyLMHead(hidden).argMax(axis: -1).asType(.int32).reshaped([rows])
         }

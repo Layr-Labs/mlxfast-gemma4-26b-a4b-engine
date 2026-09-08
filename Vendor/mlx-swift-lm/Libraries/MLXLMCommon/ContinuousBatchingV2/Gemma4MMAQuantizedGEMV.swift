@@ -3227,7 +3227,7 @@ public enum Gemma4MMAQuantizedGEMV {
                 ensureRowContiguous: true),
             argmax: MLXFast.metalKernel(
                 name: "gemma4_mma_affine4_qmv_m8_v27_argmax_rl1"
-                    + logitslessCarryKeySuffix,
+                    + logitslessCarryKeySuffix + "_local4",
                 inputNames: ["x", "w", "scales", "biases", "xSums"],
                 outputNames: ["pv", "pi"],
                 source: argmax,
@@ -3236,7 +3236,7 @@ public enum Gemma4MMAQuantizedGEMV {
             argmaxXT: argmaxXT.map { source in
                 MLXFast.metalKernel(
                     name: "gemma4_mma_affine4_qmv_m8_v27_argmax_rl1"
-                        + logitslessCarryKeySuffix + "_xt1",
+                        + logitslessCarryKeySuffix + "_xt1_local4",
                     inputNames: ["x", "w", "scales", "biases", "xSums"],
                     outputNames: ["pv", "pi"],
                     source: source,
@@ -3462,15 +3462,13 @@ public enum Gemma4MMAQuantizedGEMV {
     /// (`tanh(x / c) * c` is strictly increasing for `c > 0`), so the softcap
     /// never has to run on this path.
     ///
-    /// The reduction orders records lexicographically on `(value, -index)`:
-    /// the higher value wins, and equal values keep the LOWER index --- stock
-    /// `argMax`'s first-index-wins rule. That order is associative and
-    /// commutative, so the simd butterfly and the second stage return the same
-    /// answer whatever order they visit partials in.
+    /// Each SIMDgroup emits one `(float, uint)` record per activation row. The
+    /// second stage first closes the four records in their original order,
+    /// preserving the incumbent hierarchy's nonfinite behavior as well as its
+    /// first-index tie rule.
     ///
-    /// Each threadgroup emits one `(float, uint)` record per activation row
-    /// into `pv`/`pi`: `[8, N / 128]`, 128 KB at the tied head's geometry
-    /// against the 4 MB the logits store cost.
+    /// The partial planes are `[8, N / 128, 4]`, 512 KB together at the tied
+    /// head's geometry against the 4 MB the logits store cost.
     private static let sourceV27Argmax: String = {
         var result = logitslessCarryEnabled ? sourceV27Carry : sourceV27
 
@@ -3497,9 +3495,6 @@ public enum Gemma4MMAQuantizedGEMV {
             """,
             with: """
             constexpr uint TILES = uint(N) / (N_SG * N_PSG * 4);
-            threadgroup float bestVal[N_SG * M_ROWS];
-            threadgroup uint bestIdx[N_SG * M_ROWS];
-
             // A lane owns one output column per tile and TWO activation rows
             // of it (`fragmentCol` and `fragmentCol + 1`). Tiles are visited
             // in increasing column order and only a STRICTLY greater value
@@ -3535,25 +3530,14 @@ public enum Gemma4MMAQuantizedGEMV {
                 if (ob > vb || (ob == vb && oib < ib)) { vb = ob; ib = oib; }
             }
 
-            // Lanes 0, 1, 8 and 9 carry the four `fragmentCol` values, i.e.
-            // the eight activation rows exactly once.
+            // Lanes 0, 1, 8 and 9 carry the eight activation-row winners for
+            // this SIMDgroup. Export them without a threadgroup close.
             if ((lane & 22u) == 0u) {
-                bestVal[sg * M_ROWS + fragmentCol] = va;
-                bestIdx[sg * M_ROWS + fragmentCol] = ia;
-                bestVal[sg * M_ROWS + fragmentCol + 1] = vb;
-                bestIdx[sg * M_ROWS + fragmentCol + 1] = ib;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (lid < M_ROWS) {
-                float rv = bestVal[lid];
-                uint ri = bestIdx[lid];
-                for (uint s = 1; s < N_SG; ++s) {
-                    const float ov = bestVal[s * M_ROWS + lid];
-                    const uint oi = bestIdx[s * M_ROWS + lid];
-                    if (ov > rv || (ov == rv && oi < ri)) { rv = ov; ri = oi; }
-                }
-                pv[lid * TILES + tg] = rv;
-                pi[lid * TILES + tg] = ri;
+                const uint partial = (fragmentCol * TILES + tg) * N_SG + sg;
+                pv[partial] = va;
+                pi[partial] = ia;
+                pv[partial + TILES * N_SG] = vb;
+                pi[partial + TILES * N_SG] = ib;
             }
             """
         )
@@ -3562,7 +3546,8 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27Argmax: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_argmax" + logitslessCarryKeySuffix,
+        name: "gemma4_mma_affine4_qmv_m8_v27_argmax" + logitslessCarryKeySuffix
+            + "_local4",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["pv", "pi"],
         source: sourceV27Argmax,
@@ -3623,7 +3608,7 @@ public enum Gemma4MMAQuantizedGEMV {
 
     private static let kernelV27ArgmaxXT: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v27_argmax"
-            + logitslessCarryKeySuffix + "_xt1",
+            + logitslessCarryKeySuffix + "_xt1_local4",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["pv", "pi"],
         source: sourceV27ArgmaxXT,
@@ -3631,27 +3616,37 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
-    /// Stage two. One simdgroup per activation row folds that row's `NT`
-    /// threadgroup records under the same total order and emits the token id.
+    /// Stage two. One simdgroup per activation row first reproduces the old
+    /// four-SIMDgroup close for every tile, then folds the `NT` tile winners in
+    /// the incumbent order and emits the token id.
     private static let argmaxReduceKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_head_argmax_reduce_v2_vec4",
+        name: "gemma4_mma_head_argmax_reduce_v3_local4",
         inputNames: ["pv", "pi"],
         outputNames: ["tokens"],
         source: """
             const uint m = threadgroup_position_in_grid.x;
             const uint lane = thread_index_in_simdgroup;
-            const device float4* pv4 = (const device float4*)(pv + m * uint(NT));
-            const device uint4* pi4 = (const device uint4*)(pi + m * uint(NT));
+            constexpr uint N_SG = 4;
+            const device float4* pv4 =
+                (const device float4*)(pv + m * uint(NT) * N_SG);
+            const device uint4* pi4 =
+                (const device uint4*)(pi + m * uint(NT) * N_SG);
             float rv = -INFINITY;
             uint ri = 0xFFFFFFFFu;
             constexpr uint NT4 = uint(NT) / 4;
             for (uint i = lane; i < NT4; i += 32) {
-                const float4 ov = pv4[i];
-                const uint4 oi = pi4[i];
                 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
-                    const float v = ov[e];
-                    const uint idx = oi[e];
+                    const float4 ov = pv4[i * 4 + e];
+                    const uint4 oi = pi4[i * 4 + e];
+                    float v = ov[0];
+                    uint idx = oi[0];
+                    #pragma unroll
+                    for (int s = 1; s < 4; ++s) {
+                        const float sv = ov[s];
+                        const uint si = oi[s];
+                        if (sv > v || (sv == v && si < idx)) { v = sv; idx = si; }
+                    }
                     if (v > rv || (v == rv && idx < ri)) { rv = v; ri = idx; }
                 }
             }
@@ -3785,7 +3780,10 @@ public enum Gemma4MMAQuantizedGEMV {
             template: [("T", x.dtype), ("K", k), ("N", n)],
             grid: (threadgroups * threadsPerThreadgroup, 1, 1),
             threadGroup: (threadsPerThreadgroup, 1, 1),
-            outputShapes: [[mRows * threadgroups], [mRows * threadgroups]],
+            outputShapes: [
+                [mRows * threadgroups * simdgroupsPerThreadgroup],
+                [mRows * threadgroups * simdgroupsPerThreadgroup],
+            ],
             outputDTypes: [.float32, .uint32]
         )
         if relayoutKernels != nil, relayoutXCheck {
@@ -3794,7 +3792,10 @@ public enum Gemma4MMAQuantizedGEMV {
                 template: [("T", x.dtype), ("K", k), ("N", n)],
                 grid: (threadgroups * threadsPerThreadgroup, 1, 1),
                 threadGroup: (threadsPerThreadgroup, 1, 1),
-                outputShapes: [[mRows * threadgroups], [mRows * threadgroups]],
+                outputShapes: [
+                    [mRows * threadgroups * simdgroupsPerThreadgroup],
+                    [mRows * threadgroups * simdgroupsPerThreadgroup],
+                ],
                 outputDTypes: [.float32, .uint32]
             )
             relayoutReport("argmax pv", candidate: partials[0], incumbent: reference[0])

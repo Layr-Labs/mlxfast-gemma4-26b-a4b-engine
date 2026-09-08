@@ -38,6 +38,26 @@ public enum Gemma4DecodeFusedGUV1 {
             outputShapes: [outputShape], outputDTypes: [outputDType])[0]
     }
 
+    /// GU-U2. The four `tg_qmv_affine4_g64_*_impl` block walks step the
+    /// contraction in whole blocks and are emitted rolled. `GU_LOOP_UNROLL`
+    /// requests a factor-two unroll of that walk. Each pass keeps its own
+    /// loads, its own `qdot_affine4_registered_word` and its own accumulation
+    /// into the same `result*[row]`, in the same ascending block order; these
+    /// sources are built `-fno-fast-math`, so no floating-point reassociation
+    /// is permitted. The values, the arithmetic and the accumulation order are
+    /// unaltered, so the kernel is bit-exact.
+    ///
+    /// `DARKBLOOM_GEMMA4_GU_UNROLL2=0` restores the rolled walk and the
+    /// incumbent kernel name.
+    static let guUnroll2Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_GU_UNROLL2"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let guUnroll2Suffix: String = guUnroll2Enabled ? "_u2" : ""
+
     /// GU-TAGGED-ROUTE. When the route producer emits prefix-bounds tagged
     /// words, `expert_run`'s untagged fallback -- a backward, data-dependent
     /// scan over `rhs` -- can never execute, but it still inlines into the
@@ -51,6 +71,7 @@ public enum Gemma4DecodeFusedGUV1 {
     private static func makeKernel(tagged: Bool) -> MLXFast.MLXFastKernel {
         MLXFast.metalKernel(
         name: "gemma4_b8_decode_gateup_geglu_threadgroup_v2_solo1"
+            + guUnroll2Suffix
             + (tagged ? "_tagged_v1" : ""),
         inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"],
         outputNames: ["y"],
@@ -83,7 +104,10 @@ uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
 
 """#,
         header: "#define GU_RUN_CAP \(runCap)\n"
-            + "#define GU_TAGGED_ROUTE \(tagged ? 1 : 0)\n" + #"""
+            + "#define GU_TAGGED_ROUTE \(tagged ? 1 : 0)\n"
+            + (guUnroll2Enabled
+                ? "#define GU_LOOP_UNROLL _Pragma(\"clang loop unroll_count(2)\")\n"
+                : "#define GU_LOOP_UNROLL\n") + #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helpers from 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -778,6 +802,7 @@ METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
   y1 += out_row;
 
   int k = 0;
+  GU_LOOP_UNROLL
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
@@ -878,6 +903,7 @@ METAL_FUNC void tg_qmv_affine4_g64_solo_impl(
   y0 += out_row;
 
   int k = 0;
+  GU_LOOP_UNROLL
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
@@ -974,6 +1000,7 @@ METAL_FUNC void tg_qmv_affine4_g64_triple_stream_impl(
   y2 += out_row;
 
   int k = 0;
+  GU_LOOP_UNROLL
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] =
@@ -1105,6 +1132,7 @@ METAL_FUNC void tg_qmv_affine4_g64_quad_stream_impl(
   y3 += out_row;
 
   int k = 0;
+  GU_LOOP_UNROLL
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] =

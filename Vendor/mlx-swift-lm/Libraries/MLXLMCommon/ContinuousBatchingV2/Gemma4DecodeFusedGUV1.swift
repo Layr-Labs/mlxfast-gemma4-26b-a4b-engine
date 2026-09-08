@@ -31,9 +31,35 @@ public enum Gemma4DecodeFusedGUV1 {
             taggedRoute: taggedRoute)
     }
 
+    /// Fresh per-invocation carrier; never cache data across decode calls.
+    private static let octetSums = MLXFast.metalKernel(
+        name: "gemma4_gu_raw_octet_sums_v1",
+        inputNames: ["x"], outputNames: ["sums"],
+        source: #"""
+const uint packet = thread_position_in_grid.x;
+if (packet >= uint(PACKETS)) return;
+const device bfloat* p = x + packet * 8;
+float sum = 0;
+sum += p[0] + p[1] + p[2] + p[3];
+sum += p[4] + p[5] + p[6] + p[7];
+sums[packet] = sum;
+"""#,
+        ensureRowContiguous: true)
+
     /// Raw launch for callers that already passed the fused-GU contract.
     static func call(_ inputs: [MLXArray], taggedRoute: Bool = false) -> MLXArray {
-        (taggedRoute ? kernelTagged : kernelGeneral)(inputs,
+        let x = inputs[3]
+        let useSums = x.dtype == .bfloat16 && x.size > 0
+            && x.shape.last == 2816
+            && ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_OCTET_SUMS"] != "0"
+        let carrier = useSums ? octetSums([x],
+            template: [("PACKETS", x.size / 8)],
+            grid: (x.size / 8, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[x.size / 8]], outputDTypes: [.float32])[0] : x
+        let selected = useSums
+            ? (taggedRoute ? kernelSummedTagged : kernelSummedGeneral)
+            : (taggedRoute ? kernelTagged : kernelGeneral)
+        return selected(inputs + [carrier],
             grid: (32, 176 * 2, 64), threadGroup: (32, 2, 1),
             outputShapes: [outputShape], outputDTypes: [outputDType])[0]
     }
@@ -48,11 +74,12 @@ public enum Gemma4DecodeFusedGUV1 {
     /// two carry distinct kernel names so their pipeline-cache entries never
     /// alias. Only an already-unreachable branch is removed, so the output is
     /// bit-identical.
-    private static func makeKernel(tagged: Bool) -> MLXFast.MLXFastKernel {
+    private static func makeKernel(tagged: Bool, summed: Bool = false) -> MLXFast.MLXFastKernel {
         MLXFast.metalKernel(
         name: "gemma4_b8_decode_gateup_geglu_threadgroup_v2_solo1"
+            + (summed ? "_octet_solo_v1" : "_octet_fallback_v1")
             + (tagged ? "_tagged_v1" : ""),
-        inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"],
+        inputNames: ["w", "scales", "biases", "x", "lhs", "rhs", "sums"],
         outputNames: ["y"],
         source: #"""
 uint3 tid=threadgroup_position_in_grid;
@@ -69,7 +96,7 @@ uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
     threadgroup bfloat* scratch=tile+(localSg==1 ? 4*guPairs:0)+localColumn-localSg*4;
     uint3 mathTid=tid;mathTid.y=0;
     tg_execute_projection<bfloat>(w+(expertBase+packedRow)*352,scales+(expertBase+packedRow)*44,biases+(expertBase+packedRow)*44,
-        x,lhs,scratch,8*guPairs,guSliceN,assignment,run.count,mathTid,localSg,lane);
+        x,lhs,(const device float*)sums,scratch,8*guPairs,guSliceN,assignment,run.count,mathTid,localSg,lane);
     // BF16 closes remain explicit; only the scratch address space changes.
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if((sg&1u)==0 && lane<run.count*4){
@@ -82,7 +109,8 @@ uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
     }
 
 """#,
-        header: "#define GU_RUN_CAP \(runCap)\n"
+        header: "#define GU_OCTET_SUMS \(summed ? 1 : 0)\n"
+            + "#define GU_RUN_CAP \(runCap)\n"
             + "#define GU_TAGGED_ROUTE \(tagged ? 1 : 0)\n" + #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helpers from 093e716.
 #include <metal_stdlib>
@@ -1243,12 +1271,67 @@ METAL_FUNC ExpertRun expert_run(const device uint* rhs,uint assignment) {
     return {expert,count,true};
 #endif
 }
+#if GU_OCTET_SUMS
+template <typename T>
+METAL_FUNC void tg_qmv_octet_solo(
+    const device uint* w, const device T* scales, const device T* biases,
+    const device T* x, const device float* sums, threadgroup T* y,
+    uint sg, uint lane) {
+  // Same lane packets, four-row accumulators and SIMD close as the incumbent.
+  const uint out_row = sg * 4;
+  const device uint* ws = w + out_row * 352 + lane;
+  scales += out_row * 44 + lane / 8;
+  biases += out_row * 44 + lane / 8;
+  x += lane * 8;
+  sums += lane;
+  thread float result[4] = {0};
+  thread float xt[8];
+  thread uint packed[4];
+  thread float sl[4], bl[4];
+  for (int k = 0; k < 2816; k += 256) {
+    for (int row = 0; row < 4; ++row) {
+      packed[row] = ws[row * 352];
+      sl[row] = scales[row * 44];
+      bl[row] = biases[row * 44];
+    }
+    // Preserve original BF16-to-float loads and power-of-two divisions.
+    for (int i = 0; i < 8; i += 4) {
+      xt[i] = x[i];
+      xt[i+1] = x[i+1] / 16.0f;
+      xt[i+2] = x[i+2] / 256.0f;
+      xt[i+3] = x[i+3] / 4096.0f;
+    }
+    const float sum = sums[0];
+    for (int row = 0; row < 4; ++row) {
+      result[row] += qdot_affine4_registered_word<float, 8>(
+          packed[row], xt, sl[row], bl[row], sum);
+    }
+    ws += 32;
+    scales += 4;
+    biases += 4;
+    x += 256;
+    sums += 32;
+  }
+  for (int row = 0; row < 4; ++row) {
+    result[row] = simd_sum(result[row]);
+    if (lane == 0) y[out_row + row] = static_cast<T>(result[row]);
+  }
+}
+#endif
+
 template<typename T>
 METAL_FUNC void tg_execute_projection(const device uint* w,const device T* scales,const device T* biases,
-    const device T* x,const device uint* lhs,threadgroup T* y0,int rowStride,
+    const device T* x,const device uint* lhs,const device float* sums,threadgroup T* y0,int rowStride,
     const constant int& outputN,uint assignment,uint count,uint3 tid,uint sg,uint lane) {
     const device T* x0=x+lhs[assignment]*2816;
-    if(count==1){tg_qmv_affine4_g64_solo_impl<T,64,4>(w,scales,biases,x0,y0,guK,tid,sg,lane);return;}
+    if(count==1){
+#if GU_OCTET_SUMS
+        tg_qmv_octet_solo<T>(w,scales,biases,x0,sums+lhs[assignment]*352,y0,sg,lane);
+#else
+        tg_qmv_affine4_g64_solo_impl<T,64,4>(w,scales,biases,x0,y0,guK,tid,sg,lane);
+#endif
+        return;
+    }
     const device T* x1=x+lhs[assignment+1]*2816;threadgroup T* y1=y0+rowStride;
     if(count==2){tg_qmv_affine4_g64_pair_impl<T,64,4>(w,scales,biases,x0,x1,y0,y1,guK,tid,sg,lane);return;}
 #if GU_RUN_CAP >= 3
@@ -1267,4 +1350,6 @@ METAL_FUNC void tg_execute_projection(const device uint* w,const device T* scale
 
     private static let kernelGeneral: MLXFast.MLXFastKernel = makeKernel(tagged: false)
     private static let kernelTagged: MLXFast.MLXFastKernel = makeKernel(tagged: true)
+    private static let kernelSummedGeneral: MLXFast.MLXFastKernel = makeKernel(tagged: false, summed: true)
+    private static let kernelSummedTagged: MLXFast.MLXFastKernel = makeKernel(tagged: true, summed: true)
 }

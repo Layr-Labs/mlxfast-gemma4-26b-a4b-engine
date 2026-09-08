@@ -1639,15 +1639,6 @@ enum CBv2AttentionV1 {
                 queries: queries, keys: keys, values: values,
                 scale: scale, sinks: sinks, softcap: softcap)
             : nil
-        if historyCount == 0, blockSize == 128, newTokenCount == 1024,
-            spanContext == nil,
-            let grouped = CBv2GroupedPrefillPVV1.attend(
-                queries: queries, keys: keys, values: values,
-                scale: scale, window: window, sinks: sinks, softcap: softcap,
-                queryPlane: queryPlane)
-        {
-            return grouped.transposed(0, 2, 1, 3)
-        }
         var offset = 0
         while offset < newTokenCount {
             let count = min(blockSize, newTokenCount - offset)

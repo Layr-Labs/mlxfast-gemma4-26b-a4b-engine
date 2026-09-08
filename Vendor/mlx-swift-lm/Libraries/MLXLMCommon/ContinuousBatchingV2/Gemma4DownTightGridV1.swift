@@ -43,6 +43,9 @@ public enum Gemma4DownTightGridV1 {
     static let packedWordLoads =
         ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_PACKED_WORD_LOAD"] != "0"
 
+    static let wideSameExpertEnabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_WIDE_SAME_EXPERT"] != "0"
+
     private static let compiledGateUpEnabled =
         ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_COMPILED_GU_DOWN"] != "0"
 
@@ -153,6 +156,7 @@ public enum Gemma4DownTightGridV1 {
         MLXFast.metalKernel(
         name: "gemma4_b8_down_qmv_span4_tight_zorder_v2_solo1"
             + (packedWordLoads ? "_word32" : "")
+            + (wideSameExpertEnabled ? "_wide34" : "")
             + (tagged ? "_tagged_v1" : ""),
         inputNames: ["w", "scales", "biases", "x", "lhs_indices", "rhs_indices"],
         outputNames: ["y"],
@@ -171,6 +175,7 @@ gather_qmv_gemma4_down_tile<T, 64, 4, SPAN>(
     tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
 """#,
         header: "#define DOWN_PACKED_WORD_LOAD \(packedWordLoads ? 1 : 0)\n"
+            + "#define DOWN_WIDE_SAME_EXPERT \(wideSameExpertEnabled ? 1 : 0)\n"
             + "#define DOWN_TAGGED_ROUTE \(tagged ? 1 : 0)\n" + #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helper bodies verified byte-identical to 093e716.
 #include <metal_stdlib>
@@ -821,7 +826,7 @@ METAL_FUNC void qmv_impl(
   }
 }
 
-template <typename T, const int group_size, const int bits, const int K = 704>
+template <typename T, const int group_size, const int bits>
 METAL_FUNC void qmv_affine4_g64_pair_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -830,13 +835,10 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     const device T* x1,
     device T* y0,
     device T* y1,
-    const constant int& runtime_in_vec_size,
+    const constant int& in_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  // This helper is only dispatched for the admitted K=704 expert projection.
-  // Keep the launch ABI, but expose the bound to the Metal optimizer.
-  constexpr int in_vec_size = K;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
@@ -867,7 +869,6 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   y1 += out_row;
 
   int k = 0;
-  #pragma unroll
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
@@ -927,6 +928,243 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     if (simd_lid == 0) {
       y0[row] = static_cast<T>(result0[row]);
       y1[row] = static_cast<T>(result1[row]);
+    }
+  }
+}
+
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine4_g64_triple_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    const device T* x2,
+    device T* y0,
+    device T* y1,
+    device T* y2,
+    const constant int& in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 8;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x0_thread[values_per_thread];
+  thread float x1_thread[values_per_thread];
+  thread float x2_thread[values_per_thread];
+  thread uint packed[results_per_simdgroup];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+  thread float result2[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  x2 += simd_lid * values_per_thread;
+  y0 += out_row;
+  y1 += out_row;
+  y2 += out_row;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+    float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+    float sum2 = load_vector<T, float, values_per_thread, 4>(x2, x2_thread);
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x0_thread, scale_local[row], bias_local[row], sum0);
+      result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x1_thread, scale_local[row], bias_local[row], sum1);
+      result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x2_thread, scale_local[row], bias_local[row], sum2);
+    }
+
+    ws += block_size / 2;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+    x2 += block_size;
+  }
+
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+    float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+    float sum2 = load_vector<T, float, values_per_thread, 4>(x2, x2_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x0_thread, scale_local[row], bias_local[row], sum0);
+      result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x1_thread, scale_local[row], bias_local[row], sum1);
+      result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x2_thread, scale_local[row], bias_local[row], sum2);
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+    result2[row] = simd_sum(result2[row]);
+    if (simd_lid == 0) {
+      y0[row] = static_cast<T>(result0[row]);
+      y1[row] = static_cast<T>(result1[row]);
+      y2[row] = static_cast<T>(result2[row]);
+    }
+  }
+}
+
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine4_g64_quad_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    const device T* x2,
+    const device T* x3,
+    device T* y0,
+    device T* y1,
+    device T* y2,
+    device T* y3,
+    const constant int& in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 8;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x0_thread[values_per_thread];
+  thread float x1_thread[values_per_thread];
+  thread float x2_thread[values_per_thread];
+  thread float x3_thread[values_per_thread];
+  thread uint packed[results_per_simdgroup];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+  thread float result2[results_per_simdgroup] = {0};
+  thread float result3[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  x2 += simd_lid * values_per_thread;
+  x3 += simd_lid * values_per_thread;
+  y0 += out_row;
+  y1 += out_row;
+  y2 += out_row;
+  y3 += out_row;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+    float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+    float sum2 = load_vector<T, float, values_per_thread, 4>(x2, x2_thread);
+    float sum3 = load_vector<T, float, values_per_thread, 4>(x3, x3_thread);
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x0_thread, scale_local[row], bias_local[row], sum0);
+      result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x1_thread, scale_local[row], bias_local[row], sum1);
+      result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x2_thread, scale_local[row], bias_local[row], sum2);
+      result3[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x3_thread, scale_local[row], bias_local[row], sum3);
+    }
+
+    ws += block_size / 2;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+    x2 += block_size;
+    x3 += block_size;
+  }
+
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+    float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+    float sum2 = load_vector<T, float, values_per_thread, 4>(x2, x2_thread);
+    float sum3 = load_vector<T, float, values_per_thread, 4>(x3, x3_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x0_thread, scale_local[row], bias_local[row], sum0);
+      result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x1_thread, scale_local[row], bias_local[row], sum1);
+      result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x2_thread, scale_local[row], bias_local[row], sum2);
+      result3[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x3_thread, scale_local[row], bias_local[row], sum3);
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+    result2[row] = simd_sum(result2[row]);
+    result3[row] = simd_sum(result3[row]);
+    if (simd_lid == 0) {
+      y0[row] = static_cast<T>(result0[row]);
+      y1[row] = static_cast<T>(result1[row]);
+      y2[row] = static_cast<T>(result2[row]);
+      y3[row] = static_cast<T>(result3[row]);
     }
   }
 }
@@ -1046,6 +1284,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
 #if DOWN_TAGGED_ROUTE
   const uint32_t expert = route_word & 0xffu;
   const uint run_offset = (route_word >> 8) & 0x3fu;
+  const uint run_remaining = ((route_word >> 14) & 0x3fu) + 1u;
 #else
   const bool expert_prefix_bounds = (route_word & 0x80000000u) != 0u;
   const uint32_t expert =
@@ -1062,18 +1301,80 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
   }
 #endif
+#if DOWN_TAGGED_ROUTE && DOWN_WIDE_SAME_EXPERT
+  // Tagged bounds let one leader own four-row chunks without another route read.
+  if ((run_offset & 3u) != 0u) {
+    return;
+  }
+#else
   // Odd positions are produced by the immediately preceding pair leader.
   if ((run_offset & 1) != 0) {
     return;
   }
+#endif
   const device uint32_t* tile_w = w + expert * w_stride;
   const device T* tile_scales = scales + expert * s_stride;
   const device T* tile_biases = biases + expert * b_stride;
   const device T* tile_x0 =
       x + lhs_indices[assignment * lhs_stride] * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;
+#if DOWN_TAGGED_ROUTE && DOWN_WIDE_SAME_EXPERT
+  if (run_remaining >= 3u) {
+    const device T* tile_x1 =
+        x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
+    const device T* tile_x2 =
+        x + lhs_indices[(assignment + 2) * lhs_stride] * x_stride;
+    device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+    device T* tile_y2 = y + (assignment + 2) * out_vec_size;
+    if (run_remaining >= 4u) {
+      const device T* tile_x3 =
+          x + lhs_indices[(assignment + 3) * lhs_stride] * x_stride;
+      device T* tile_y3 = y + (assignment + 3) * out_vec_size;
+      for (int t = 0; t < gemma4_down_tile_span; t++) {
+        uint3 tile_tid = tid;
+        tile_tid.y = tid.y + uint(t);
+        qmv_affine4_g64_quad_impl<T, group_size, bits>(
+            tile_w,
+            tile_scales,
+            tile_biases,
+            tile_x0,
+            tile_x1,
+            tile_x2,
+            tile_x3,
+            tile_y0,
+            tile_y1,
+            tile_y2,
+            tile_y3,
+            in_vec_size,
+            tile_tid,
+            simd_gid,
+            simd_lid);
+      }
+      return;
+    }
+    for (int t = 0; t < gemma4_down_tile_span; t++) {
+      uint3 tile_tid = tid;
+      tile_tid.y = tid.y + uint(t);
+      qmv_affine4_g64_triple_impl<T, group_size, bits>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_x1,
+          tile_x2,
+          tile_y0,
+          tile_y1,
+          tile_y2,
+          in_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    }
+    return;
+  }
+#endif
 #if DOWN_TAGGED_ROUTE
-  const bool has_pair = (((route_word >> 14) & 0x3fu) + 1u) > 1u;
+  const bool has_pair = run_remaining > 1u;
 #else
   const bool has_pair = expert_prefix_bounds
       ? (((route_word >> 14) & 0x3fu) + 1u) > 1u

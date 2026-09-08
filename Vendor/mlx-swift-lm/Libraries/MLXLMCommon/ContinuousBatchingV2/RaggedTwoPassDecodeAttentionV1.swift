@@ -13,6 +13,61 @@ import Foundation
 import MLX
 import MLXFast
 
+public enum CBv2Gemma4RawAttentionCarrier {
+    public struct Sliding {
+        let rawQueries: MLXArray
+        let rawKeys: MLXArray
+        let rawValues: MLXArray
+        let qWeight: MLXArray
+        let kWeight: MLXArray
+        let positionOffsets: MLXArray
+        let ropeLog2Base: MLXArray
+        let ropeInverseFrequencies: MLXArray?
+
+        public init(
+            rawQueries: MLXArray, rawKeys: MLXArray, rawValues: MLXArray,
+            qWeight: MLXArray, kWeight: MLXArray, positionOffsets: MLXArray,
+            ropeLog2Base: MLXArray, ropeInverseFrequencies: MLXArray?
+        ) {
+            self.rawQueries = rawQueries
+            self.rawKeys = rawKeys
+            self.rawValues = rawValues
+            self.qWeight = qWeight
+            self.kWeight = kWeight
+            self.positionOffsets = positionOffsets
+            self.ropeLog2Base = ropeLog2Base
+            self.ropeInverseFrequencies = ropeInverseFrequencies
+        }
+    }
+
+    public struct Full {
+        let rawQueries: MLXArray
+        let rawKeys: MLXArray
+        let rawValues: MLXArray
+        let qWeight: MLXArray
+        let kWeight: MLXArray
+        let positionOffsets: MLXArray
+        let ropeFrequencies: MLXArray
+
+        public init(
+            rawQueries: MLXArray, rawKeys: MLXArray, rawValues: MLXArray,
+            qWeight: MLXArray, kWeight: MLXArray, positionOffsets: MLXArray,
+            ropeFrequencies: MLXArray
+        ) {
+            self.rawQueries = rawQueries
+            self.rawKeys = rawKeys
+            self.rawValues = rawValues
+            self.qWeight = qWeight
+            self.kWeight = kWeight
+            self.positionOffsets = positionOffsets
+            self.ropeFrequencies = ropeFrequencies
+        }
+    }
+
+    case sliding(Sliding)
+    case full(Full)
+}
+
 // Per-call input assembly only: tensor identities and argument order are
 // unchanged, and no request-dependent values are retained between calls.
 fileprivate enum Q4InputAssemblyV1 {
@@ -114,14 +169,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private struct ResidentNormRopeInputs {
         let normalizedKeys: ObjectIdentifier
         let normalizedValues: ObjectIdentifier
-        let rawQueries: MLXArray
-        let rawKeys: MLXArray
-        let rawValues: MLXArray
-        let qWeight: MLXArray
-        let kWeight: MLXArray
-        let positionOffsets: MLXArray
-        let ropeLog2Base: MLXArray
-        let ropeInverseFrequencies: MLXArray?
+        let carrier: CBv2Gemma4RawAttentionCarrier.Sliding
     }
 
     private static let residentNormRopeLock = NSLock()
@@ -198,14 +246,15 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             ResidentNormRopeInputs(
                 normalizedKeys: ObjectIdentifier(normalizedKeys),
                 normalizedValues: ObjectIdentifier(normalizedValues),
-                rawQueries: rawQueries,
-                rawKeys: rawKeys,
-                rawValues: rawValues,
-                qWeight: qWeight,
-                kWeight: kWeight,
-                positionOffsets: positionOffsets,
-                ropeLog2Base: ropeLog2Base,
-                ropeInverseFrequencies: ropeInverseFrequencies)
+                carrier: .init(
+                    rawQueries: rawQueries,
+                    rawKeys: rawKeys,
+                    rawValues: rawValues,
+                    qWeight: qWeight,
+                    kWeight: kWeight,
+                    positionOffsets: positionOffsets,
+                    ropeLog2Base: ropeLog2Base,
+                    ropeInverseFrequencies: ropeInverseFrequencies))
         residentNormRopeLock.unlock()
         return true
     }
@@ -3820,6 +3869,149 @@ for (int element = 0; element < values_per_lane; ++element) {
         )[0]
     }
 
+    private static func attendRingQuantWritingResident(
+        carrier: CBv2Gemma4RawAttentionCarrier.Sliding,
+        mirrors: [MLXArray], startArray: MLXArray,
+        previousWriteFence: MLXArray
+    ) -> (output: MLXArray, nextWriteFence: MLXArray) {
+        let residentInputs = Q4InputAssemblyV1.build(
+            first: carrier.rawQueries, mirrors: mirrors, tail: [
+                startArray,
+                carrier.rawKeys,
+                carrier.rawValues,
+                carrier.qWeight,
+                carrier.kWeight,
+                carrier.positionOffsets,
+                carrier.ropeInverseFrequencies ?? carrier.ropeLog2Base,
+                previousWriteFence,
+            ])
+        let residentTemplate: [(String, any KernelTemplateArg)] = [
+            ("T", carrier.rawQueries.dtype),
+            ("D", headDim),
+            ("N", sequenceLength),
+            ("GQA", gqa),
+            ("KV_HEADS", kvHeads),
+            ("BLOCKS", blocks),
+            ("ROPE_INV_FREQS", carrier.ropeInverseFrequencies != nil),
+        ]
+        let residentShapes = [
+            [batch, queryHeads, 1, headDim], [1],
+            [batch, kvHeads, 1, headDim],
+            [batch, kvHeads, 1, headDim],
+        ]
+        let residentDTypes: [DType] = [
+            .bfloat16, .int32, .bfloat16, .bfloat16,
+        ]
+        let resident: [MLXArray]
+        let oRunsum: MLXArray?
+        if oRunsumFoldEnabled {
+            let kernel = q4ResidentDirectRopeEnabled
+                ? portQuantFusedWriteResidentNormRopeDirectORunsumKernel
+                : portQuantFusedWriteResidentNormRopeORunsumKernel
+            resident = kernel(
+                residentInputs,
+                template: residentTemplate,
+                grid: (kvHeads * blocks * 32, batch, 1),
+                threadGroup: (blocks * 32, 1, 1),
+                outputShapes: residentShapes
+                    + [[batch, queryHeads * headDim / 64]],
+                outputDTypes: residentDTypes + [.float32]
+            )
+            oRunsum = resident[4]
+            CBv2EngageMark.once("o-runsum-resident-fold")
+        } else {
+            let kernel = q4ResidentDirectRopeEnabled
+                ? portQuantFusedWriteResidentNormRopeDirectKernel
+                : portQuantFusedWriteResidentNormRopeKernel
+            resident = kernel(
+                residentInputs,
+                template: residentTemplate,
+                grid: (kvHeads * blocks * 32, batch, 1),
+                threadGroup: (blocks * 32, 1, 1),
+                outputShapes: residentShapes,
+                outputDTypes: residentDTypes
+            )
+            oRunsum = nil
+        }
+        publishResidentProducts(
+            ResidentProducts(
+                runsumTable: oRunsum,
+                normalizedKeys: resident[2],
+                normalizedValues: resident[3]),
+            for: resident[0])
+        CBv2EngageMark.once("kvq4-fused-live-write")
+        CBv2EngageMark.once("kvq4-resident-merge")
+        CBv2EngageMark.once("kvq4-resident-norm-rope")
+        if q4ResidentDirectRopeEnabled {
+            CBv2EngageMark.once("kvq4-resident-direct-rope")
+        }
+        if slidingPrefetchDepth2 && slidingPrefetchPeelEnabled {
+            CBv2EngageMark.once("sliding-prefetch-pf2-tail-peel")
+        }
+        if slidingSoftRefWalks.applied {
+            CBv2EngageMark.once("sliding-softmax-ref")
+            if slidingAffineFoldActive {
+                CBv2EngageMark.once("sliding-affine-fold")
+            }
+        }
+        return (resident[0], resident[1])
+    }
+
+    static func attendRingQuantWriting(
+        carrier: CBv2Gemma4RawAttentionCarrier.Sliding,
+        mirrors: [MLXArray], starts: [Int],
+        previousWriteFence: MLXArray, scale: Float,
+        slidingWindowLength: Int
+    ) -> (output: MLXArray, nextWriteFence: MLXArray)? {
+        guard q4ResidentNormRopeEnabled,
+            q4ResidentMergeEnabled,
+            blocks == 8,
+            combineColumns == 8,
+            combineThreads == 256,
+            CBv2WindowedSequenceKV.q4FusedMirrorWriteEnabled,
+            CBv2WindowedSequenceKV.q4BF16RingElideEnabled,
+            CBv2WindowedSequenceKV.quantEnabled,
+            !CBv2WindowedSequenceKV.quantSimulate,
+            !CBv2WindowedSequenceKV.gpuPackCheck,
+            slidingWindowLength == sequenceLength,
+            starts.count == batch,
+            starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength }),
+            enabled, sequenceLength.isMultiple(of: blocks),
+            scale == 1.0,
+            carrier.rawQueries.dtype == .bfloat16,
+            carrier.rawQueries.shape == [batch, 1, queryHeads, headDim],
+            carrier.rawKeys.dtype == .bfloat16,
+            carrier.rawKeys.shape == [batch, 1, kvHeads, headDim],
+            carrier.rawValues.dtype == .bfloat16,
+            carrier.rawValues.shape == carrier.rawKeys.shape,
+            carrier.qWeight.dtype == .bfloat16,
+            carrier.qWeight.shape == [headDim],
+            carrier.kWeight.dtype == .bfloat16,
+            carrier.kWeight.shape == [headDim],
+            carrier.positionOffsets.dtype == .int32,
+            carrier.positionOffsets.shape == [batch],
+            carrier.ropeLog2Base.dtype == .float32,
+            carrier.ropeLog2Base.shape == [1],
+            previousWriteFence.dtype == .int32,
+            previousWriteFence.shape == [1],
+            mirrors.count == batch,
+            mirrors.allSatisfy({
+                $0.dtype == .uint32
+                    && $0.shape == [2, kvHeads, sequenceLength, headDim / 8 + headDim / 64]
+            })
+        else { return nil }
+        if let frequencies = carrier.ropeInverseFrequencies,
+            (frequencies.dtype != .float32 || frequencies.shape != [headDim / 2])
+        {
+            return nil
+        }
+        let startArray = getStartArray(starts: starts, batch: batch)
+        if Q4InputAssemblyV1.enabled { CBv2EngageMark.once("q4-input-assembly-v1") }
+        return attendRingQuantWritingResident(
+            carrier: carrier, mirrors: mirrors, startArray: startArray,
+            previousWriteFence: previousWriteFence)
+    }
+
     /// Exact B8/D256 q4g64 ring attention which packs this step's new K/V
     /// into the live mirror from pass A. Pass B consumes the first three
     /// outputs, while the fourth output is the next step's write fence.
@@ -3872,87 +4064,9 @@ for (int element = 0; element < values_per_lane; ++element) {
             if let normRope = takeResidentNormRope(
                 queries: queries, keys: newKeys, values: newValues)
             {
-                let residentInputs = Q4InputAssemblyV1.build(
-                    first: normRope.rawQueries, mirrors: mirrors, tail: [
-                        startArray,
-                        normRope.rawKeys,
-                        normRope.rawValues,
-                        normRope.qWeight,
-                        normRope.kWeight,
-                        normRope.positionOffsets,
-                        normRope.ropeInverseFrequencies ?? normRope.ropeLog2Base,
-                        previousWriteFence,
-                    ])
-                let residentTemplate: [(String, any KernelTemplateArg)] = [
-                    ("T", normRope.rawQueries.dtype),
-                    ("D", headDim),
-                    ("N", sequenceLength),
-                    ("GQA", gqa),
-                    ("KV_HEADS", kvHeads),
-                    ("BLOCKS", blocks),
-                    ("ROPE_INV_FREQS", normRope.ropeInverseFrequencies != nil),
-                ]
-                let residentShapes = [
-                    [batch, queryHeads, 1, headDim], [1],
-                    [batch, kvHeads, 1, headDim],
-                    [batch, kvHeads, 1, headDim],
-                ]
-                let residentDTypes: [DType] = [
-                    .bfloat16, .int32, .bfloat16, .bfloat16,
-                ]
-                let resident: [MLXArray]
-                let oRunsum: MLXArray?
-                if oRunsumFoldEnabled {
-                    let kernel = q4ResidentDirectRopeEnabled
-                        ? portQuantFusedWriteResidentNormRopeDirectORunsumKernel
-                        : portQuantFusedWriteResidentNormRopeORunsumKernel
-                    resident = kernel(
-                        residentInputs,
-                        template: residentTemplate,
-                        grid: (kvHeads * blocks * 32, batch, 1),
-                        threadGroup: (blocks * 32, 1, 1),
-                        outputShapes: residentShapes
-                            + [[batch, queryHeads * headDim / 64]],
-                        outputDTypes: residentDTypes + [.float32]
-                    )
-                    oRunsum = resident[4]
-                    CBv2EngageMark.once("o-runsum-resident-fold")
-                } else {
-                    let kernel = q4ResidentDirectRopeEnabled
-                        ? portQuantFusedWriteResidentNormRopeDirectKernel
-                        : portQuantFusedWriteResidentNormRopeKernel
-                    resident = kernel(
-                        residentInputs,
-                        template: residentTemplate,
-                        grid: (kvHeads * blocks * 32, batch, 1),
-                        threadGroup: (blocks * 32, 1, 1),
-                        outputShapes: residentShapes,
-                        outputDTypes: residentDTypes
-                    )
-                    oRunsum = nil
-                }
-                publishResidentProducts(
-                    ResidentProducts(
-                        runsumTable: oRunsum,
-                        normalizedKeys: resident[2],
-                        normalizedValues: resident[3]),
-                    for: resident[0])
-                CBv2EngageMark.once("kvq4-fused-live-write")
-                CBv2EngageMark.once("kvq4-resident-merge")
-                CBv2EngageMark.once("kvq4-resident-norm-rope")
-                if q4ResidentDirectRopeEnabled {
-                    CBv2EngageMark.once("kvq4-resident-direct-rope")
-                }
-                if slidingPrefetchDepth2 && slidingPrefetchPeelEnabled {
-                    CBv2EngageMark.once("sliding-prefetch-pf2-tail-peel")
-                }
-                if slidingSoftRefWalks.applied {
-                    CBv2EngageMark.once("sliding-softmax-ref")
-                    if slidingAffineFoldActive {
-                        CBv2EngageMark.once("sliding-affine-fold")
-                    }
-                }
-                return (resident[0], resident[1])
+                return attendRingQuantWritingResident(
+                    carrier: normRope.carrier, mirrors: mirrors,
+                    startArray: startArray, previousWriteFence: previousWriteFence)
             }
             let resident = portQuantFusedWriteResidentKernel(
                 fallbackInputs(),
@@ -4345,12 +4459,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         weak var normalizedQueries: MLXArray?
         weak var normalizedKeys: MLXArray?
         weak var normalizedValues: MLXArray?
-        let rawQueries: MLXArray
-        let rawKeys: MLXArray
-        let qWeight: MLXArray
-        let kWeight: MLXArray
-        let positionOffsets: MLXArray
-        let ropeFrequencies: MLXArray
+        let carrier: CBv2Gemma4RawAttentionCarrier.Full
     }
 
     private static let fullNormRopeLock = NSLock()
@@ -4414,12 +4523,14 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 normalizedQueries: normalizedQueries,
                 normalizedKeys: normalizedKeys,
                 normalizedValues: normalizedValues,
-                rawQueries: rawQueries,
-                rawKeys: rawKeys,
-                qWeight: qWeight,
-                kWeight: kWeight,
-                positionOffsets: positionOffsets,
-                ropeFrequencies: ropeFrequencies)
+                carrier: .init(
+                    rawQueries: rawQueries,
+                    rawKeys: rawKeys,
+                    rawValues: rawValues,
+                    qWeight: qWeight,
+                    kWeight: kWeight,
+                    positionOffsets: positionOffsets,
+                    ropeFrequencies: ropeFrequencies))
         fullNormRopeLock.unlock()
         return true
     }
@@ -6294,6 +6405,59 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         previousWriteFence: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float?
     ) -> (output: MLXArray, nextWriteFence: MLXArray)? {
+        updateAndAttendWriting22Impl(
+            rows: rows, kind: kind,
+            queries: queries, keys: keys, values: values, carrier: nil,
+            previousWriteFence: previousWriteFence,
+            scale: scale, sinks: sinks, softcap: softcap)
+    }
+
+    static func updateAndAttendWriting22(
+        rows: [CBv2SequenceKV], kind: CBv2LayerKind,
+        carrier: CBv2Gemma4RawAttentionCarrier.Full,
+        previousWriteFence: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float?
+    ) -> (output: MLXArray, nextWriteFence: MLXArray)? {
+        updateAndAttendWriting22Impl(
+            rows: rows, kind: kind,
+            queries: nil, keys: nil, values: nil, carrier: carrier,
+            previousWriteFence: previousWriteFence,
+            scale: scale, sinks: sinks, softcap: softcap)
+    }
+
+    private static func updateAndAttendWriting22Impl(
+        rows: [CBv2SequenceKV], kind: CBv2LayerKind,
+        queries: MLXArray?, keys: MLXArray?, values: MLXArray?,
+        carrier: CBv2Gemma4RawAttentionCarrier.Full?,
+        previousWriteFence: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float?
+    ) -> (output: MLXArray, nextWriteFence: MLXArray)? {
+        let directInputValid = carrier.map {
+            normRopeFoldEnabled
+                && CBv2RaggedTwoPassDecodeAttentionV1.q4ResidentNormRopeEnabled
+                && $0.rawValues === $0.rawKeys
+                && $0.rawQueries.dtype == .bfloat16
+                && $0.rawQueries.shape == [batch, 1, queryHeads, headDim]
+                && $0.rawKeys.dtype == .bfloat16
+                && $0.rawKeys.shape == [batch, 1, kvHeads, headDim]
+                && $0.qWeight.dtype == .bfloat16
+                && $0.qWeight.shape == [headDim]
+                && $0.kWeight.dtype == .bfloat16
+                && $0.kWeight.shape == [headDim]
+                && $0.positionOffsets.dtype == .int32
+                && $0.positionOffsets.shape == [batch]
+                && $0.ropeFrequencies.dtype == .float32
+                && $0.ropeFrequencies.shape == [headDim / 2]
+        } ?? false
+        let fallbackInputValid = queries.map { query in
+            guard let keys, let values else { return false }
+            return query.dtype == .bfloat16
+                && keys.dtype == .bfloat16
+                && values.dtype == .bfloat16
+                && query.shape == [batch, queryHeads, 1, headDim]
+                && keys.shape == [batch, kvHeads, 1, headDim]
+                && values.shape == keys.shape
+        } ?? false
         guard storeDispatchEnabled,
             enabled,
             rows.count == batch,
@@ -6304,14 +6468,9 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             kind.queryHeads == queryHeads,
             kind.kvHeads == kvHeads,
             kind.headDim == headDim,
-            queries.dtype == .bfloat16,
-            keys.dtype == .bfloat16,
-            values.dtype == .bfloat16,
             previousWriteFence.dtype == .int32,
             previousWriteFence.shape == [1],
-            queries.shape == [batch, queryHeads, 1, headDim],
-            keys.shape == [batch, kvHeads, 1, headDim],
-            values.shape == keys.shape
+            directInputValid || fallbackInputValid
         else { return nil }
         guard case .full = kind.attention else { return nil }
 
@@ -6325,7 +6484,6 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let fallbackFullRows: [CBv2FullSequenceKV]?
 
         if directFullRowCastEnabled {
-            CBv2EngageMark.once("d512-direct-full-row-cast")
             guard let first = rows.first as? CBv2FullSequenceKV else { return nil }
             offset = first.absoluteOffset
             keyLength = offset + 1
@@ -6359,6 +6517,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 params.append(UInt32(state[0].dim(2)))
             }
             fallbackFullRows = nil
+            CBv2EngageMark.once("d512-direct-full-row-cast")
         } else {
             let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
             guard fullRows.count == batch else { return nil }
@@ -6397,7 +6556,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let paramsArray = getD512ParamsArray(params: params)
 
         let template: [(String, any KernelTemplateArg)] = [
-            ("T", queries.dtype)
+            ("T", carrier?.rawQueries.dtype ?? queries!.dtype)
         ]
         let scratchShape = [batch, queryHeads, 1, keyLength]
 
@@ -6410,10 +6569,19 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let liveQueries: MLXArray
         var normalizedKeys: MLXArray? = nil
         var normalizedValues: MLXArray? = nil
-        if normRopeFoldEnabled,
-            let normRope = takeFullNormRope(
+        let directCarrier: CBv2Gemma4RawAttentionCarrier.Full?
+        if let carrier {
+            directCarrier = carrier
+        } else if normRopeFoldEnabled,
+            let queries, let keys, let values,
+            let registered = takeFullNormRope(
                 queries: queries, keys: keys, values: values)
         {
+            directCarrier = registered.carrier
+        } else {
+            directCarrier = nil
+        }
+        if let normRope = directCarrier {
             let stored = ringStoreNormRopeKernel(
                 keyBuffers + valueBuffers + [
                     paramsArray,
@@ -6442,6 +6610,9 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             normalizedValues = stored[3]
             CBv2EngageMark.once("d512-normrope-store")
         } else {
+            let queries = queries!
+            let keys = keys!
+            let values = values!
             storeFence = ringStoreKernel(
                 keyBuffers + valueBuffers
                     + [paramsArray, keys, values, previousWriteFence],

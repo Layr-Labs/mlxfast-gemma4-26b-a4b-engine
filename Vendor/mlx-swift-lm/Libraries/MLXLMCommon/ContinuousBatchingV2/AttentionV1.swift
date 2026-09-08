@@ -820,6 +820,53 @@ enum CBv2AttentionV1 {
         }
     }
 
+    static func updateAndAttendResidentNormRope(
+        rows: [CBv2SequenceKV], kind: CBv2LayerKind,
+        carrier: CBv2Gemma4RawAttentionCarrier,
+        scale: Float, sinks: MLXArray?, softcap: Float?,
+        decodeRingWriteFence: CBv2DecodeRingWriteFence,
+        allowFusedRingWrite: Bool
+    ) -> MLXArray? {
+        guard allowFusedRingWrite else { return nil }
+        switch carrier {
+        case .sliding(let sliding):
+            guard canUseRaggedTwoPassDecode(
+                batch: rows.count, cacheKind: kind, queryKind: kind,
+                scale: scale, sinks: sinks, softcap: softcap)
+            else { return nil }
+            let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
+            guard ringRows.count == rows.count,
+                ringRows.allSatisfy({ $0.decodeRingView != nil })
+            else { return nil }
+            let preWrite = ringRows.compactMap { $0.decodeRingQuantViewBeforeWrite }
+            guard preWrite.count == rows.count,
+                let fused = CBv2RaggedTwoPassDecodeAttentionV1.attendRingQuantWriting(
+                    carrier: sliding,
+                    mirrors: preWrite.map(\.mirror),
+                    starts: preWrite.map(\.start),
+                    previousWriteFence: decodeRingWriteFence.value,
+                    scale: scale,
+                    slidingWindowLength: ringRows[0].window)
+            else { return nil }
+            for row in ringRows {
+                row.advanceDecodeRingAfterQuantWrite()
+            }
+            decodeRingWriteFence.value = fused.nextWriteFence
+            return fused.output
+
+        case .full(let full):
+            guard let fused = CBv2RaggedComposedD512DecodeAttentionV1
+                .updateAndAttendWriting22(
+                    rows: rows, kind: kind, carrier: full,
+                    previousWriteFence: decodeRingWriteFence.value,
+                    scale: scale, sinks: sinks, softcap: softcap)
+            else { return nil }
+            decodeRingWriteFence.value = fused.nextWriteFence
+            CBv2EngageMark.once("write022d512")
+            return fused.output
+        }
+    }
+
     /// PREFILL-KV-BATCH: all-rows-fresh admission for the rectangular
     /// road's commit stage. When every row is a `CBv2WindowedSequenceKV`
     /// whose next `update` with this chunk would take FRESH-RING-ADOPT
@@ -1639,15 +1686,6 @@ enum CBv2AttentionV1 {
                 queries: queries, keys: keys, values: values,
                 scale: scale, sinks: sinks, softcap: softcap)
             : nil
-        if historyCount == 0, blockSize == 128, newTokenCount == 1024,
-            spanContext == nil,
-            let grouped = CBv2GroupedPrefillPVV1.attend(
-                queries: queries, keys: keys, values: values,
-                scale: scale, window: window, sinks: sinks, softcap: softcap,
-                queryPlane: queryPlane)
-        {
-            return grouped.transposed(0, 2, 1, 3)
-        }
         var offset = 0
         while offset < newTokenCount {
             let count = min(blockSize, newTokenCount - offset)

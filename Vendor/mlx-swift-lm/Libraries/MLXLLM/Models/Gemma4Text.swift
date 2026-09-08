@@ -1976,12 +1976,12 @@ private func gemma4FusedQKVNormHeadMajorSliding(
     return (outputs[0], outputs[1], outputs[2], fusedRope, nil)
 }
 
-private func gemma4FusedQKVNorm(
+private func gemma4CanFusedQKVNorm(
     q: MLXArray, k: MLXArray, v: MLXArray,
     qWeight: MLXArray, kWeight: MLXArray, eps: Float,
     keyValueShared: Bool, positionOffsets: MLXArray,
-    ropeParameters: Gemma4QKVRopeParameters, applyRope: Bool
-) -> (q: MLXArray, k: MLXArray, v: MLXArray, appliedRope: Bool)? {
+    ropeParameters: Gemma4QKVRopeParameters
+) -> Bool {
     guard eps == 1.0e-6,
         q.dtype == .bfloat16, k.dtype == .bfloat16, v.dtype == .bfloat16,
         qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
@@ -1997,6 +1997,21 @@ private func gemma4FusedQKVNorm(
         !keyValueShared || v.shape == k.shape,
         !ropeParameters.usesFrequencies
             || ropeParameters.frequencies.size == q.dim(3) / 2
+    else { return false }
+    return true
+}
+
+private func gemma4FusedQKVNorm(
+    q: MLXArray, k: MLXArray, v: MLXArray,
+    qWeight: MLXArray, kWeight: MLXArray, eps: Float,
+    keyValueShared: Bool, positionOffsets: MLXArray,
+    ropeParameters: Gemma4QKVRopeParameters, applyRope: Bool
+) -> (q: MLXArray, k: MLXArray, v: MLXArray, appliedRope: Bool)? {
+    guard gemma4CanFusedQKVNorm(
+        q: q, k: k, v: v,
+        qWeight: qWeight, kWeight: kWeight, eps: eps,
+        keyValueShared: keyValueShared, positionOffsets: positionOffsets,
+        ropeParameters: ropeParameters)
     else { return nil }
 
     let dimension = q.dim(3)
@@ -2545,7 +2560,8 @@ private class Gemma4Attention: Module {
         v2SharedSource: (any CBv2AttendingLayerCache)? = nil,
         outputStart: Int = 0,
         useLastQueryPrefill: Bool = false,
-        carriedRunsum: MLXArray? = nil
+        carriedRunsum: MLXArray? = nil,
+        allowRawAttentionCarrier: Bool = false
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // ContinuousBatchingV2: the layer cache owns both the KV update and
         // the attention computation (no masks, no padding — see
@@ -2556,7 +2572,8 @@ private class Gemma4Attention: Module {
                 x, layerCache: layerCacheV2, source: v2SharedSource,
                 sharedKV: sharedKV, positionOffset: positionOffset,
                 outputStart: outputStart, useLastQueryPrefill: useLastQueryPrefill,
-                carriedRunsum: carriedRunsum)
+                carriedRunsum: carriedRunsum,
+                allowRawAttentionCarrier: allowRawAttentionCarrier)
         }
         precondition(
             outputStart == 0 && !useLastQueryPrefill,
@@ -2696,7 +2713,8 @@ private class Gemma4Attention: Module {
         positionOffset: Gemma4.PositionOffset?,
         outputStart: Int = 0,
         useLastQueryPrefill: Bool = false,
-        carriedRunsum: MLXArray? = nil
+        carriedRunsum: MLXArray? = nil,
+        allowRawAttentionCarrier: Bool = false
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         let (B, L) = (x.dim(0), x.dim(1))
         precondition(
@@ -2827,6 +2845,59 @@ private class Gemma4Attention: Module {
                 .reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw
+        }
+
+        if allowRawAttentionCarrier,
+            lastQueryCache == nil,
+            gemma4QKVNormRopeEnabled,
+            gemma4CanFusedQKVNorm(
+                q: queryRaw, k: kRaw, v: vRaw,
+                qWeight: qNorm.weight, kWeight: kNorm.weight,
+                eps: config.rmsNormEps, keyValueShared: vProj == nil,
+                positionOffsets: capturedOffsets,
+                ropeParameters: qkvRopeParameters),
+            let contiguousCache = layerCache as? CBv2LayerCache
+        {
+            let carrier: CBv2Gemma4RawAttentionCarrier?
+            if isSliding {
+                carrier = .sliding(.init(
+                    rawQueries: queryRaw, rawKeys: kRaw, rawValues: vRaw,
+                    qWeight: qNorm.weight, kWeight: kNorm.weight,
+                    positionOffsets: capturedOffsets,
+                    ropeLog2Base: qkvRopeParameters.log2Base,
+                    ropeInverseFrequencies: qkvRopeParameters.inverseFrequencies))
+            } else if vRaw === kRaw, qkvRopeParameters.usesFrequencies {
+                carrier = .full(.init(
+                    rawQueries: queryRaw, rawKeys: kRaw, rawValues: vRaw,
+                    qWeight: qNorm.weight, kWeight: kNorm.weight,
+                    positionOffsets: capturedOffsets,
+                    ropeFrequencies: qkvRopeParameters.frequencies))
+            } else {
+                carrier = nil
+            }
+            if let carrier,
+                let attention = contiguousCache.updateAndAttendResidentNormRope(
+                    carrier: carrier, scale: scale, sinks: nil)
+            {
+                guard let products =
+                        CBv2RaggedTwoPassDecodeAttentionV1.takeResidentProducts(
+                            for: attention),
+                    let normalizedKeys = products.normalizedKeys,
+                    let normalizedValues = products.normalizedValues
+                else {
+                    preconditionFailure(
+                        "Gemma4 raw attention carrier requires normalized K/V mirrors")
+                }
+                var output = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+                if outputStart > 0 {
+                    output = output[0..., outputStart..., 0...]
+                }
+                CBv2EngageMark.once("raw-attention-carrier")
+                return (
+                    outputProjection(output, carriedRunsum: products.runsumTable),
+                    (normalizedKeys, normalizedValues),
+                    captured)
+            }
         }
 
         var queries: MLXArray
@@ -5652,28 +5723,6 @@ private class Gemma4MLP: Module {
     fileprivate func zipDown(_ activated: MLXArray) -> MLXArray {
         denseProjection(downProj, activated)
     }
-
-    /// Resolve immutable storage outside the trace; every tensor is explicit.
-    fileprivate func zipCompiledGateUpGeluDown(
-        _ x: MLXArray, expertScores: MLXArray
-    ) -> MLXArray? {
-        guard gemma4DenseGateUpJoinEnabled,
-            let storage = fusedGateUpStorage,
-            let gate = gateProj as? QuantizedLinear,
-            let up = upProj as? QuantizedLinear,
-            let down = downProj as? QuantizedLinear,
-            gate.bias == nil, up.bias == nil, down.bias == nil,
-            gate.groupSize == 64, up.groupSize == gate.groupSize,
-            down.groupSize == gate.groupSize,
-            gate.bits == 8, up.bits == gate.bits, down.bits == gate.bits,
-            gate.mode == .affine, up.mode == gate.mode, down.mode == gate.mode,
-            let downBiases = down.biases
-        else { return nil }
-        return CBv2DenseMLPQMVV1.compiledGateUpGeluDown(
-            [x, storage.weight, storage.scales, storage.biases,
-             down.weight, down.scales, downBiases, expertScores],
-            groupSize: gate.groupSize, bits: gate.bits, mode: gate.mode)
-    }
 }
 
 /// ZIP-ROUTER-001 -- interleave the MoE layer's router chain with the
@@ -5753,25 +5802,6 @@ private enum Gemma4ZipRouterV1 {
         let routeTable: SwitchRouteTable?
     }
 
-    /// Preserve the default route-selection tail after the compiled dense pair.
-    private static func selectAfterDense(
-        router: Gemma4Router, expertScores: MLXArray, denseOut: MLXArray
-    ) -> (indices: MLXArray, weights: MLXArray, table: SwitchRouteTable?) {
-        if let fold = Gemma4RouteGlueFoldV1.apply(
-            MLX.depends(input: expertScores, dependencies: [denseOut]),
-            perExpertScale: router.perExpertScale,
-            topK: router.topK, kth: router.kth)
-        {
-            return (fold.indices, fold.weights, fold.table)
-        }
-        let partition = router.zipPartition(
-            MLX.depends(input: expertScores, dependencies: [denseOut]))
-        let indices = router.zipSelected(partition)
-        let weights = router.zipWeights(
-            expertScores: expertScores, topKIndices: indices)
-        return (indices, weights, nil)
-    }
-
     /// PREFIX-001 admission lives beside the ZIP admission so the eager
     /// custom producer is never built unless this exact consumer will use all
     /// of its outputs.
@@ -5839,29 +5869,6 @@ private enum Gemma4ZipRouterV1 {
         // dual pre-norm arrays unreferenced, so MLX never evaluates them and
         // the caller's stock path rebuilds the identical pair.
         let normed = carriedRouterNorm ?? router.zipNorm(out)
-
-        // Default ZIP only. The trace keeps the score dependency BETWEEN the
-        // same two dense kernels; incoming and outgoing fences stay outside it.
-        if plan == 1, gemma4DenseGateUpJoinEnabled,
-            Gemma4FusedLayerGlue.denseXSumElideEnabled,
-            CBv2DenseMLPQMVV1.compiledPairAvailable
-        {
-            let expertScores = router.zipScores(normed)
-            let denseIn = MLX.depends(input: n1, dependencies: [normed])
-            if let denseOut = mlp.zipCompiledGateUpGeluDown(
-                denseIn, expertScores: expertScores)
-            {
-                let selected = selectAfterDense(
-                    router: router, expertScores: expertScores, denseOut: denseOut)
-                Gemma4RouterProbe.recorder?(expertScores, selected.indices)
-                let expertNorm = MLX.depends(input: n2, dependencies: [denseOut])
-                CBv2EngageMark.once("zip-router")
-                return Zipped(
-                    denseOut: denseOut, expertNorm: expertNorm,
-                    topKIndices: selected.indices, topKWeights: selected.weights,
-                    routeTable: selected.table)
-            }
-        }
 
         // Stage 2: router QMV | dense gate + up.
         //
@@ -6084,7 +6091,8 @@ public class Gemma4DecoderLayer: Module {
         isExpertPrefill: Bool = false,
         glueChain: Gemma4GlueChainBox? = nil,
         nextInputLayernormWeight: MLXArray? = nil,
-        enableAttentionBranchPrefix: Bool = false
+        enableAttentionBranchPrefix: Bool = false,
+        allowRawAttentionCarrier: Bool = false
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // Prompt-path narrowing (CBv2 only): attention and every K/V write
         // still cover the full chunk; only the token-local work AFTER
@@ -6138,7 +6146,8 @@ public class Gemma4DecoderLayer: Module {
         let (attnOut, kvPair, attnPositionOffset) = selfAttn(
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
-            useLastQueryPrefill: useLastQueryPrefill, carriedRunsum: carriedRunsum)
+            useLastQueryPrefill: useLastQueryPrefill, carriedRunsum: carriedRunsum,
+            allowRawAttentionCarrier: allowRawAttentionCarrier)
         // PREFIX-001: only build the joined producer when the ZIP consumer is
         // guaranteed to accept it. A nil leaves the established attention
         // residual and branch pre-norm paths untouched.
@@ -7499,7 +7508,12 @@ public class Gemma4TextModelInner: Module {
                 enableAttentionBranchPrefix:
                     isCBv2 && !schedulePrefill
                     && inputBatchSize == 8 && inputLength == 1
-                    && !capturePreNorm && dFlashHiddenCapture == nil
+                    && !capturePreNorm && dFlashHiddenCapture == nil,
+                allowRawAttentionCarrier:
+                    isCBv2 && !schedulePrefill
+                    && inputBatchSize == 8 && inputLength == 1
+                    && captureHook == nil && !capturePreNorm
+                    && dFlashHiddenCapture == nil
             )
             h = out
             reusableIntermediates[idx] = (kvPair, positionOffset)

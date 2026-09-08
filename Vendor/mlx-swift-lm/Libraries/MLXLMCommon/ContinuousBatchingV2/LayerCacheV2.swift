@@ -204,6 +204,25 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         return output
     }
 
+    public func updateAndAttendResidentNormRope(
+        carrier: CBv2Gemma4RawAttentionCarrier,
+        scale: Float, sinks: MLXArray?
+    ) -> MLXArray? {
+        guard kind.sharesKVWithLayer == nil,
+            boundSpanContexts == nil,
+            !mtpSerializesRectangularAttention,
+            let output = CBv2AttentionV1.updateAndAttendResidentNormRope(
+                rows: rows, kind: kind, carrier: carrier,
+                scale: scale, sinks: sinks, softcap: attentionSoftcap,
+                decodeRingWriteFence: decodeRingWriteFence,
+                allowFusedRingWrite: !retainsChunkForBorrowers)
+        else { return nil }
+        if advancesPositionOffsets {
+            positionOffsetsState.value = positionOffsetsState.value + Int32(1)
+        }
+        return output
+    }
+
     /// Final-layer prompt specialization (see LastQueryPrefillV2.swift):
     /// commit the whole chunk's K/V, attend only its newest query row.
     /// Offsets advance by the K/V length, NOT the query length — the chunk

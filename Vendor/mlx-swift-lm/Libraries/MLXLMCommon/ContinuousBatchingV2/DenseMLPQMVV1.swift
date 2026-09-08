@@ -919,6 +919,26 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         ensureRowContiguous: true)
 
     /// Gate/up: K = 2816, G = 44, 22 groups per simdgroup, unrolled by two.
+    /// DMLP-GU-UR4. The gate/up static-K body already runs the group walk as a
+    /// static-trip loop under `unroll_count(2)`. The o-projection run-sum body
+    /// reaches the identical shape -- same `gi < nGroups` trip count, same
+    /// `const uint4 r0/r1` pair opening the body, same eight-accumulator
+    /// register set -- and there the step from the incumbent directive to
+    /// `unroll_count(4)` is the shipped default. This selects the same count
+    /// here. Trip count, loop order, addresses and arithmetic are unchanged in
+    /// both positions; only the unroll directive differs.
+    ///
+    /// `DARKBLOOM_GEMMA4_DMLP_GU_UR4=0` restores the incumbent directive and
+    /// the incumbent kernel names byte for byte.
+    static let gateUpUr4Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DMLP_GU_UR4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    static let gateUpUr4KeySuffix = gateUpUr4Enabled ? "_ur4" : ""
+
     private static let mma8GateUpStaticKHeader: String = {
         var result = mma8KernelHeader
         func replaceOnce(_ old: String, with new: String) {
@@ -955,7 +975,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         replaceOnce(
             "  for (int g = g_begin; g < g_end; ++g) {",
             with: """
-              #pragma clang loop unroll_count(2)
+              #pragma clang loop unroll_count(\(gateUpUr4Enabled ? 4 : 2))
               for (int gi = 0; gi < nGroups; ++gi) {
                 const int g = g0 + gi;
             """)
@@ -1042,7 +1062,8 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }()
 
     private static let mma8GateUpGeluKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_gelu_k2816_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_gelu_k2816_v1"
+            + gateUpUr4KeySuffix,
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -1115,7 +1136,8 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }
 
     private static let mma8GateUpStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_k2816_u2_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_k2816_u2_v1"
+            + gateUpUr4KeySuffix,
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

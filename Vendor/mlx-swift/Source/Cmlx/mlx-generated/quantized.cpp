@@ -1596,7 +1596,8 @@ METAL_FUNC void qmv_impl(
   }
 }
 
-template <typename T, const int group_size, const int bits>
+template <typename T, const int group_size, const int bits,
+          const int static_in_vec_size = 0>
 METAL_FUNC void qmv_affine4_g64_pair_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1625,8 +1626,10 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   thread float result0[results_per_simdgroup] = {0};
   thread float result1[results_per_simdgroup] = {0};
 
-  const int in_vec_size_w = in_vec_size / 2;
-  const int in_vec_size_g = in_vec_size / 64;
+  const int kernel_in_vec_size =
+      static_in_vec_size == 0 ? in_vec_size : static_in_vec_size;
+  const int in_vec_size_w = kernel_in_vec_size / 2;
+  const int in_vec_size_g = kernel_in_vec_size / 64;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
@@ -1639,7 +1642,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   y1 += out_row;
 
   int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
+  for (; k <= kernel_in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
       scale_local[row] = scales[row * in_vec_size_g];
@@ -1665,30 +1668,32 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     x1 += block_size;
   }
 
-  // Every Gemma 4 caller entering this specialized g64 path has K aligned to
-  // 64.  The final block therefore contains an integral number of complete
-  // eight-value lane packets (32 lanes for K=2816, 24 for expert down_proj
-  // K=704); no active lane needs the generic dynamic safe-tail loops.
-  const uint active_tail_lanes =
-      uint((in_vec_size - k) / values_per_thread);
-  if (simd_lid < active_tail_lanes) {
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
-    }
+  // The exact-K router instantiation has no dynamic remainder: its 2816
+  // values are eleven complete 256-value blocks. Keep the established
+  // packet order for the generic pair helper, but let the static instantiation
+  // compile the tail branch away.
+  if (static_in_vec_size == 0) {
+    const uint active_tail_lanes =
+        uint((kernel_in_vec_size - k) / values_per_thread);
+    if (simd_lid < active_tail_lanes) {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+        scale_local[row] = scales[row * in_vec_size_g];
+        bias_local[row] = biases[row * in_vec_size_g];
+      }
 
-    float sum0 =
-        load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
-    float sum1 =
-        load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      float dot0;
-      float dot1;
-      qdot_affine4_pair_word<float, values_per_thread>(
-          packed[row], x0_thread, x1_thread, scale_local[row], bias_local[row], sum0, sum1, dot0, dot1);
-      result0[row] += dot0;
-      result1[row] += dot1;
+      float sum0 =
+          load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+      float sum1 =
+          load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        float dot0;
+        float dot1;
+        qdot_affine4_pair_word<float, values_per_thread>(
+            packed[row], x0_thread, x1_thread, scale_local[row], bias_local[row], sum0, sum1, dot0, dot1);
+        result0[row] += dot0;
+        result1[row] += dot1;
+      }
     }
   }
 
@@ -3245,25 +3250,40 @@ template <typename T, const int group_size, const int bits, bool batched>
           simd_lid);
       return;
     }
-    // Claim adjacent rows in four active x-groups and let the remaining host
-    // groups return. The established pair helper shares each packed-weight
-    // load while preserving each row's qdot, K-loop, and simd_sum order.
-    const int first_m = int(tid.x) * 2;
-    if (first_m >= 8) {
-      return;
+    // ROUTER-K2816-STATIC: the B=8 router plane is the one ordinary decode
+    // QMV with the exact K/N pair (2816, 128). The static helper removes the
+    // runtime K walk and its dead remainder test without changing a qdot,
+    // reduction, or output conversion. KILL SWITCH: set this constexpr to
+    // false to compile back to the established pair helper.
+    constexpr bool kGemma4RouterStaticK = true;
+    if (kGemma4RouterStaticK && in_vec_size == 2816 &&
+        out_vec_size == 128) {
+      qmv_affine4_g64_pair_impl<T, 64, 4, 2816>(
+          w,
+          scales,
+          biases,
+          x + first_m * in_vec_size,
+          x + (first_m + 1) * in_vec_size,
+          y + first_m * out_vec_size,
+          y + (first_m + 1) * out_vec_size,
+          in_vec_size,
+          tid,
+          simd_gid,
+          simd_lid);
+    } else {
+      qmv_affine4_g64_pair_impl<T, 64, 4>(
+          w,
+          scales,
+          biases,
+          x + first_m * in_vec_size,
+          x + (first_m + 1) * in_vec_size,
+          y + first_m * out_vec_size,
+          y + (first_m + 1) * out_vec_size,
+          in_vec_size,
+          tid,
+          simd_gid,
+          simd_lid);
     }
-    qmv_affine4_g64_pair_impl<T, 64, 4>(
-        w,
-        scales,
-        biases,
-        x + first_m * in_vec_size,
-        x + (first_m + 1) * in_vec_size,
-        y + first_m * out_vec_size,
-        y + (first_m + 1) * out_vec_size,
-        in_vec_size,
-        tid,
-        simd_gid,
-        simd_lid);
     return;
   }
   if (!batched && group_size == 64 && bits == 8 && ntg.x == 8 &&

@@ -3635,9 +3635,9 @@ private enum Gemma4RouterFinalistsWeightsV1 {
 /// expert, then reads the original selected score for the unchanged weight
 /// arithmetic. The staged `sel` array holds the selected expert IDs, and the
 /// rank-scatter phase retains stable assignment order for equal IDs. The
-/// prefix-bounds variant counts equal keys during those same 64 broadcasts and
-/// emits the existing tagged expert/run word. It changes no row or inverse
-/// order and adds no route-table dispatch.
+/// native-max path obtains stable ranks and expert-run bounds from seven
+/// key bit planes; the sorting-network fallback retains its 64 broadcasts.
+/// Both emit the existing row order, inverse order, and tagged expert/run word.
 ///
 /// Any geometry outside the pinned decode cell, a disabled finalists stage,
 /// or a disabled fold returns nil so the caller retains its existing fallback.
@@ -3704,10 +3704,10 @@ private enum Gemma4RouteGlueFoldV1 {
     /// pipeline-cache entries from ever aliasing.
     private static let kernelName = switchRouteGluePrefixBoundsEnabled
         ? (orderKeysEnabled
-            ? "gemma4_route_monolithic_top8_e128_k8_bf16_max8_sg1_prefix_v1"
+            ? "gemma4_route_monolithic_top8_e128_k8_bf16_max8_sg1_prefix_bp_bounds1"
             : "gemma4_route_monolithic_top8_e128_k8_bf16_prefix_v1")
         : (orderKeysEnabled
-            ? "gemma4_route_monolithic_top8_e128_k8_bf16_max8_sg1_v1"
+            ? "gemma4_route_monolithic_top8_e128_k8_bf16_max8_sg1_bp_bounds1"
             : "gemma4_route_monolithic_top8_e128_k8_bf16_v2")
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
@@ -3761,29 +3761,32 @@ private enum Gemma4RouteGlueFoldV1 {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // Phase 2 -- the incumbent simd-rank scatter, verbatim, over the
-            // staged 64 keys. Threads 0..63 are exactly the two complete
-            // SIMD groups the standalone kernel launched; `assignment` and
-            // `lane` reproduce its coordinates.
+            // Phase 2 -- stable ranks and expert-run bounds share the same
+            // equality masks over the seven expert-ID bit planes. Both
+            // participating SIMD groups are complete under tid < 64.
             if (tid < 64u) {
                 const uint assignment = tid;
                 const uint key = sel[assignment];
                 const uint key_low = sel[lane];
                 const uint key_high = sel[32u + lane];
-                uint rank = 0;
-        \(routePrefixStateSource)
+                uint2 equal = uint2(0xffffffffu);
+                uint2 less = uint2(0u);
                 #pragma clang loop unroll(full)
-                for (uint source = 0; source < 32; ++source) {
-                    const uint other_low = simd_broadcast(key_low, ushort(source));
-                    rank += (other_low < key)
-                        || (other_low == key && source < assignment);
-        \(routePrefixLowSource)
-                    const uint other_high = simd_broadcast(key_high, ushort(source));
-                    const uint high_assignment = 32u + source;
-                    rank += (other_high < key)
-                        || (other_high == key && high_assignment < assignment);
-        \(routePrefixHighSource)
+                for (int bit = 6; bit >= 0; --bit) {
+                    const uint2 plane = uint2(
+                        uint((simd_vote::vote_t)simd_ballot(((key_low >> bit) & 1u) != 0u)),
+                        uint((simd_vote::vote_t)simd_ballot(((key_high >> bit) & 1u) != 0u)));
+                    const uint own = 0u - ((key >> bit) & 1u);
+                    less |= equal & ~plane & own;
+                    equal &= ~(plane ^ own);
                 }
+                const uint prefix = (1u << lane) - 1u;
+                const uint2 before = assignment < 32u
+                    ? uint2(prefix, 0u) : uint2(0xffffffffu, prefix);
+                const uint2 earlier_equal = equal & before;
+                const uint run_offset = popcount(earlier_equal.x) + popcount(earlier_equal.y);
+                const uint run_length = popcount(equal.x) + popcount(equal.y);
+                const uint rank = popcount(less.x) + popcount(less.y) + run_offset;
                 row_order[rank] = assignment / 8;
         \(routeSortedKeySource)
                 inverse_order[assignment] = rank;

@@ -704,6 +704,29 @@ enum CBv2PrefillSoftmaxVecV1 {
         return max(1, min(640 / threadgroupSize, 1024 / threadgroupSize))
     }
 
+    // These values are immutable launch metadata. Keeping the common key
+    // lengths resident avoids rebuilding and evaluating the two-word params
+    // carrier for every prefill rectangle.
+    nonisolated(unsafe) private static let precomputedParams: [Int: MLXArray] = {
+        var table: [Int: MLXArray] = [:]
+        for axis in [128, 256, 384, 512, 640, 768, 896, 1024] {
+            let tg = ((axis + 3) / 4 + 31) / 32 * 32
+            let numSimdgroups = tg / 32
+            let arr = MLXArray([UInt32(axis), UInt32(numSimdgroups)])
+            eval(arr)
+            table[axis] = arr
+        }
+        return table
+    }()
+
+    @inline(__always)
+    fileprivate static func getParams(axisSize: Int, numSimdgroups: Int) -> MLXArray {
+        if let hit = precomputedParams[axisSize] {
+            return hit
+        }
+        return MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+    }
+
     /// Runs the vectorized softmax, or returns nil to keep the caller on
     /// the stock `MLX.softmax(scores, axis: -1, precise: true)` call.
     /// `scores` may be any contiguous rank; it is treated as a flat
@@ -721,7 +744,7 @@ enum CBv2PrefillSoftmaxVecV1 {
         let threadgroupSize = ((axisSize + 3) / 4 + 31) / 32 * 32
         guard threadgroupSize > 0, threadgroupSize <= 1024 else { return nil }
         let numSimdgroups = threadgroupSize / 32
-        let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        let paramsArray = getParams(axisSize: axisSize, numSimdgroups: numSimdgroups)
 
         // PROMPT-GLUE2 (pg2): prompt-width score rectangles take the
         // rows-per-threadgroup twin; the incumbent computes the identical
@@ -908,7 +931,8 @@ enum CBv2PrefillAttnTrafficV1 {
         let rows = CBv2PrefillSoftmaxVecV1.rowsPerThreadgroup(
             axisSize: axisSize, threadgroupSize: threadgroupSize)
         guard rows >= 1, rows * threadgroupSize <= 1024 else { return nil }
-        let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        let paramsArray = CBv2PrefillSoftmaxVecV1.getParams(
+            axisSize: axisSize, numSimdgroups: numSimdgroups)
         var statsShape = scores.shape
         statsShape[statsShape.count - 1] = 4
 

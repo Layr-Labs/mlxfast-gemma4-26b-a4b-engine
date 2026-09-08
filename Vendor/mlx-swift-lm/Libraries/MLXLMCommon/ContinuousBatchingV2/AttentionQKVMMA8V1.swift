@@ -768,6 +768,43 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
+    // QKV-STATIC-N-002. The fused rsp bodies use N only for their store
+    // epilogue. Freeze both the Q/K split and the total width for the two
+    // admitted fused geometries; the fallback kernels remain unchanged.
+    private static let fusedSlidingRspStaticNKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_staticn_v1",
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y", "y2"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816, 4096, 6144>(
+                w, scales, biases, x, rs_table, y,
+                6144, int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup, y2);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    private static let fusedFullRspStaticNKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_staticn_v1",
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y", "y2"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816, 8192, 9216>(
+                w, scales, biases, x, rs_table, y,
+                9216, int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup, y2);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
     private static let mma8Kernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_bfill_v4",
         inputNames: ["x", "w", "scales", "biases"],
@@ -1005,10 +1042,22 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             && rsTable!.dtype == .float32
             && rsTable!.shape == [batch, inputWidth / Self.groupSize]
 
-        let kernel =
+        let promotedKernel =
             qWidth == 4096
             ? (tableReady ? fusedSlidingRspKernel : fusedSlidingKernel)
             : (tableReady ? fusedFullRspKernel : fusedFullKernel)
+        let kernel = {
+            guard tableReady else { return promotedKernel }
+            if qWidth == 4096, kWidth == 2048 {
+                CBv2EngageMark.once("qkv-static-n-qk6144")
+                return fusedSlidingRspStaticNKernel
+            }
+            if qWidth == 8192, kWidth == 1024 {
+                CBv2EngageMark.once("qkv-static-n-qk9216")
+                return fusedFullRspStaticNKernel
+            }
+            return promotedKernel
+        }()
         let total = qWidth + kWidth
         let yTiles = total / outputsPerGroup
         guard yTiles % tilesPerGroup == 0 else { return nil }

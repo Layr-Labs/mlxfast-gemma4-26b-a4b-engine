@@ -25,9 +25,32 @@ public enum Gemma4DecodeFusedGUV1 {
         return Int(raw).map { min(max($0, 1), 4) } ?? 2
     }()
 
+    /// SB-INTERLEAVE, gate/up half. Same relayout as the down plane: the
+    /// affine pair for a group becomes one 4-byte access on one cache line
+    /// instead of two 2-byte accesses on two arrays. Built once from the
+    /// immutable checkpoint and cached on the storage's own scales array, so
+    /// it is input-independent and no arithmetic changes.
+    private static let sbLock = NSLock()
+    nonisolated(unsafe) private static var sbPlanes:
+        [ObjectIdentifier: MLXArray] = [:]
+
+    static func scaleBias(for storage: SwitchGateUpFusedStorage) -> MLXArray {
+        let key = ObjectIdentifier(storage.scales)
+        sbLock.lock()
+        defer { sbLock.unlock() }
+        if let cached = sbPlanes[key] { return cached }
+        let pairs = MLX.stacked([storage.scales, storage.biases], axis: -1)
+        let flat = pairs.reshaped(
+            Array(storage.scales.shape.dropLast())
+                + [2 * storage.scales.dim(-1)])
+        eval(flat)
+        sbPlanes[key] = flat
+        return flat
+    }
+
     static func call(x: MLXArray, storage: SwitchGateUpFusedStorage,
         lhs: MLXArray, rhs: MLXArray, taggedRoute: Bool = false) -> MLXArray {
-        call([storage.weight, storage.scales, storage.biases, x, lhs, rhs],
+        call([storage.weight, scaleBias(for: storage), storage.biases, x, lhs, rhs],
             taggedRoute: taggedRoute)
     }
 
@@ -68,7 +91,7 @@ uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
     threadgroup bfloat tile[4*8*guPairs];
     threadgroup bfloat* scratch=tile+(localSg==1 ? 4*guPairs:0)+localColumn-localSg*4;
     uint3 mathTid=tid;mathTid.y=0;
-    tg_execute_projection<bfloat>(w+(expertBase+packedRow)*352,scales+(expertBase+packedRow)*44,biases+(expertBase+packedRow)*44,
+    tg_execute_projection<bfloat>(w+(expertBase+packedRow)*352,scales+(expertBase+packedRow)*88,biases+(expertBase+packedRow)*44,
         x,lhs,scratch,8*guPairs,guSliceN,assignment,run.count,mathTid,localSg,lane);
     // BF16 closes remain explicit; only the scratch address space changes.
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -591,8 +614,7 @@ METAL_FUNC void tg_qmv_impl(
   if (out_vec_size < (num_simdgroups * results_per_simdgroup)) {
     ws +=
         out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
-    scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-    biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+    scales += 2 * (out_row * in_vec_size_g + simd_lid / scale_step_per_thread);
     x += tid.x * in_vec_size + simd_lid * values_per_thread;
     y += tid.x * out_vec_size + out_row;
 
@@ -604,8 +626,8 @@ METAL_FUNC void tg_qmv_impl(
            row < results_per_simdgroup && out_row + row < out_vec_size;
            row++) {
         auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-        const device T* sl = scales + row * in_vec_size_g;
-        const device T* bl = biases + row * in_vec_size_g;
+        const device T* sl = scales + row * 2 * in_vec_size_g;
+        const device T* bl = sl + 1;
 
         U s = sl[0];
         U b = bl[0];
@@ -614,8 +636,7 @@ METAL_FUNC void tg_qmv_impl(
       }
 
       ws += block_size * bytes_per_pack / pack_factor;
-      scales += block_size / group_size;
-      biases += block_size / group_size;
+      scales += 2 * (block_size / group_size);
       x += block_size;
     }
     const int remaining = clamp(
@@ -630,8 +651,8 @@ METAL_FUNC void tg_qmv_impl(
            row < results_per_simdgroup && out_row + row < out_vec_size;
            row++) {
         auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-        const device T* sl = scales + row * in_vec_size_g;
-        const device T* bl = biases + row * in_vec_size_g;
+        const device T* sl = scales + row * 2 * in_vec_size_g;
+        const device T* bl = sl + 1;
 
         U s = sl[0];
         U b = bl[0];
@@ -654,8 +675,7 @@ METAL_FUNC void tg_qmv_impl(
   else {
     ws += used_out_row * in_vec_size_w +
         simd_lid * packs_per_thread * bytes_per_pack;
-    scales += used_out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-    biases += used_out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+    scales += 2 * (used_out_row * in_vec_size_g + simd_lid / scale_step_per_thread);
     x += tid.x * in_vec_size + simd_lid * values_per_thread;
     y += tid.x * out_vec_size + used_out_row;
 
@@ -665,8 +685,8 @@ METAL_FUNC void tg_qmv_impl(
 
       for (int row = 0; row < results_per_simdgroup; row++) {
         auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-        const device T* sl = scales + row * in_vec_size_g;
-        const device T* bl = biases + row * in_vec_size_g;
+        const device T* sl = scales + row * 2 * in_vec_size_g;
+        const device T* bl = sl + 1;
 
         U s = sl[0];
         U b = bl[0];
@@ -675,8 +695,7 @@ METAL_FUNC void tg_qmv_impl(
       }
 
       ws += block_size * bytes_per_pack / pack_factor;
-      scales += block_size / group_size;
-      biases += block_size / group_size;
+      scales += 2 * (block_size / group_size);
       x += block_size;
     }
     const int tail_values = static_cast<int>(in_vec_size - k);
@@ -695,8 +714,8 @@ METAL_FUNC void tg_qmv_impl(
 
           for (int row = 0; row < results_per_simdgroup; row++) {
             auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-            const device T* sl = scales + row * in_vec_size_g;
-            const device T* bl = biases + row * in_vec_size_g;
+            const device T* sl = scales + row * 2 * in_vec_size_g;
+            const device T* bl = sl + 1;
 
             U s = sl[0];
             U b = bl[0];
@@ -715,8 +734,8 @@ METAL_FUNC void tg_qmv_impl(
 
           for (int row = 0; row < results_per_simdgroup; row++) {
             auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-            const device T* sl = scales + row * in_vec_size_g;
-            const device T* bl = biases + row * in_vec_size_g;
+            const device T* sl = scales + row * 2 * in_vec_size_g;
+            const device T* bl = sl + 1;
 
             U s = sl[0];
             U b = bl[0];
@@ -770,8 +789,7 @@ METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
       simd_gid * results_per_simdgroup;
 
   ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
-  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  scales += 2 * (out_row * in_vec_size_g + simd_lid / scale_step_per_thread);
   x0 += simd_lid * values_per_thread;
   x1 += simd_lid * values_per_thread;
   y0 += out_row;
@@ -781,8 +799,8 @@ METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+      scale_local[row] = scales[row * 2 * in_vec_size_g];
+      bias_local[row] = scales[row * 2 * in_vec_size_g + 1];
     }
 
     float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
@@ -798,8 +816,7 @@ METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
     }
 
     ws += block_size / 2;
-    scales += block_size / 64;
-    biases += block_size / 64;
+    scales += 2 * (block_size / 64);
     x0 += block_size;
     x1 += block_size;
   }
@@ -813,8 +830,8 @@ METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
   if (simd_lid < active_tail_lanes) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+      scale_local[row] = scales[row * 2 * in_vec_size_g];
+      bias_local[row] = scales[row * 2 * in_vec_size_g + 1];
     }
 
     float sum0 =
@@ -872,8 +889,7 @@ METAL_FUNC void tg_qmv_affine4_g64_solo_impl(
       simd_gid * results_per_simdgroup;
 
   ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
-  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  scales += 2 * (out_row * in_vec_size_g + simd_lid / scale_step_per_thread);
   x0 += simd_lid * values_per_thread;
   y0 += out_row;
 
@@ -881,8 +897,8 @@ METAL_FUNC void tg_qmv_affine4_g64_solo_impl(
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+      scale_local[row] = scales[row * 2 * in_vec_size_g];
+      bias_local[row] = scales[row * 2 * in_vec_size_g + 1];
     }
 
     float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
@@ -893,8 +909,7 @@ METAL_FUNC void tg_qmv_affine4_g64_solo_impl(
     }
 
     ws += block_size / 2;
-    scales += block_size / 64;
-    biases += block_size / 64;
+    scales += 2 * (block_size / 64);
     x0 += block_size;
   }
 
@@ -906,8 +921,8 @@ METAL_FUNC void tg_qmv_affine4_g64_solo_impl(
   if (simd_lid < active_tail_lanes) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+      scale_local[row] = scales[row * 2 * in_vec_size_g];
+      bias_local[row] = scales[row * 2 * in_vec_size_g + 1];
     }
 
     float sum0 =
@@ -964,8 +979,7 @@ METAL_FUNC void tg_qmv_affine4_g64_triple_stream_impl(
       simd_gid * results_per_simdgroup;
 
   ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
-  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  scales += 2 * (out_row * in_vec_size_g + simd_lid / scale_step_per_thread);
   x0 += simd_lid * values_per_thread;
   x1 += simd_lid * values_per_thread;
   x2 += simd_lid * values_per_thread;
@@ -978,8 +992,8 @@ METAL_FUNC void tg_qmv_affine4_g64_triple_stream_impl(
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] =
           *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+      scale_local[row] = scales[row * 2 * in_vec_size_g];
+      bias_local[row] = scales[row * 2 * in_vec_size_g + 1];
     }
 
     float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
@@ -999,8 +1013,7 @@ METAL_FUNC void tg_qmv_affine4_g64_triple_stream_impl(
     }
 
     ws += block_size / 2;
-    scales += block_size / 64;
-    biases += block_size / 64;
+    scales += 2 * (block_size / 64);
     x0 += block_size;
     x1 += block_size;
     x2 += block_size;
@@ -1014,8 +1027,8 @@ METAL_FUNC void tg_qmv_affine4_g64_triple_stream_impl(
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] =
           *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+      scale_local[row] = scales[row * 2 * in_vec_size_g];
+      bias_local[row] = scales[row * 2 * in_vec_size_g + 1];
     }
 
     float sum =
@@ -1093,8 +1106,7 @@ METAL_FUNC void tg_qmv_affine4_g64_quad_stream_impl(
       simd_gid * results_per_simdgroup;
 
   ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
-  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  scales += 2 * (out_row * in_vec_size_g + simd_lid / scale_step_per_thread);
   x0 += simd_lid * values_per_thread;
   x1 += simd_lid * values_per_thread;
   x2 += simd_lid * values_per_thread;
@@ -1109,8 +1121,8 @@ METAL_FUNC void tg_qmv_affine4_g64_quad_stream_impl(
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] =
           *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+      scale_local[row] = scales[row * 2 * in_vec_size_g];
+      bias_local[row] = scales[row * 2 * in_vec_size_g + 1];
     }
 
     float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
@@ -1135,8 +1147,7 @@ METAL_FUNC void tg_qmv_affine4_g64_quad_stream_impl(
     }
 
     ws += block_size / 2;
-    scales += block_size / 64;
-    biases += block_size / 64;
+    scales += 2 * (block_size / 64);
     x0 += block_size;
     x1 += block_size;
     x2 += block_size;
@@ -1151,8 +1162,8 @@ METAL_FUNC void tg_qmv_affine4_g64_quad_stream_impl(
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] =
           *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+      scale_local[row] = scales[row * 2 * in_vec_size_g];
+      bias_local[row] = scales[row * 2 * in_vec_size_g + 1];
     }
 
     float sum =

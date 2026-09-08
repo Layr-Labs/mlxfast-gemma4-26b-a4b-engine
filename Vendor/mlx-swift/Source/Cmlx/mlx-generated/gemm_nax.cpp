@@ -1384,8 +1384,9 @@ template <
 #define DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY 1
 #endif
 
-    typename AccumType = float>
-auto gemm_loop(
+    typename AccumType = float,
+    bool kSkipCausalMaskedTiles = false>
+auto gemm_loop_with_causal_skip(
     const device T* A,
     const device T* B,
     int lda,
@@ -1393,7 +1394,8 @@ auto gemm_loop(
     int K,
     int gemm_k_iterations_aligned,
     const short sgp_sm,
-    const short sgp_sn) {
+    const short sgp_sn,
+    const bool skip_causal_tile) {
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;
   constexpr short TK = SK / 16;
@@ -1415,6 +1417,11 @@ auto gemm_loop(
   STEEL_PRAGMA_NO_UNROLL
   for (int kk0 = 0; kk0 < gemm_k_iterations_; kk0++) {
     threadgroup_barrier(mem_flags::mem_none);
+    // These loads feed private register tiles; all groups keep the barrier.
+    if constexpr (kSkipCausalMaskedTiles) {
+      if (skip_causal_tile)
+        continue;
+    }
     if constexpr (
         (DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY != 0) &&
         (!kAlignedM || !kAlignedN)) {
@@ -1476,7 +1483,9 @@ auto gemm_loop(
         return Dtile;
     }
 
-    const short rem_bk = K - gemm_k_iterations_ * BK;
+    const short rem_bk = (kSkipCausalMaskedTiles && skip_causal_tile)
+        ? 0
+        : K - gemm_k_iterations_ * BK;
 
     STEEL_PRAGMA_NO_UNROLL
     for (int kk1 = 0; kk1 < rem_bk; kk1 += SK) {
@@ -1507,6 +1516,42 @@ auto gemm_loop(
   }
 
   return Dtile;
+}
+
+template <
+    typename T,
+    short SM,
+    short SN,
+    short SK,
+    short BK,
+    bool transpose_a,
+    bool transpose_b,
+    bool kAlignedM,
+    bool kAlignedN,
+    bool kAlignedK,
+    typename AccumType = float>
+auto gemm_loop(
+    const device T* A,
+    const device T* B,
+    int lda,
+    int ldb,
+    int K,
+    int gemm_k_iterations_aligned,
+    const short sgp_sm,
+    const short sgp_sn) {
+  return gemm_loop_with_causal_skip<
+      T,
+      SM,
+      SN,
+      SK,
+      BK,
+      transpose_a,
+      transpose_b,
+      kAlignedM,
+      kAlignedN,
+      kAlignedK,
+      AccumType>(
+      A, B, lda, ldb, K, gemm_k_iterations_aligned, sgp_sm, sgp_sn, false);
 }
 
 // PREFILL-ATTN-TRAFFIC (at1): apply the prompt softmax's per-element
@@ -1557,7 +1602,7 @@ METAL_FUNC void softmax_transform_atile(
 // before the tensor op consumes it. The row statistics sit at
 // sm_stats + row * 4 (bf16 words carrying the fp32 bit patterns) relative to
 // this simdgroup's first row; this lane's rows are mm * 16 + sc.y + i * 8.
-// Non-transposed A only. gemm_loop itself is untouched.
+// Non-transposed A only.
 template <
     typename T,
     short SM,

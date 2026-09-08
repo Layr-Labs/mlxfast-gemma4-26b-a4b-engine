@@ -251,6 +251,12 @@ template <
   constexpr short SN = BN / WN;
   constexpr short SK = 32;
 
+  constexpr bool kCausalTileSkipEligible =
+      kCausalBiasSynthEligible && metal::is_same_v<AccumType, float> &&
+      BN == 128 && WN == 4 &&
+      ((BM == 64 && WM == 2 && BK == 256) ||
+       (BM == 128 && WM == 4 && BK == 512));
+
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;
 
@@ -292,6 +298,26 @@ template <
   dispatch_bool(align_K, [&](auto kAlignedK) {
     dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
       dispatch_bool(align_N || !is_unaligned_sn, [&](auto kAlignedN) {
+        bool causal_bias_synth = false;
+        if constexpr (kCausalBiasSynthEligible) {
+          if (use_out_source) {
+            causal_bias_synth = !do_axpby && kAlignedM.value && kAlignedN.value &&
+                addmm_params->fdc == 1 &&
+                addmm_params->ldc == params->N + 1 &&
+                params->M <= params->N && c_bstride_zero;
+          }
+        }
+        // Finite model scores round to 0xFF7F after the mask addend; a
+        // cleared dead tile keeps that same score word through the epilogue.
+        bool skip_causal_tile = false;
+        if constexpr (kCausalTileSkipEligible) {
+          const int global_row_start = c_row + tm;
+          const int global_col_start = c_col + tn;
+          skip_causal_tile = causal_bias_synth && params->M == 128 &&
+              (params->K == 256 || params->K == 512) &&
+              global_col_start >
+                  (params->N - params->M) + global_row_start + SM - 1;
+        }
         bool loop_done = false;
         if constexpr (kSoftmaxLoaderEligible) {
           if (softmax_loader) {
@@ -321,7 +347,7 @@ template <
           }
         }
         if (!loop_done) {
-          Dtile = gemm_loop<
+          Dtile = gemm_loop_with_causal_skip<
               T,
               SM,
               SN,
@@ -332,7 +358,8 @@ template <
               kAlignedM.value,
               kAlignedN.value,
               kAlignedK.value,
-              AccumType>(
+              AccumType,
+              kCausalTileSkipEligible>(
               A,
               B,
               params->lda,
@@ -340,7 +367,8 @@ template <
               params->K,
               params->gemm_k_iterations_aligned,
               sgp_sm,
-              sgp_sn);
+              sgp_sn,
+              skip_causal_tile);
         }
         if ((DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY == 0) ||
             ((kAlignedM.value || sgp_sm > 0) &&
@@ -350,10 +378,7 @@ template <
           if (use_out_source && !softmax_loader) {
             bool synthesized = false;
             if constexpr (kCausalBiasSynthEligible) {
-              if (!do_axpby && kAlignedM.value && kAlignedN.value &&
-                  addmm_params->fdc == 1 &&
-                  addmm_params->ldc == params->N + 1 &&
-                  params->M <= params->N && c_bstride_zero) {
+              if (causal_bias_synth) {
                 // CAUSAL-CLOAD: signature and exactness argument in
                 // steel_gemm_fused.h; the synthesized addend is bit-identical
                 // to the loaded one on every element.

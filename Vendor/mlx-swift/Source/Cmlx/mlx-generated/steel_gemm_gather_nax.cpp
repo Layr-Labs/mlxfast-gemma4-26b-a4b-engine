@@ -123,7 +123,15 @@ gather_mm_rhs_nax(
               params->K,
               params->gemm_k_iterations_aligned,
               sgp_sm,
-              sgp_sn);
+              sgp_sn
+#if DARKBLOOM_GEMMA4_NAX_LOOP_UNIFY
+              // gemm_loop is reached here through a function-pointer binding,
+              // which does not carry the default argument. No statistics
+              // operand: this kernel takes the plain load, as before.
+              ,
+              nullptr
+#endif
+          );
 
           if constexpr (kAlignedN.value) {
             if (offset_next - offset == SM) {

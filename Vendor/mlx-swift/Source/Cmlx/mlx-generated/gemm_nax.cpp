@@ -1332,6 +1332,39 @@ inline T gemma4_dense_geglu_compiled_tape(T gate, T up) {
 
 namespace mlx::steel {
 
+// DARKBLOOM GEMMA4 NAX LOOP UNIFY.
+// The accelerated steel GEMM carried TWO complete K-loop function templates --
+// gemm_loop and gemm_loop_softmax -- differing only in whether the prompt
+// softmax expression is applied to the A fragments after they are loaded. The
+// choice between them is a runtime predicate on constant-buffer values, so a
+// single nn/axpby pipeline instantiated both bodies in full and executed at
+// most one. With the unify on there is one body: the transform is predicated
+// at the A-load site, which is where the non-accelerated twin has always taken
+// the same decision (steel_gemm_fused.h). Loads, K order, tensor ops, the
+// accumulator and the store are untouched, and the transform is applied to
+// exactly the elements, with exactly the limits, it was applied to before, so
+// every stored element is bit-identical.
+// The transform is admitted only on the layout the incumbent admitted it on
+// (non-transposed A, non-transposed B, bfloat16), which is a compile-time
+// property, so every other pipeline compiles to the incumbent body unchanged.
+// Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_LOOP_UNIFY=0 to restore the
+// two separate templates and the two call sites.
+#ifndef DARKBLOOM_GEMMA4_NAX_LOOP_UNIFY
+#define DARKBLOOM_GEMMA4_NAX_LOOP_UNIFY 1
+#endif
+
+#if DARKBLOOM_GEMMA4_NAX_LOOP_UNIFY
+template <typename T, short RA, short CA>
+METAL_FUNC void softmax_transform_atile(
+    thread NAXTile<T, RA, CA>& Atile,
+    const thread float* rmax,
+    const thread float* rinv,
+    const short2 sc,
+    const short row_limit,
+    const short col_limit);
+#endif
+
+
 // DARKBLOOM GEMMA4 NAX VOLATILE-FENCE ELIDE.
 // Every K-step loop body in the accelerated GEMM family declares an
 // uninitialised volatile int that is never written and is read once through
@@ -1393,7 +1426,12 @@ auto gemm_loop(
     int K,
     int gemm_k_iterations_aligned,
     const short sgp_sm,
-    const short sgp_sn) {
+    const short sgp_sn
+#if DARKBLOOM_GEMMA4_NAX_LOOP_UNIFY
+    ,
+    const device T* sm_stats = nullptr
+#endif
+) {
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;
   constexpr short TK = SK / 16;
@@ -1409,6 +1447,40 @@ auto gemm_loop(
 
   const bool has_output = sgp_sm > 0 && sgp_sn > 0;
   (void)has_output;
+
+#if DARKBLOOM_GEMMA4_NAX_LOOP_UNIFY
+  // at1 row statistics, read once per simdgroup exactly as the separate
+  // template read them. kSmEligible is the incumbent admission layout, so a
+  // pipeline that could never have taken the softmax body carries none of this.
+  constexpr bool kSmEligible =
+      !transpose_a && !transpose_b && metal::is_same_v<T, bfloat16_t>;
+  constexpr short kSmRows =
+      kSmEligible ? short(TM * BaseNAXFrag::kElemRows) : short(1);
+  float sm_rmax[kSmRows];
+  float sm_rinv[kSmRows];
+  short2 sm_sc = short2(0, 0);
+  bool do_sm = false;
+  if constexpr (kSmEligible) {
+    do_sm = (sm_stats != nullptr);
+    sm_sc = BaseNAXFrag::get_coord();
+    if (do_sm) {
+      STEEL_PRAGMA_UNROLL
+      for (short mm = 0; mm < TM; mm++) {
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < BaseNAXFrag::kElemRows; i++) {
+          const short row = mm * BaseNAXFrag::kFragRows + sm_sc.y +
+              i * BaseNAXFrag::kElemRowsJump;
+          const short r =
+              metal::max(short(0), metal::min(row, short(sgp_sm - 1)));
+          const uint2 w =
+              *reinterpret_cast<const device uint2*>(sm_stats + r * 4);
+          sm_rmax[mm * BaseNAXFrag::kElemRows + i] = as_type<float>(w.x);
+          sm_rinv[mm * BaseNAXFrag::kElemRows + i] = as_type<float>(w.y);
+        }
+      }
+    }
+  }
+#endif
 
   int gemm_k_iterations_ = gemm_k_iterations_aligned;
 
@@ -1442,6 +1514,19 @@ auto gemm_loop(
       } else {
         Atile.load_safe(A + A_offset, lda, short2(sgp_sm, SK));
       }
+#if DARKBLOOM_GEMMA4_NAX_LOOP_UNIFY
+      if constexpr (kSmEligible) {
+        if (do_sm) {
+          softmax_transform_atile(
+              Atile,
+              sm_rmax,
+              sm_rinv,
+              sm_sc,
+              kAlignedM ? short(SM) : sgp_sm,
+              short(SK));
+        }
+      }
+#endif
 
       if constexpr (kAlignedN) {
         Btile.load(B + B_offset, ldb);
@@ -1495,6 +1580,13 @@ auto gemm_loop(
       const int B_offset = transpose_b ? k : k * ldb;
 
       Atile.load_safe(A + A_offset, lda, Aklims);
+#if DARKBLOOM_GEMMA4_NAX_LOOP_UNIFY
+      if constexpr (kSmEligible) {
+        if (do_sm) {
+          softmax_transform_atile(Atile, sm_rmax, sm_rinv, sm_sc, sgp_sm, psk);
+        }
+      }
+#endif
       Btile.load_safe(B + B_offset, ldb, Bklims);
 
       tile_matmad_nax(

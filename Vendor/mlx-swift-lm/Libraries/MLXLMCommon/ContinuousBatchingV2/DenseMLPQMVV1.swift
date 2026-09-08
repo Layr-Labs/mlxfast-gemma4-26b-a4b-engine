@@ -1161,6 +1161,18 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         )[0]
     }
 
+    /// Trace launches for a compiled ZIP cell that also owns route-select.
+    /// Admission stays in the public wrapper; these are the same grids the
+    /// guarded pair already emits.
+    public static func compiledTraceGateUpGelu(_ inputs: [MLXArray]) -> MLXArray {
+        gateUpGeluCall(inputs)
+    }
+
+    public static func compiledTraceDownStaticKN(_ inputs: [MLXArray]) -> MLXArray {
+        downStaticKNCall(inputs)
+    }
+
+
     /// Gate/up + GeGLU in one dispatch: `[batch, sequence, 2112]` activated.
     public static func gateUpGelu(
         x: MLXArray,

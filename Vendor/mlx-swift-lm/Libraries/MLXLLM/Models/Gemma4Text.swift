@@ -3964,6 +3964,28 @@ private enum Gemma4RouteGlueFoldV1 {
                 inverseOrder: outs[4],
                 hasExpertPrefixBounds: switchRouteGluePrefixBoundsEnabled))
     }
+
+    /// Same launch as `apply`, without admission. Used only inside a compiled
+    /// ZIP identity that already proved the decode cell.
+    static func compiledTrace(_ scores: MLXArray, pes: MLXArray) -> [MLXArray] {
+        kernel(
+            [scores, pes],
+            grid: (orderKeysEnabled ? 256 : 1024, 1, 1),
+            threadGroup: (orderKeysEnabled ? 256 : 1024, 1, 1),
+            outputShapes: [[8, 1, 8], [8, 1, 8], [64], [64], [64]],
+            outputDTypes: [.uint32, .bfloat16, .uint32, .uint32, .uint32]
+        )
+    }
+
+    static func markEngaged() {
+        CBv2EngageMark.once("glue-fold")
+        if orderKeysEnabled { CBv2EngageMark.once("router-native-max8-sg1-decode") }
+        if switchRouteGluePrefixBoundsEnabled {
+            CBv2EngageMark.once("route-glue-prefix-bounds")
+        }
+    }
+
+
 }
 
 
@@ -5674,6 +5696,54 @@ private class Gemma4MLP: Module {
              down.weight, down.scales, downBiases, expertScores],
             groupSize: gate.groupSize, bits: gate.bits, mode: gate.mode)
     }
+
+    /// Dense GU/down plus glue-fold in one compiled identity.
+    fileprivate func zipCompiledGateUpGeluDownAndSelect(
+        _ x: MLXArray, expertScores: MLXArray, perExpertScale: MLXArray
+    ) -> (
+        denseOut: MLXArray, indices: MLXArray, weights: MLXArray,
+        table: SwitchRouteTable
+    )? {
+        guard Gemma4ZipRouterV1.compiledZipRouteAvailable,
+            gemma4DenseGateUpJoinEnabled,
+            let storage = fusedGateUpStorage,
+            let gate = gateProj as? QuantizedLinear,
+            let up = upProj as? QuantizedLinear,
+            let down = downProj as? QuantizedLinear,
+            gate.bias == nil, up.bias == nil, down.bias == nil,
+            gate.groupSize == 64, up.groupSize == gate.groupSize,
+            down.groupSize == gate.groupSize,
+            gate.bits == 8, up.bits == gate.bits, down.bits == gate.bits,
+            gate.mode == .affine, up.mode == gate.mode, down.mode == gate.mode,
+            let downBiases = down.biases,
+            perExpertScale.ndim == 1, perExpertScale.dim(0) == 128,
+            perExpertScale.dtype == .bfloat16,
+            expertScores.dtype == .bfloat16,
+            expertScores.ndim == 3, expertScores.dim(0) == 8,
+            expertScores.dim(1) == 1, expertScores.dim(2) == 128,
+            x.dtype == .bfloat16, x.ndim == 3,
+            x.dim(0) == 8, x.dim(1) == 1, x.dim(2) == 2816
+        else { return nil }
+        CBv2EngageMark.once("dense-gelu-epilogue-decode")
+        CBv2EngageMark.once("mlp-down-static-n")
+        CBv2EngageMark.once("dense-compiled-gu-down")
+        Gemma4RouteGlueFoldV1.markEngaged()
+        CBv2EngageMark.once("zip-compiled-route")
+        let outs = Gemma4ZipRouterV1.compiledZipRoute(
+            [x, storage.weight, storage.scales, storage.biases,
+             down.weight, down.scales, downBiases, expertScores, perExpertScale])
+        return (
+            denseOut: outs[0],
+            indices: outs[1],
+            weights: outs[2],
+            table: SwitchRouteTable(
+                rowOrder: outs[3],
+                sortedKeys: outs[4],
+                inverseOrder: outs[5],
+                hasExpertPrefixBounds: switchRouteGluePrefixBoundsEnabled)
+        )
+    }
+
 }
 
 /// ZIP-ROUTER-001 -- interleave the MoE layer's router chain with the
@@ -5742,6 +5812,40 @@ private enum Gemma4ZipRouterV1 {
         else { return 1 }
         return v
     }()
+
+    /// One reusable identity: dense GU/GeGLU, score-fenced down, glue-fold.
+    /// `DARKBLOOM_GEMMA4_COMPILED_ZIP_ROUTE=0` restores the two-step compiled
+    /// dense pair plus a standalone selectAfterDense launch.
+    private static let compiledZipRouteEnabled: Bool = {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["MLX_DISABLE_COMPILE"] == nil else { return false }
+        guard let raw = environment["DARKBLOOM_GEMMA4_COMPILED_ZIP_ROUTE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    fileprivate static var compiledZipRouteAvailable: Bool {
+        compiledZipRouteEnabled && CBv2DenseMLPQMVV1.compiledPairAvailable
+            && Gemma4RouteGlueFoldV1.enabled
+            && Gemma4RouterFinalistsV1.enabled
+    }
+
+    /// Inputs: x, GU w/s/b, DOWN w/s/b, scores, pes. Outputs: denseOut,
+    /// indices, weights, row_order, sorted_keys, inverse_order.
+    fileprivate static let compiledZipRoute: @Sendable ([MLXArray]) -> [MLXArray] =
+        MLX.compile(shapeless: false) { inputs in
+            let activated = CBv2DenseMLPQMVV1.compiledTraceGateUpGelu(
+                Array(inputs[0..<4]))
+            let held = MLX.depends(input: activated, dependencies: [inputs[7]])
+            let denseOut = CBv2DenseMLPQMVV1.compiledTraceDownStaticKN(
+                [held, inputs[4], inputs[5], inputs[6]])
+            let scoresHeld = MLX.depends(
+                input: inputs[7], dependencies: [denseOut])
+            let fold = Gemma4RouteGlueFoldV1.compiledTrace(
+                scoresHeld, pes: inputs[8])
+            return [denseOut] + fold
+        }
+
 
     struct Zipped {
         let denseOut: MLXArray
@@ -5840,14 +5944,28 @@ private enum Gemma4ZipRouterV1 {
         // the caller's stock path rebuilds the identical pair.
         let normed = carriedRouterNorm ?? router.zipNorm(out)
 
-        // Default ZIP only. The trace keeps the score dependency BETWEEN the
-        // same two dense kernels; incoming and outgoing fences stay outside it.
+        // Default ZIP only. The compiled identity keeps the score dependency
+        // BETWEEN the same two dense kernels and owns the glue-fold launch
+        // that used to be reconstructed per layer after denseOut.
         if plan == 1, gemma4DenseGateUpJoinEnabled,
             Gemma4FusedLayerGlue.denseXSumElideEnabled,
             CBv2DenseMLPQMVV1.compiledPairAvailable
         {
             let expertScores = router.zipScores(normed)
             let denseIn = MLX.depends(input: n1, dependencies: [normed])
+            if let packed = mlp.zipCompiledGateUpGeluDownAndSelect(
+                denseIn, expertScores: expertScores,
+                perExpertScale: router.perExpertScale)
+            {
+                Gemma4RouterProbe.recorder?(expertScores, packed.indices)
+                let expertNorm = MLX.depends(
+                    input: n2, dependencies: [packed.denseOut])
+                CBv2EngageMark.once("zip-router")
+                return Zipped(
+                    denseOut: packed.denseOut, expertNorm: expertNorm,
+                    topKIndices: packed.indices, topKWeights: packed.weights,
+                    routeTable: packed.table)
+            }
             if let denseOut = mlp.zipCompiledGateUpGeluDown(
                 denseIn, expertScores: expertScores)
             {

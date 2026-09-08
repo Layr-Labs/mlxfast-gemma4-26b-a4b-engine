@@ -115,21 +115,28 @@ enum CBv2GroupedPrefillPVV1 {
         var stats: [MLXArray] = []
         scores.reserveCapacity(8)
         stats.reserveCapacity(8)
-        for block in 0..<8 {
-            let start = block * 128
-            let end = start + 128
-            guard let stage = CBv2ComposedPrefillSDPAV1.prepareScores(
-                queries: queries[0..., 0..., start..<end, 0...],
-                keys: keys[0..., 0..., 0..<end, 0...],
-                values: values[0..., 0..., 0..<end, 0...],
-                scale: scale, L: 128, kL: end, window: window,
-                bidirectional: false, sinks: sinks,
-                queryPlaneSlice: queryPlane[0..., 0..., 0..., start..<end, 0...]),
-                let statistics = CBv2PrefillAttnTrafficV1.statistics(
-                    scores: stage.scores, values: stage.values)
-            else { return nil }
-            scores.append(stage.scores)
-            stats.append(statistics)
+        if let prepared = CBv2PrefillAttnTrafficV1.compiledGroupedStages(
+            queryPlane: queryPlane, keys: keys, values: values)
+        {
+            scores = prepared.scores
+            stats = prepared.stats
+        } else {
+            for block in 0..<8 {
+                let start = block * 128
+                let end = start + 128
+                guard let stage = CBv2ComposedPrefillSDPAV1.prepareScores(
+                    queries: queries[0..., 0..., start..<end, 0...],
+                    keys: keys[0..., 0..., 0..<end, 0...],
+                    values: values[0..., 0..., 0..<end, 0...],
+                    scale: scale, L: 128, kL: end, window: window,
+                    bidirectional: false, sinks: sinks,
+                    queryPlaneSlice: queryPlane[0..., 0..., 0..., start..<end, 0...]),
+                    let statistics = CBv2PrefillAttnTrafficV1.statistics(
+                        scores: stage.scores, values: stage.values)
+                else { return nil }
+                scores.append(stage.scores)
+                stats.append(statistics)
+            }
         }
         let batch = queries.dim(0)
         let dim = values.dim(3)

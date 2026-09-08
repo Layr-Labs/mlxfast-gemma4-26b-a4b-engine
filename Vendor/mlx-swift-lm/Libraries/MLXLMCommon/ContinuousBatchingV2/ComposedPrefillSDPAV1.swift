@@ -198,6 +198,12 @@ enum CBv2ComposedPrefillSDPAV1 {
         return bias
     }
 
+    /// Resolve existing shape-only bias storage before tracing current tensors.
+    static func groupedStageMaskBiases() -> [MLXArray]? {
+        guard enabled, maskFuseEnabled else { return nil }
+        return (1...8).map { causalMaskBias(L: 128, kL: $0 * 128) }
+    }
+
     /// Head dims for which MLX has a fused kernel; those calls must keep
     /// taking it, because the fused kernel is NOT the fallback graph.
     @inline(__always)
@@ -879,6 +885,74 @@ enum CBv2PrefillAttnTrafficV1 {
             source: source,
             ensureRowContiguous: true
         )
+    }
+
+    private static let compiledGroupedStagesEnabled: Bool = {
+        guard ProcessInfo.processInfo.environment["MLX_DISABLE_COMPILE"] == nil else {
+            return false
+        }
+        let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_COMPILED_GROUPED_PREFILL_STAGES_V1"] ?? "1"
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }()
+
+    private static let groupedStatisticsGeometrySupported: Bool = (1...8).allSatisfy {
+        let axisSize = $0 * 128
+        let threads = ((axisSize + 3) / 4 + 31) / 32 * 32
+        let rows = CBv2PrefillSoftmaxVecV1.rowsPerThreadgroup(
+            axisSize: axisSize, threadgroupSize: threads)
+        return rows >= 1 && rows * threads <= 1024
+    }
+
+    private static let compiledGroupedScoreStats: @Sendable ([MLXArray]) -> [MLXArray] =
+        MLX.compile(shapeless: false) { inputs in
+            var scores: [MLXArray] = []
+            var stats: [MLXArray] = []
+            scores.reserveCapacity(8)
+            stats.reserveCapacity(8)
+            for block in 0..<8 {
+                let start = block * 128
+                let end = start + 128
+                let q = inputs[0][0..., 0..., 0..., start..<end, 0...]
+                let k = inputs[1][0..., 0..., 0..<end, 0...]
+                    .expandedDimensions(axis: 2)
+                let score = addMM(inputs[2 + block], q, k.swappedAxes(-1, -2))
+                // Only dtype and shape of this operand are read by statistics.
+                // Admitted key/value planes have the same metadata.
+                guard let statistic = statistics(scores: score, values: k) else {
+                    preconditionFailure("admitted grouped statistics geometry changed")
+                }
+                scores.append(score)
+                stats.append(statistic)
+            }
+            return scores + stats
+        }
+
+    /// Fixed grouped-prefill stage boundary; final P.V still receives live values.
+    static func compiledGroupedStages(
+        queryPlane: MLXArray, keys: MLXArray, values: MLXArray
+    ) -> (scores: [MLXArray], stats: [MLXArray])? {
+        guard compiledGroupedStagesEnabled,
+            MLXHardwareInfo.isCompiledDecodeSupported,
+            StreamOrDevice.default == .gpu,
+            enabled, !xcheck, CBv2PrefillSoftmaxVecV1.enabled, statsKernel != nil,
+            groupedStatisticsGeometrySupported,
+            queryPlane.dtype == .bfloat16, keys.dtype == .bfloat16,
+            values.dtype == .bfloat16,
+            queryPlane.ndim == 5, keys.ndim == 4, values.shape == keys.shape
+        else { return nil }
+        let batch = keys.dim(0), kvHeads = keys.dim(1), dim = keys.dim(3)
+        guard batch >= 1, batch <= 8, keys.dim(2) == 1024,
+            (kvHeads == 8 && dim == 256) || (kvHeads == 2 && dim == 512),
+            queryPlane.dim(0) == batch, queryPlane.dim(1) == kvHeads,
+            queryPlane.dim(2) == 16 / kvHeads, queryPlane.dim(3) == 1024,
+            queryPlane.dim(4) == dim,
+            batch * 16 * 128 >= Gemma4PromptGlue2V1.minRows,
+            let masks = CBv2ComposedPrefillSDPAV1.groupedStageMaskBiases()
+        else { return nil }
+        let outputs = compiledGroupedScoreStats([queryPlane, keys] + masks)
+        return (Array(outputs[0..<8]), Array(outputs[8..<16]))
     }
 
     /// The incumbent per-row softmax statistics and launch geometry.

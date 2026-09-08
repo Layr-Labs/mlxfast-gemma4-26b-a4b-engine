@@ -302,6 +302,7 @@ extension CBv2LayerCache: KVCache {
     /// collapse lazy chains: per-row storage plus the positionOffsets chain.
     public func innerState() -> [MLXArray] {
         var arrays = [positionOffsetsState.value, decodeRingWriteFence.value]
+        arrays.reserveCapacity(2 + rows.count * 3)
         for row in rows {
             if let provider = row as? CBv2InnerStateProviding {
                 arrays.append(contentsOf: provider.cbv2InnerState())

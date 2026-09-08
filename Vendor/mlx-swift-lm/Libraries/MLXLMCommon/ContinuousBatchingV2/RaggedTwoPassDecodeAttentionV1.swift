@@ -162,30 +162,31 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             !CBv2WindowedSequenceKV.quantSimulate,
             !CBv2WindowedSequenceKV.gpuPackCheck,
             normalizedQueries.dtype == .bfloat16,
-            normalizedQueries.shape == [batch, queryHeads, 1, headDim],
+            normalizedQueries.ndim == 4, normalizedQueries.shape4 == (batch, queryHeads, 1, headDim),
             normalizedKeys.dtype == .bfloat16,
-            normalizedKeys.shape == [batch, kvHeads, 1, headDim],
+            normalizedKeys.ndim == 4, normalizedKeys.shape4 == (batch, kvHeads, 1, headDim),
             normalizedValues.dtype == .bfloat16,
-            normalizedValues.shape == normalizedKeys.shape,
+            normalizedValues.ndim == 4, normalizedValues.shape4 == normalizedKeys.shape4,
             rawQueries.dtype == .bfloat16,
-            rawQueries.shape == [batch, 1, queryHeads, headDim],
+            rawQueries.ndim == 4, rawQueries.shape4 == (batch, 1, queryHeads, headDim),
             rawKeys.dtype == .bfloat16,
-            rawKeys.shape == [batch, 1, kvHeads, headDim],
+            rawKeys.ndim == 4, rawKeys.shape4 == (batch, 1, kvHeads, headDim),
             rawValues.dtype == .bfloat16,
-            rawValues.shape == rawKeys.shape,
+            rawValues.ndim == 4, rawValues.shape4 == rawKeys.shape4,
             qWeight.dtype == .bfloat16,
-            qWeight.shape == [headDim],
+            qWeight.ndim == 1, qWeight.dim(0) == headDim,
             kWeight.dtype == .bfloat16,
-            kWeight.shape == [headDim],
+            kWeight.ndim == 1, kWeight.dim(0) == headDim,
             positionOffsets.dtype == .int32,
-            positionOffsets.shape == [batch],
+            positionOffsets.ndim == 1, positionOffsets.dim(0) == batch,
             ropeLog2Base.dtype == .float32,
-            ropeLog2Base.shape == [1]
+            ropeLog2Base.ndim == 1, ropeLog2Base.dim(0) == 1
         else { return false }
 
         if let ropeInverseFrequencies,
             (ropeInverseFrequencies.dtype != .float32
-                || ropeInverseFrequencies.shape != [headDim / 2])
+                || ropeInverseFrequencies.ndim != 1
+                || ropeInverseFrequencies.dim(0) != headDim / 2)
         {
             return false
         }
@@ -3777,12 +3778,13 @@ for (int element = 0; element < values_per_lane; ++element) {
             enabled, blocks > 0, sequenceLength.isMultiple(of: blocks),
             scale == 1.0,
             queries.dtype == .bfloat16,
-            queries.shape == [batch, queryHeads, 1, headDim],
+            queries.ndim == 4, queries.shape4 == (batch, queryHeads, 1, headDim),
             headDim == 256, kvHeads == 8,
             mirrors.count == batch,
             mirrors.allSatisfy({
                 $0.dtype == .uint32
-                    && $0.shape == [2, kvHeads, sequenceLength, headDim / 8 + headDim / 64]
+                    && $0.ndim == 4
+                    && $0.shape4 == (2, kvHeads, sequenceLength, headDim / 8 + headDim / 64)
             })
         else { return nil }
 
@@ -3843,17 +3845,18 @@ for (int element = 0; element < values_per_lane; ++element) {
             enabled, blocks > 0, sequenceLength.isMultiple(of: blocks),
             scale == 1.0,
             queries.dtype == .bfloat16,
-            queries.shape == [batch, queryHeads, 1, headDim],
+            queries.ndim == 4, queries.shape4 == (batch, queryHeads, 1, headDim),
             newKeys.dtype == .bfloat16,
-            newKeys.shape == [batch, kvHeads, 1, headDim],
+            newKeys.ndim == 4, newKeys.shape4 == (batch, kvHeads, 1, headDim),
             newValues.dtype == .bfloat16,
-            newValues.shape == newKeys.shape,
+            newValues.ndim == 4, newValues.shape4 == newKeys.shape4,
             previousWriteFence.dtype == .int32,
-            previousWriteFence.shape == [1],
+            previousWriteFence.ndim == 1, previousWriteFence.dim(0) == 1,
             mirrors.count == batch,
             mirrors.allSatisfy({
                 $0.dtype == .uint32
-                    && $0.shape == [2, kvHeads, sequenceLength, headDim / 8 + headDim / 64]
+                    && $0.ndim == 4
+                    && $0.shape4 == (2, kvHeads, sequenceLength, headDim / 8 + headDim / 64)
             })
         else { return nil }
 
@@ -4386,23 +4389,23 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             eps == 1.0e-6,
             rawValues === rawKeys,
             normalizedQueries.dtype == .bfloat16,
-            normalizedQueries.shape == [batch, queryHeads, 1, headDim],
+            normalizedQueries.ndim == 4, normalizedQueries.shape4 == (batch, queryHeads, 1, headDim),
             normalizedKeys.dtype == .bfloat16,
-            normalizedKeys.shape == [batch, kvHeads, 1, headDim],
+            normalizedKeys.ndim == 4, normalizedKeys.shape4 == (batch, kvHeads, 1, headDim),
             normalizedValues.dtype == .bfloat16,
-            normalizedValues.shape == normalizedKeys.shape,
+            normalizedValues.ndim == 4, normalizedValues.shape4 == normalizedKeys.shape4,
             rawQueries.dtype == .bfloat16,
-            rawQueries.shape == [batch, 1, queryHeads, headDim],
+            rawQueries.ndim == 4, rawQueries.shape4 == (batch, 1, queryHeads, headDim),
             rawKeys.dtype == .bfloat16,
-            rawKeys.shape == [batch, 1, kvHeads, headDim],
+            rawKeys.ndim == 4, rawKeys.shape4 == (batch, 1, kvHeads, headDim),
             qWeight.dtype == .bfloat16,
-            qWeight.shape == [headDim],
+            qWeight.ndim == 1, qWeight.dim(0) == headDim,
             kWeight.dtype == .bfloat16,
-            kWeight.shape == [headDim],
+            kWeight.ndim == 1, kWeight.dim(0) == headDim,
             positionOffsets.dtype == .int32,
-            positionOffsets.shape == [batch],
+            positionOffsets.ndim == 1, positionOffsets.dim(0) == batch,
             ropeFrequencies.dtype == .float32,
-            ropeFrequencies.shape == [headDim / 2]
+            ropeFrequencies.ndim == 1, ropeFrequencies.dim(0) == headDim / 2
         else { return false }
 
         fullNormRopeLock.lock()
@@ -6308,10 +6311,12 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             keys.dtype == .bfloat16,
             values.dtype == .bfloat16,
             previousWriteFence.dtype == .int32,
-            previousWriteFence.shape == [1],
-            queries.shape == [batch, queryHeads, 1, headDim],
-            keys.shape == [batch, kvHeads, 1, headDim],
-            values.shape == keys.shape
+            previousWriteFence.ndim == 1, previousWriteFence.dim(0) == 1,
+            queries.ndim == 4,
+            queries.shape4 == (batch, queryHeads, 1, headDim),
+            keys.ndim == 4,
+            keys.shape4 == (batch, kvHeads, 1, headDim),
+            values.ndim == 4, values.shape4 == keys.shape4
         else { return nil }
         guard case .full = kind.attention else { return nil }
 
@@ -6350,8 +6355,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     state[0].dim(0) == 1,
                     state[0].dim(1) == kvHeads,
                     state[0].dim(3) == headDim,
-                    state[1].shape == state[0].shape,
-                    state[1].dtype == state[0].dtype,
+                    state[1].ndim == 4,
+                    state[1].shape4 == state[0].shape4,
                     state[0].dim(2) >= keyLength
                 else { return nil }
                 keyBuffers.append(state[0])
@@ -6384,8 +6389,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     state[0].dim(0) == 1,
                     state[0].dim(1) == kvHeads,
                     state[0].dim(3) == headDim,
-                    state[1].shape == state[0].shape,
-                    state[1].dtype == state[0].dtype,
+                    state[1].ndim == 4,
+                    state[1].shape4 == state[0].shape4,
                     state[0].dim(2) >= keyLength
                 else { return nil }
                 keyBuffers.append(state[0])
@@ -6556,10 +6561,12 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             keys.dtype == .bfloat16,
             values.dtype == .bfloat16,
             previousWriteFence.dtype == .int32,
-            previousWriteFence.shape == [1],
-            queries.shape == [batch, queryHeads, 1, headDim],
-            keys.shape == [batch, kvHeads, 1, headDim],
-            values.shape == keys.shape
+            previousWriteFence.ndim == 1, previousWriteFence.dim(0) == 1,
+            queries.ndim == 4,
+            queries.shape4 == (batch, queryHeads, 1, headDim),
+            keys.ndim == 4,
+            keys.shape4 == (batch, kvHeads, 1, headDim),
+            values.ndim == 4, values.shape4 == keys.shape4
         else { return nil }
         guard case .full = kind.attention else { return nil }
 
@@ -6598,8 +6605,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     state[0].dim(0) == 1,
                     state[0].dim(1) == kvHeads,
                     state[0].dim(3) == headDim,
-                    state[1].shape == state[0].shape,
-                    state[1].dtype == state[0].dtype,
+                    state[1].ndim == 4,
+                    state[1].shape4 == state[0].shape4,
                     state[0].dim(2) >= keyLength
                 else { return nil }
                 keyBuffers.append(state[0])
@@ -6632,8 +6639,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     state[0].dim(0) == 1,
                     state[0].dim(1) == kvHeads,
                     state[0].dim(3) == headDim,
-                    state[1].shape == state[0].shape,
-                    state[1].dtype == state[0].dtype,
+                    state[1].ndim == 4,
+                    state[1].shape4 == state[0].shape4,
                     state[0].dim(2) >= keyLength
                 else { return nil }
                 keyBuffers.append(state[0])
@@ -6712,9 +6719,11 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             queries.dtype == .bfloat16,
             keys.dtype == .bfloat16,
             values.dtype == .bfloat16,
-            queries.shape == [batch, queryHeads, 1, headDim],
-            keys.shape == [batch, kvHeads, 1, headDim],
-            values.shape == keys.shape
+            queries.ndim == 4,
+            queries.shape4 == (batch, queryHeads, 1, headDim),
+            keys.ndim == 4,
+            keys.shape4 == (batch, kvHeads, 1, headDim),
+            values.ndim == 4, values.shape4 == keys.shape4
         else { return nil }
         guard case .full = kind.attention else { return nil }
 
@@ -6750,8 +6759,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     state[0].dim(0) == 1,
                     state[0].dim(1) == kvHeads,
                     state[0].dim(3) == headDim,
-                    state[1].shape == state[0].shape,
-                    state[1].dtype == state[0].dtype
+                    state[1].ndim == 4,
+                    state[1].shape4 == state[0].shape4
                 else { return nil }
             }
 
@@ -6789,8 +6798,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     state[0].dim(0) == 1,
                     state[0].dim(1) == kvHeads,
                     state[0].dim(3) == headDim,
-                    state[1].shape == state[0].shape,
-                    state[1].dtype == state[0].dtype
+                    state[1].ndim == 4,
+                    state[1].shape4 == state[0].shape4
                 else { return nil }
             }
 
@@ -6851,7 +6860,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             kind.kvHeads == kvHeads,
             kind.headDim == headDim,
             queries.dtype == .bfloat16,
-            queries.shape == [batch, queryHeads, 1, headDim]
+            queries.ndim == 4,
+            queries.shape4 == (batch, queryHeads, 1, headDim)
         else { return nil }
         guard case .full = kind.attention else { return nil }
 
@@ -6885,8 +6895,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     state[0].dim(0) == 1,
                     state[0].dim(1) == kvHeads,
                     state[0].dim(3) == headDim,
-                    state[1].shape == state[0].shape,
-                    state[1].dtype == state[0].dtype,
+                    state[1].ndim == 4,
+                    state[1].shape4 == state[0].shape4,
                     state[0].dim(2) >= keyLength
                 else { return nil }
                 keyBuffers.append(state[0])
@@ -6915,8 +6925,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     state[0].dim(0) == 1,
                     state[0].dim(1) == kvHeads,
                     state[0].dim(3) == headDim,
-                    state[1].shape == state[0].shape,
-                    state[1].dtype == state[0].dtype,
+                    state[1].ndim == 4,
+                    state[1].shape4 == state[0].shape4,
                     state[0].dim(2) >= keyLength
                 else { return nil }
                 keyBuffers.append(state[0])

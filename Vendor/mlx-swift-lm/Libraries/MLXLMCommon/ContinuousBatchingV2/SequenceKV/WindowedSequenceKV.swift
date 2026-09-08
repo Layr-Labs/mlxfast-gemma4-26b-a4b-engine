@@ -102,6 +102,10 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// authoritative and self-consistent.
     private(set) var bf16RingStale = false
 
+    // Before quantized attention owns the writes, the mirror may not be an
+    // attention input. Keep full evaluation roots until its fence owns them.
+    var decodeOutputCoversMirrorWrites: Bool { quantMirror == nil || bf16RingStale }
+
     /// `MLX_KV_QUANT=0` disables the quantized-ring read path wholesale
     /// (mirror never allocated, kernels take the established bf16 road).
     /// Default ON. `MLX_` prefix: the worker env sanitizer only passes
@@ -591,7 +595,11 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     }
 
     func cbv2InnerState() -> [MLXArray] {
-        [keys, values, quantMirror].compactMap { $0 }
+        if let keys, let values {
+            if let quantMirror { return [keys, values, quantMirror] }
+            return [keys, values]
+        }
+        return [keys, values, quantMirror].compactMap { $0 }
     }
 
     // MARK: - Ring geometry

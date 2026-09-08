@@ -412,6 +412,7 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         if let pool = cohortPool {
             return [pool.keys, pool.values]
         }
+        if let keys, let values { return [keys, values] }
         return [keys, values].compactMap { $0 }
     }
 

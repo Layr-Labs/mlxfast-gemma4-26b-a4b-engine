@@ -603,7 +603,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// of the fast-ack default.
     public func shutdownSynchronously() async {
         beginRejectingSubmissions()
-        await loop.drain()
+        await loop.drain(waitForStop: true)
     }
 
     /// Resolved once: fast-ack drains are the default; set the variable to

@@ -1124,10 +1124,12 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         guard x.dtype == .bfloat16, (x.ndim == 3 && x.dim(0) == batch && x.dim(1) == sequence && x.dim(2) == 2816),
             guWeight.dtype == .uint32, (guWeight.ndim == 2 && guWeight.dim(0) == 4224 && guWeight.dim(1) == 704),
             guScales.dtype == .bfloat16, (guScales.ndim == 2 && guScales.dim(0) == 4224 && guScales.dim(1) == 44),
-            guBiases.dtype == .bfloat16, guBiases.shape == guScales.shape,
+            guBiases.dtype == .bfloat16, guBiases.ndim == 2,
+            guBiases.shape2 == guScales.shape2,
             downWeight.dtype == .uint32, (downWeight.ndim == 2 && downWeight.dim(0) == 2816 && downWeight.dim(1) == 528),
             downScales.dtype == .bfloat16, (downScales.ndim == 2 && downScales.dim(0) == 2816 && downScales.dim(1) == 33),
-            downBiases.dtype == .bfloat16, downBiases.shape == downScales.shape,
+            downBiases.dtype == .bfloat16, downBiases.ndim == 2,
+            downBiases.shape2 == downScales.shape2,
             scores.dtype == .bfloat16, (scores.ndim == 3 && scores.dim(0) == batch && scores.dim(1) == sequence && scores.dim(2) == 128)
         else { return nil }
         CBv2EngageMark.once("dense-gelu-epilogue-decode")
@@ -1179,8 +1181,9 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
             x.ndim == 3, x.dim(0) == batch, x.dim(1) == sequence,
             x.dim(2) == 2816, weight.ndim == 2, weight.dim(0) == 4224,
             weight.dim(1) == 2816 * Self.bits / 32,
-            scales.shape == [4224, 2816 / Self.groupSize],
-            biases.shape == scales.shape
+            scales.ndim == 2, biases.ndim == 2,
+            scales.shape2 == (4224, 2816 / Self.groupSize),
+            biases.shape2 == scales.shape2
         else { return nil }
         CBv2EngageMark.once("dense-gelu-epilogue-decode")
         let yTiles = 2112 / outputsPerGroup
@@ -1618,8 +1621,9 @@ inline U qdot_affine8_registered_v4(
             outDim % outputsPerGroup == 0,
             x.size == batch * sequence * inDim,
             weight.dim(1) == inDim * Self.bits / 32,
-            scales.shape == [outDim, inDim / Self.groupSize],
-            biases.shape == scales.shape
+            scales.ndim == 2, biases.ndim == 2,
+            scales.shape2 == (outDim, inDim / Self.groupSize),
+            biases.shape2 == scales.shape2
         else { return nil }
 
         // MMA-MLP-001: matrix-unit body for the dense MLP planes, DOWN plane

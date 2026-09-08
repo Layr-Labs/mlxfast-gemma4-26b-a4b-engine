@@ -14,7 +14,7 @@
 import Foundation
 import MLX
 
-/// Model-level proof that an ordinary CBv2 decode output transitively
+/// Model-level proof that ordinary and fused-argmax CBv2 decode outputs transitively
 /// consumes every K/V mutation performed by that forward. This is deliberately
 /// narrower than `LanguageModel`: an adapter cannot infer the dependency from
 /// a cache type alone.
@@ -61,6 +61,7 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
             contiguous.allSatisfy({ cache in
                 cache.rows.allSatisfy {
                     $0 is any CBv2DecodeRootCompactionCapableSequenceKV
+                        && (($0 as? CBv2WindowedSequenceKV)?.decodeOutputCoversMirrorWrites ?? true)
                 }
             }),
             let stateIdentity = contiguous[0].unifiedPositionStateIdentity,

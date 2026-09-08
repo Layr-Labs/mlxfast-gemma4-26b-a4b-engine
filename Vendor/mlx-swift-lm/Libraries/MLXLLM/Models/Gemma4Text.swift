@@ -1985,16 +1985,17 @@ private func gemma4FusedQKVNorm(
     guard eps == 1.0e-6,
         q.dtype == .bfloat16, k.dtype == .bfloat16, v.dtype == .bfloat16,
         qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
-        positionOffsets.dtype == .int32, positionOffsets.shape == [8],
+        positionOffsets.dtype == .int32,
+        positionOffsets.ndim == 1, positionOffsets.dim(0) == 8,
         ropeParameters.log2Base.dtype == .float32, ropeParameters.log2Base.size == 1,
         ropeParameters.frequencies.dtype == .float32,
         q.ndim == 4, k.ndim == 4, v.ndim == 4,
         q.dim(0) == 8, q.dim(1) == 1, q.dim(2) == 16,
-        k.dim(0) == 8, k.dim(1) == 1, v.shape == k.shape,
+        k.dim(0) == 8, k.dim(1) == 1, v.shape4 == k.shape4,
         q.dim(3) == k.dim(3),
         (q.dim(3) == 256 && k.dim(2) == 8) || (q.dim(3) == 512 && k.dim(2) == 2),
-        qWeight.shape == [q.dim(3)], kWeight.shape == [q.dim(3)],
-        !keyValueShared || v.shape == k.shape,
+        qWeight.ndim == 1, kWeight.ndim == 1,
+        qWeight.dim(0) == q.dim(3), kWeight.dim(0) == q.dim(3),
         !ropeParameters.usesFrequencies
             || ropeParameters.frequencies.size == q.dim(3) / 2
     else { return nil }
@@ -8160,7 +8161,7 @@ extension Gemma4TextModel: CBv2LanguageModelPrefillForwardable {
 }
 
 /// Every storage-owning CBv2 attention result is consumed by the sequential
-/// Gemma trunk and final LM head, so ordinary decode logits transitively root
+/// Gemma trunk and final LM head, so decode logits and fused argmax transitively root
 /// that forward's K/V mutations. Cache-layout gates remain in the adapter.
 extension Gemma4TextModel: CBv2LanguageModelDecodeOutputCoversCacheMutations {}
 

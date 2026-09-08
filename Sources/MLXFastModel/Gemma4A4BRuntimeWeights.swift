@@ -330,7 +330,7 @@ public final class Gemma4A4BRuntimeWeightCache {
     /// output. Inputs are constant BOS tokens against throwaway caches, so
     /// the warm is prompt-independent and cannot affect model output; the
     /// only durable effect is process-global compiled-pipeline state. It is
-    /// best-effort and deadline-guarded: no failure here may fail model load.
+    /// best-effort, but cancellation must retire before model load continues.
     private static func warmCohortShapes(
         _ model: Gemma4TextModel, config: Gemma4A4BConfig
     ) {
@@ -409,7 +409,7 @@ public final class Gemma4A4BRuntimeWeightCache {
                 }
                 drained.signal()
             }
-            // Deadline so a wedged warm can never wedge worker startup.
+            // Cancel slow warmup, then wait for retirement before reusing the model.
             if drained.wait(timeout: .now() + 120) == .timedOut {
                 consumer.cancel()
                 for slot in 0..<batch {
@@ -424,7 +424,7 @@ public final class Gemma4A4BRuntimeWeightCache {
                 await engine.shutdownSynchronously()
                 stopped.signal()
             }
-            _ = stopped.wait(timeout: .now() + 30)
+            stopped.wait()
             if CBv2StepProfiler.enabled {
                 // Local diagnostics only (armed by CBV2_STEP_PROFILE): the
                 // worker's stdout is the protocol channel, so the table goes

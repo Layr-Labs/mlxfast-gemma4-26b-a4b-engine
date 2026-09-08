@@ -111,10 +111,8 @@ enum CBv2GroupedPrefillPVV1 {
             let queryPlane
         else { return nil }
 
-        var scores: [MLXArray] = []
-        var stats: [MLXArray] = []
-        scores.reserveCapacity(8)
-        stats.reserveCapacity(8)
+        var staged: [(scores: MLXArray, values: MLXArray)] = []
+        staged.reserveCapacity(8)
         for block in 0..<8 {
             let start = block * 128
             let end = start + 128
@@ -124,12 +122,27 @@ enum CBv2GroupedPrefillPVV1 {
                 values: values[0..., 0..., 0..<end, 0...],
                 scale: scale, L: 128, kL: end, window: window,
                 bidirectional: false, sinks: sinks,
-                queryPlaneSlice: queryPlane[0..., 0..., 0..., start..<end, 0...]),
-                let statistics = CBv2PrefillAttnTrafficV1.statistics(
-                    scores: stage.scores, values: stage.values)
+                queryPlaneSlice: queryPlane[0..., 0..., 0..., start..<end, 0...])
             else { return nil }
-            scores.append(stage.scores)
-            stats.append(statistics)
+            staged.append((stage.scores, stage.values))
+        }
+        // PREFILL-STATS-GROUP: one launch for the sweep's eight row-statistics
+        // reduces, in place of eight. The per-block fallback keeps the
+        // incumbent reachable when a sweep misses the grouped admission gates.
+        let scores = staged.map(\.scores)
+        let stats: [MLXArray]
+        if let grouped = CBv2PrefillAttnTrafficV1.groupedStatistics(blocks: staged) {
+            stats = grouped
+        } else {
+            var perBlock: [MLXArray] = []
+            perBlock.reserveCapacity(8)
+            for stage in staged {
+                guard let statistics = CBv2PrefillAttnTrafficV1.statistics(
+                    scores: stage.scores, values: stage.values)
+                else { return nil }
+                perBlock.append(statistics)
+            }
+            stats = perBlock
         }
         let batch = queries.dim(0)
         let dim = values.dim(3)

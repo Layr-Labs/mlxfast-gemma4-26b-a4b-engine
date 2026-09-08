@@ -924,6 +924,131 @@ enum CBv2PrefillAttnTrafficV1 {
         return stats
     }
 
+    /// PREFILL-STATS-GROUP: the eight query blocks' statistics reduces issued
+    /// as one launch, the block index carried on the grid's z axis.
+    ///
+    /// Every block's rectangle has the same row count and the same output
+    /// shape (`[.., 128, 4]`); only the key extent differs, running 128, 256,
+    /// ... 1024. The grouped launch therefore runs every block at the widest
+    /// block's geometry and reads that block's own extent from `params`.
+    ///
+    /// Widening a short block is bit-exact, not merely masked. A lane whose
+    /// `base` passes its block's `axis_size` takes the incumbent's existing
+    /// `row_valid` else branch and loads -INFINITY, the identity of the max
+    /// reduce, so `simd_max` is unchanged; it then evaluates
+    /// `fast::exp(-INFINITY - maxval)`, exactly `0.0f`, the identity of the sum
+    /// reduce, so the normalizer is unchanged even though the reduction tree
+    /// gained leaves. That is the same identity-substitution argument the
+    /// incumbent already makes for the unwritten slots of its own two combines.
+    private static let groupedStatsSource: String? = statsSource.map { text in
+        let head = [
+            "const int blk = int(threadgroup_position_in_grid.z);",
+            "const device T* scores = nullptr;",
+            "switch (blk) {",
+            "    case 0: scores = s0; break;",
+            "    case 1: scores = s1; break;",
+            "    case 2: scores = s2; break;",
+            "    case 3: scores = s3; break;",
+            "    case 4: scores = s4; break;",
+            "    case 5: scores = s5; break;",
+            "    case 6: scores = s6; break;",
+            "    default: scores = s7; break;",
+            "}",
+            "device T* stats = nullptr;",
+            "switch (blk) {",
+            "    case 0: stats = o0; break;",
+            "    case 1: stats = o1; break;",
+            "    case 2: stats = o2; break;",
+            "    case 3: stats = o3; break;",
+            "    case 4: stats = o4; break;",
+            "    case 5: stats = o5; break;",
+            "    case 6: stats = o6; break;",
+            "    default: stats = o7; break;",
+            "}",
+            "const int axis_size = int(params[blk]);",
+            "const int num_simdgroups = int(params[8]);",
+        ].joined(separator: "\n")
+        // The donor opens by reading both scalars out of `params`; the grouped
+        // head reads the block's own extent instead, so drop the donor's pair
+        // rather than shadow them.
+        let donorHead = [
+            "const int axis_size = int(params[0]);",
+            "const int num_simdgroups = int(params[1]);",
+        ].joined(separator: "\n")
+        guard text.components(separatedBy: donorHead).count == 2 else { return text }
+        return head + text.replacingOccurrences(of: donorHead, with: "")
+    }
+
+    private static let groupedStatsKernel: MLXFast.MLXFastKernel? =
+        groupedStatsSource.map { source in
+            MLXFast.metalKernel(
+                name: "cbv2_prefill_sdpa_softmax_stats_grouped_bf16_at1",
+                inputNames: (0..<8).map { "s\($0)" } + ["params"],
+                outputNames: (0..<8).map { "o\($0)" },
+                source: source,
+                ensureRowContiguous: true
+            )
+        }
+
+    /// The grouped launch of `statistics` over a whole query-block sweep.
+    /// `blocks` is the eight `(scores, values)` pairs in block order; every
+    /// admission gate the incumbent applies per block is applied here per
+    /// block too, so a sweep that would have taken the incumbent path in any
+    /// one of its blocks takes it in all of them.
+    static func groupedStatistics(blocks: [(scores: MLXArray, values: MLXArray)]) -> [MLXArray]? {
+        guard enabled, CBv2PrefillSoftmaxVecV1.enabled, let groupedStatsKernel else { return nil }
+        guard blocks.count == 8 else { return nil }
+
+        var axisSizes: [Int] = []
+        var statsShapes: [[Int]] = []
+        var nRows = 0
+        for (scores, values) in blocks {
+            guard scores.dtype == .bfloat16, values.dtype == .bfloat16 else { return nil }
+            guard scores.ndim >= 2, values.ndim == scores.ndim else { return nil }
+            let axisSize = scores.dim(scores.ndim - 1)
+            guard axisSize > 0, axisSize % 4 == 0, axisSize <= maxKeyLength else { return nil }
+            let L = scores.dim(scores.ndim - 2)
+            let D = values.dim(values.ndim - 1)
+            guard values.dim(values.ndim - 2) == axisSize else { return nil }
+            guard L % 128 == 0, D % 128 == 0 else { return nil }
+            let totalElements = scores.shape.reduce(1, *)
+            guard totalElements > 0, totalElements % axisSize == 0 else { return nil }
+            let rows = totalElements / axisSize
+            guard rows >= Gemma4PromptGlue2V1.minRows else { return nil }
+            // One launch covers one row count; the blocks of a sweep share it
+            // because they share L and differ only in the key extent.
+            if nRows == 0 { nRows = rows } else if rows != nRows { return nil }
+            axisSizes.append(axisSize)
+            var statsShape = scores.shape
+            statsShape[statsShape.count - 1] = 4
+            statsShapes.append(statsShape)
+        }
+        guard let axisSizeMax = axisSizes.max() else { return nil }
+
+        // The widest block's geometry, for every block. Short blocks idle
+        // their surplus lanes on the incumbent's own `row_valid` else branch.
+        let threadgroupSize = ((axisSizeMax + 3) / 4 + 31) / 32 * 32
+        guard threadgroupSize > 0, threadgroupSize <= 1024 else { return nil }
+        let numSimdgroups = threadgroupSize / 32
+        let rowsPerGroup = CBv2PrefillSoftmaxVecV1.rowsPerThreadgroup(
+            axisSize: axisSizeMax, threadgroupSize: threadgroupSize)
+        guard rowsPerGroup >= 1, rowsPerGroup * threadgroupSize <= 1024 else { return nil }
+        // Metal needs whole threadgroups on every axis of the thread grid.
+        guard nRows % rowsPerGroup == 0 else { return nil }
+
+        let paramsArray = MLXArray(axisSizes.map { UInt32($0) } + [UInt32(numSimdgroups)])
+
+        CBv2EngageMark.once("prefill-stats-group")
+        return groupedStatsKernel(
+            blocks.map(\.scores) + [paramsArray],
+            template: [("T", blocks[0].scores.dtype), ("RPT", rowsPerGroup)],
+            grid: (threadgroupSize * nRows, 1, 8),
+            threadGroup: (threadgroupSize * rowsPerGroup, 1, 1),
+            outputShapes: statsShapes,
+            outputDTypes: Array(repeating: .bfloat16, count: 8)
+        )
+    }
+
     static func attend(scores: MLXArray, values: MLXArray) -> MLXArray? {
         guard let stats = statistics(scores: scores, values: values) else { return nil }
         let axisSize = scores.dim(-1)

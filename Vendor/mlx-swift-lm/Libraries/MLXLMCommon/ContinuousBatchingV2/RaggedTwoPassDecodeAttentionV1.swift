@@ -6140,7 +6140,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// slot receives the K row the standalone kernel would have handed the
     /// incumbent store, so dispatches 1...3 read identical bytes.
     private static let ringStoreNormRopeKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1",
+        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_nb1",
         inputNames: [
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -6215,12 +6215,14 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             threadgroup float partials[32];
             threadgroup float inverse_rms;
             threadgroup T rounded[D];
-            if (simd_group == 0) partials[lane] = 0.0f;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // NORM-NB: zero initialization and its barrier only made the
+            // 32-lane simd_sum read defined values; bounded reads supply the
+            // exact same zero contribution for the four participating
+            // simdgroups without that write or synchronization.
             if (lane == 0) partials[simd_group] = sum;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (simd_group == 0) {
-                sum = simd_sum(partials[lane]);
+                sum = simd_sum(lane < 4u ? partials[lane] : 0.0f);
                 if (lane == 0) {
                     inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
                 }

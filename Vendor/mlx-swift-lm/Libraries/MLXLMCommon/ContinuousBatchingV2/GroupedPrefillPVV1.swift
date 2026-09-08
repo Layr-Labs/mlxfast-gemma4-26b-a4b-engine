@@ -74,10 +74,21 @@ enum CBv2GroupedPrefillPVV1 {
             (size_t(b) * KVHEADS + h / (16 / KVHEADS)) * 1024 * D + col;
         device T* O = output +
             ((size_t(b) * 1024 + block * 128 + row) * 16 + h) * D + col;
+        // PREFILL-CAUSAL-KSKIP: this simdgroup owns rows row .. row + SM - 1
+        // of query block `block`, whose row m carries query index
+        // block * 128 + m and admits key columns 0 .. block * 128 + m. With
+        // K = (block + 1) * 128 that is K - 128 + m, so the largest admitting
+        // column over the whole slice is K - 128 + row + SM - 1 and no column
+        // at or beyond kActive is live for any row here. Exactness argument
+        // above gemm_loop_softmax.
+        int kActive = K;
+        #if DARKBLOOM_GEMMA4_PREFILL_CAUSAL_KSKIP
+        kActive = metal::min(K, K - 128 + row + int(SM));
+        #endif
         dispatch_bool(K % BK == 0, [&](auto alignedK) {
             auto tile = gemm_loop_softmax<
                 T, SM, SN, 32, BK, false, false, true, true, alignedK.value, float>(
-                A, V, K, D, K, K / BK, SM, SN, C);
+                A, V, K, D, K, K / BK, SM, SN, C, kActive);
             tile.store(O, 16 * D);
         });
         """#
@@ -125,8 +136,14 @@ enum CBv2GroupedPrefillPVV1 {
                 scale: scale, L: 128, kL: end, window: window,
                 bidirectional: false, sinks: sinks,
                 queryPlaneSlice: queryPlane[0..., 0..., 0..., start..<end, 0...]),
+                // PREFILL-CAUSAL-KSKIP: this slice is exactly the bottom-right
+                // aligned causal rectangle prepareScores builds for query
+                // block `block` -- L = 128 rows over kL = end columns, row m
+                // admitting columns 0 ..< end - 128 + m + 1 -- so the
+                // statistics row walk can stop at the diagonal.
                 let statistics = CBv2PrefillAttnTrafficV1.statistics(
-                    scores: stage.scores, values: stage.values)
+                    scores: stage.scores, values: stage.values,
+                    causalQueryBlock: 128)
             else { return nil }
             scores.append(stage.scores)
             stats.append(statistics)

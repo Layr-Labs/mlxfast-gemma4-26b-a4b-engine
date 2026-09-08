@@ -255,6 +255,24 @@ METAL_FUNC void softmax_transform_atile(
 // sm_stats + row * 4 (bf16 words carrying the fp32 bit patterns) relative to
 // this simdgroup's first row; this lane's rows are mm * 16 + sc.y + i * 8.
 // Non-transposed A only. gemm_loop itself is untouched.
+//
+// PREFILL-CAUSAL-KSKIP: k_active is the number of leading K columns that can
+// hold a non-masked score for ANY row this simdgroup owns. Every column at or
+// beyond it is strictly above the causal diagonal, so its score word is the
+// bfloat16 lowest finite value 0xFF7F, its transformed A element is
+// fast::exp(-3.3895e38 - maxval) * normalizer, which underflows to +0.0f, and
+// its contribution to the accumulator is a product with exactly +0.0. The
+// accumulator is cleared to +0.0 and only ever gains fma terms, so it is never
+// negative zero and x + (+-0.0) == x holds for every reachable x. Dropping
+// those K blocks is therefore bit-exact, not a tolerance. It also drops the
+// matching B rows, since a k block skipped on A is skipped on B.
+//
+// Kill switch: build with -DDARKBLOOM_GEMMA4_PREFILL_CAUSAL_KSKIP=0 and the
+// caller passes K, which folds every bound back to the incumbent form.
+#ifndef DARKBLOOM_GEMMA4_PREFILL_CAUSAL_KSKIP
+#define DARKBLOOM_GEMMA4_PREFILL_CAUSAL_KSKIP 1
+#endif
+
 template <
     typename T,
     short SM,
@@ -276,7 +294,8 @@ auto gemm_loop_softmax(
     int gemm_k_iterations_aligned,
     const short sgp_sm,
     const short sgp_sn,
-    const device T* sm_stats) {
+    const device T* sm_stats,
+    const int k_active) {
   static_assert(!transpose_a, "at1: non-transposed A operand only");
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;
@@ -325,8 +344,14 @@ auto gemm_loop_softmax(
         continue;
     }
 
+    // PREFILL-CAUSAL-KSKIP: k_active is simdgroup varying while the barrier
+    // above is threadgroup wide, so the loop trip count stays exactly what it
+    // was and the dead blocks are dropped from INSIDE the iteration. A
+    // partially live SK tile is still loaded whole; only wholly dead ones go.
+    const int kk1_end = metal::min(int(BK), k_active - kk0 * int(BK));
+
     STEEL_PRAGMA_NO_UNROLL
-    for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+    for (int kk1 = 0; kk1 < kk1_end; kk1 += SK) {
       NAXTile<T, RA, CA> Atile;
       NAXTile<T, RB, CB> Btile;
       const int k = kk1;
@@ -387,9 +412,13 @@ auto gemm_loop_softmax(
     }
 
     const short rem_bk = K - gemm_k_iterations_ * BK;
+    // PREFILL-CAUSAL-KSKIP: the tail sits at the high end of K, so it is the
+    // first thing the causal bound removes.
+    const int rem_end =
+        metal::min(int(rem_bk), k_active - gemm_k_iterations_ * int(BK));
 
     STEEL_PRAGMA_NO_UNROLL
-    for (int kk1 = 0; kk1 < rem_bk; kk1 += SK) {
+    for (int kk1 = 0; kk1 < rem_end; kk1 += SK) {
       NAXTile<T, RA, CA> Atile;
       NAXTile<T, RB, CB> Btile;
 

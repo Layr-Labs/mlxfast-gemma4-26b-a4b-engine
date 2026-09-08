@@ -41,6 +41,13 @@ constant bool align_K [[function_constant(202)]];
 #define DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY 1
 #endif
 
+// PREFILL-CAUSAL-KSKIP kill switch; the exactness argument lives in gemm_nax.h
+// above gemm_loop_softmax. Zero passes K through and restores the incumbent
+// bounds.
+#ifndef DARKBLOOM_GEMMA4_PREFILL_CAUSAL_KSKIP
+#define DARKBLOOM_GEMMA4_PREFILL_CAUSAL_KSKIP 1
+#endif
+
 // clang-format off
 template <
     bool kAlignedM,
@@ -287,6 +294,23 @@ template <
     }
   }
 
+  // PREFILL-CAUSAL-KSKIP: the composed prompt attention is the only producer
+  // of the at1 signature, and it always hands over a bottom-right aligned
+  // causal score rectangle: row m carries query index K - M + m and admits
+  // key columns 0 .. K - M + m, every column above that holding the bfloat16
+  // lowest finite word. The largest admitting row this simdgroup owns is its
+  // last one, so no column at or beyond this bound is live for any of them.
+  // Exactness argument in gemm_nax.h above gemm_loop_softmax.
+  int sm_k_active = params->K;
+#if DARKBLOOM_GEMMA4_PREFILL_CAUSAL_KSKIP
+  if constexpr (kSoftmaxLoaderEligible) {
+    if (softmax_loader && params->K >= params->M) {
+      const int lim = params->K - params->M + (c_row + int(tm)) + sgp_sm_int;
+      sm_k_active = lim < params->K ? (lim > 0 ? lim : 0) : params->K;
+    }
+  }
+#endif
+
   NAXTile<AccumType, TM, TN> Dtile;
 
   dispatch_bool(align_K, [&](auto kAlignedK) {
@@ -316,7 +340,8 @@ template <
                 params->gemm_k_iterations_aligned,
                 sgp_sm,
                 sgp_sn,
-                sm_stats);
+                sm_stats,
+                sm_k_active);
             loop_done = true;
           }
         }

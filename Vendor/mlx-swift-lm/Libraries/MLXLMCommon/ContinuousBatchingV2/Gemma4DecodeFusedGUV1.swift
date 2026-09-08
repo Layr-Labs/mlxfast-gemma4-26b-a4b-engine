@@ -21,7 +21,12 @@ public enum Gemma4DecodeFusedGUV1 {
     /// the 86% of threadgroups that never execute them.
     /// `DARKBLOOM_GEMMA4_GU_RUN_CAP=4` restores the incumbent.
     static let runCap: Int = {
-        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_RUN_CAP"] ?? "4"
+        // Ship the measured register-pressure win: compile out triple/quad
+        // stream bodies so the 86% of top-8 runs with count<=2 stop paying for
+        // rarely-taken wide paths. Runs of 3+ split into aligned cap-sized
+        // chunks via expert_run's offset mask (bit-identical). Cap 4 restores
+        // the prior register footprint.
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_RUN_CAP"] ?? "2"
         return Int(raw).map { min(max($0, 1), 4) } ?? 2
     }()
 
@@ -51,6 +56,7 @@ public enum Gemma4DecodeFusedGUV1 {
     private static func makeKernel(tagged: Bool) -> MLXFast.MLXFastKernel {
         MLXFast.metalKernel(
         name: "gemma4_b8_decode_gateup_geglu_threadgroup_v2_solo1"
+            + "_rc\(runCap)"
             + (tagged ? "_tagged_v1" : ""),
         inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"],
         outputNames: ["y"],
@@ -1217,7 +1223,7 @@ inline T gemma4_geglu_compiled_tape(T gate, T up) {
 #endif
 constant int guPairs=GU_PAIRS;
 #ifndef GU_RUN_CAP
-#define GU_RUN_CAP 4
+#define GU_RUN_CAP 2
 #endif
 constant uint guRunCap=GU_RUN_CAP;
 constant int guK=2816,guN=704,guSliceN=8;

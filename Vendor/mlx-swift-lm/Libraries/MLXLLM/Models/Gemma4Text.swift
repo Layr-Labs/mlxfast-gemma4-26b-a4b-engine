@@ -4352,13 +4352,28 @@ private enum Gemma4FusedLayerGlue {
             ensureRowContiguous: true
         )
 
+    /// The four equal BF16 boundary planes share one fresh allocation.
+    /// Each contiguous view owns its original region; V1 keeps its table ABI.
+    private static let prefixBF16ArenaEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFIX_BF16_ARENA_V1"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }()
+
+    private static func prefixBF16ArenaSource(_ original: String) -> String {
+        guard prefixBF16ArenaEnabled else { return original }
+        return "device T* out = branchPlanes;\ndevice T* dense = branchPlanes + 22528u;\ndevice T* expert = branchPlanes + 45056u;\ndevice T* router = branchPlanes + 67584u;\n" + original
+    }
+
     private static let attentionBranchPrefixKernelV2: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
             name: "gemma4_glue_attention_branch_prefix_2816_bf16_v2_nb1"
-                + tbSuffix,
+                + tbSuffix + (prefixBF16ArenaEnabled ? "_bf16_arena_v1" : ""),
             inputNames: ["attn", "res", "wa", "wd", "we", "wr"],
-            outputNames: ["out", "dense", "expert", "router"],
-            source: """
+            outputNames: prefixBF16ArenaEnabled ? ["branchPlanes"] : ["out", "dense", "expert", "router"],
+            source: prefixBF16ArenaSource("""
                 const uint row = threadgroup_position_in_grid.x;
                 const uint lid = thread_position_in_threadgroup.x;
                 const uint simd_lane_id = thread_index_in_simdgroup;
@@ -4389,7 +4404,7 @@ private enum Gemma4FusedLayerGlue {
                     expert[base + i] = we[wbase + i] * nx;
                     router[base + i] = wr[wbase + i] * nx;
                 }
-            """,
+            """),
             ensureRowContiguous: true
         )
 
@@ -4556,24 +4571,45 @@ private enum Gemma4FusedLayerGlue {
         else { return nil }
         if denseXSumElideEnabled {
             CBv2EngageMark.once("dense-xsum-elide")
-            let outs = attentionBranchPrefixKernelV2(
-                [
-                    attn, residual, postAttentionWeight, denseWeight,
-                    expertWeight, routerWeight,
-                ],
-                template: [("T", attn.dtype)],
-                grid: (rows * tgThreads, 1, 1),
-                threadGroup: (tgThreads, 1, 1),
-                outputShapes: [
-                    [rows, 1, axis],
-                    [rows, 1, axis],
-                    [rows, 1, axis],
-                    [rows, 1, axis],
-                ],
-                outputDTypes: [
-                    .bfloat16, .bfloat16, .bfloat16, .bfloat16,
+            let outs: [MLXArray]
+            if prefixBF16ArenaEnabled {
+                let output = attentionBranchPrefixKernelV2(
+                    [
+                        attn, residual, postAttentionWeight, denseWeight,
+                        expertWeight, routerWeight,
+                    ],
+                    template: [("T", attn.dtype)],
+                    grid: (rows * tgThreads, 1, 1),
+                    threadGroup: (tgThreads, 1, 1),
+                    outputShapes: [[90112]],
+                    outputDTypes: [.bfloat16]
+                )[0]
+                outs = [
+                    output[0..<22528].reshaped([rows, 1, axis]),
+                    output[22528..<45056].reshaped([rows, 1, axis]),
+                    output[45056..<67584].reshaped([rows, 1, axis]),
+                    output[67584..<90112].reshaped([rows, 1, axis]),
                 ]
-            )
+            } else {
+                outs = attentionBranchPrefixKernelV2(
+                    [
+                        attn, residual, postAttentionWeight, denseWeight,
+                        expertWeight, routerWeight,
+                    ],
+                    template: [("T", attn.dtype)],
+                    grid: (rows * tgThreads, 1, 1),
+                    threadGroup: (tgThreads, 1, 1),
+                    outputShapes: [
+                        [rows, 1, axis],
+                        [rows, 1, axis],
+                        [rows, 1, axis],
+                        [rows, 1, axis],
+                    ],
+                    outputDTypes: [
+                        .bfloat16, .bfloat16, .bfloat16, .bfloat16,
+                    ]
+                )
+            }
             CBv2EngageMark.once("attention-branch-prefix")
             return AttentionBranchPrefix(
                 out: outs[0],

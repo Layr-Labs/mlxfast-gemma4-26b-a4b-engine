@@ -48,13 +48,86 @@ public enum Gemma4DecodeFusedGUV1 {
     /// two carry distinct kernel names so their pipeline-cache entries never
     /// alias. Only an already-unreachable branch is removed, so the output is
     /// bit-identical.
-    private static func makeKernel(tagged: Bool) -> MLXFast.MLXFastKernel {
+    /// GU-STATIC-K. The four `tg_qmv_affine4_g64_*_impl` bodies take the
+    /// contraction length as `const constant int&` and are always called with
+    /// `guK`, which this kernel declares as `constant int guK=2816`. A
+    /// reference parameter is opaque to the Metal optimizer, so the block loop
+    /// carries a dynamic trip count and the `/ 2` and `/ 64` that derive the
+    /// packed-word and group strides stay runtime divisions. Substituting the
+    /// literal exposes the bound: eleven whole 256-value blocks and two
+    /// constant divisors. The values, the arithmetic and the accumulation
+    /// order are the ones the reference produced; only what the compiler knows
+    /// about them changes, so the kernel is bit-exact.
+    ///
+    /// `DARKBLOOM_GEMMA4_GU_STATIC_K=0` restores the runtime reference and the
+    /// incumbent kernel name.
+    static let guStaticKEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_GU_STATIC_K"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let guStaticKSuffix: String = guStaticKEnabled ? "_sk1" : ""
+
+    /// DQS1: sibling outputs from one invocation; no step-dependent cache.
+    /// Caller has proved tagged routes, cap two or four and the production geometry.
+    static func callWithDownQuartets(_ inputs: [MLXArray]) -> [MLXArray] {
+        kernelTaggedDownQuartets(inputs,
+            grid: (32, 176 * 2, 64), threadGroup: (32, 2, 1),
+            outputShapes: [outputShape, [64, 176]],
+            outputDTypes: [outputDType, .float32])
+    }
+
+    private static let downQuartetSource = #"""
+static_assert(GU_PAIRS == 1 && (GU_RUN_CAP == 2 || GU_RUN_CAP == 4), "DQS1 admission");
+uint3 tid=threadgroup_position_in_grid;
+uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
+const uint linear=tid.y+tid.z*176u;tid.y=linear/64u;tid.z=linear%64u;
+const uint assignment=tid.z;const ExpertRun run=expert_run(rhs,assignment);
+if(!run.leader)return;
+const uint column=tid.y*4u;
+const uint packedRow=(column/16u)*32u+column%16u+(sg==1u ? 16u:0u)-sg*4u;
+const uint expertBase=run.expert*1408u;
+threadgroup bfloat tile[32];
+uint3 mathTid=tid;mathTid.y=0;
+tg_execute_projection<bfloat>(
+    w+(expertBase+packedRow)*352u,scales+(expertBase+packedRow)*44u,
+    biases+(expertBase+packedRow)*44u,x,lhs,tile,8,guSliceN,
+    assignment,run.count,mathTid,sg,lane);
+threadgroup_barrier(mem_flags::mem_threadgroup);
+if(sg==0u){
+    // All 32 lanes execute every shuffle; inactive output lanes carry zero.
+    bfloat a=bfloat(0.0f);
+    if(lane<run.count*4u){
+        const uint r=lane/4u,h=lane%4u;
+        const bfloat g=tile[r*8u+h],u=tile[r*8u+4u+h];
+        a=gemma4_geglu_compiled_tape(g,u);
+        y[(assignment+r)*704u+column+h]=a;
+    }
+    const uint bits=uint(as_type<ushort>(a));
+    const uint qbase=lane&~3u;
+    const bfloat b=as_type<bfloat>(ushort(simd_shuffle(bits,ushort(qbase+1u))));
+    const bfloat c=as_type<bfloat>(ushort(simd_shuffle(bits,ushort(qbase+2u))));
+    const bfloat d=as_type<bfloat>(ushort(simd_shuffle(bits,ushort(qbase+3u))));
+    if(lane<run.count*4u && (lane&3u)==0u){
+        // The donor's quartet expression, widened only AFTER it is computed.
+        const float q=a+b+c+d;
+        quartets[(assignment+lane/4u)*176u+column/4u]=q;
+    }
+}
+"""#
+
+    private static func makeKernel(
+        tagged: Bool, downQuartets: Bool = false
+    ) -> MLXFast.MLXFastKernel {
         MLXFast.metalKernel(
         name: "gemma4_b8_decode_gateup_geglu_threadgroup_v2_solo1"
-            + (tagged ? "_tagged_v1" : ""),
+            + guStaticKSuffix
+            + (tagged ? "_tagged_v1" : "") + (downQuartets ? "_dqs1" : ""),
         inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"],
-        outputNames: ["y"],
-        source: #"""
+        outputNames: downQuartets ? ["y", "quartets"] : ["y"],
+        source: downQuartets ? downQuartetSource : #"""
 uint3 tid=threadgroup_position_in_grid;
 uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
 
@@ -83,7 +156,9 @@ uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
 
 """#,
         header: "#define GU_RUN_CAP \(runCap)\n"
-            + "#define GU_TAGGED_ROUTE \(tagged ? 1 : 0)\n" + #"""
+            + "#define GU_TAGGED_ROUTE \(tagged ? 1 : 0)\n"
+            + (guStaticKEnabled
+                ? "#define GU_IN_VEC 2816\n" : "#define GU_IN_VEC in_vec_size\n") + #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helpers from 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -597,7 +672,7 @@ METAL_FUNC void tg_qmv_impl(
     y += tid.x * out_vec_size + out_row;
 
     int k = 0;
-    for (; k <= in_vec_size - block_size; k += block_size) {
+    for (; k <= GU_IN_VEC - block_size; k += block_size) {
       U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
       for (int row = 0;
@@ -660,7 +735,7 @@ METAL_FUNC void tg_qmv_impl(
     y += tid.x * out_vec_size + used_out_row;
 
     int k = 0;
-    for (; k <= in_vec_size - block_size; k += block_size) {
+    for (; k <= GU_IN_VEC - block_size; k += block_size) {
       U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
       for (int row = 0; row < results_per_simdgroup; row++) {
@@ -764,8 +839,8 @@ METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
   thread float result0[results_per_simdgroup] = {0};
   thread float result1[results_per_simdgroup] = {0};
 
-  const int in_vec_size_w = in_vec_size / 2;
-  const int in_vec_size_g = in_vec_size / 64;
+  const int in_vec_size_w = GU_IN_VEC / 2;
+  const int in_vec_size_g = GU_IN_VEC / 64;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
@@ -778,7 +853,7 @@ METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
   y1 += out_row;
 
   int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
+  for (; k <= GU_IN_VEC - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
       scale_local[row] = scales[row * in_vec_size_g];
@@ -866,8 +941,8 @@ METAL_FUNC void tg_qmv_affine4_g64_solo_impl(
   thread float bias_local[results_per_simdgroup];
   thread float result0[results_per_simdgroup] = {0};
 
-  const int in_vec_size_w = in_vec_size / 2;
-  const int in_vec_size_g = in_vec_size / 64;
+  const int in_vec_size_w = GU_IN_VEC / 2;
+  const int in_vec_size_g = GU_IN_VEC / 64;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
@@ -878,7 +953,7 @@ METAL_FUNC void tg_qmv_affine4_g64_solo_impl(
   y0 += out_row;
 
   int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
+  for (; k <= GU_IN_VEC - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
       scale_local[row] = scales[row * in_vec_size_g];
@@ -958,8 +1033,8 @@ METAL_FUNC void tg_qmv_affine4_g64_triple_stream_impl(
   thread float result1[results_per_simdgroup] = {0};
   thread float result2[results_per_simdgroup] = {0};
 
-  const int in_vec_size_w = in_vec_size / 2;
-  const int in_vec_size_g = in_vec_size / 64;
+  const int in_vec_size_w = GU_IN_VEC / 2;
+  const int in_vec_size_g = GU_IN_VEC / 64;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
@@ -974,7 +1049,7 @@ METAL_FUNC void tg_qmv_affine4_g64_triple_stream_impl(
   y2 += out_row;
 
   int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
+  for (; k <= GU_IN_VEC - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] =
           *((const device uint*)(ws + row * in_vec_size_w));
@@ -1087,8 +1162,8 @@ METAL_FUNC void tg_qmv_affine4_g64_quad_stream_impl(
   thread float result2[results_per_simdgroup] = {0};
   thread float result3[results_per_simdgroup] = {0};
 
-  const int in_vec_size_w = in_vec_size / 2;
-  const int in_vec_size_g = in_vec_size / 64;
+  const int in_vec_size_w = GU_IN_VEC / 2;
+  const int in_vec_size_g = GU_IN_VEC / 64;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
@@ -1105,7 +1180,7 @@ METAL_FUNC void tg_qmv_affine4_g64_quad_stream_impl(
   y3 += out_row;
 
   int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
+  for (; k <= GU_IN_VEC - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] =
           *((const device uint*)(ws + row * in_vec_size_w));
@@ -1267,4 +1342,6 @@ METAL_FUNC void tg_execute_projection(const device uint* w,const device T* scale
 
     private static let kernelGeneral: MLXFast.MLXFastKernel = makeKernel(tagged: false)
     private static let kernelTagged: MLXFast.MLXFastKernel = makeKernel(tagged: true)
+    private static let kernelTaggedDownQuartets: MLXFast.MLXFastKernel =
+        makeKernel(tagged: true, downQuartets: true)
 }

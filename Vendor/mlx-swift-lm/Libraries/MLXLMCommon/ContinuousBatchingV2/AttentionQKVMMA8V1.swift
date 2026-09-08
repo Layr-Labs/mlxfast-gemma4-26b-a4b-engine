@@ -876,6 +876,77 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
+    /// QKV-STATIC-N-001. The rsp bodies read N only in their store epilogues
+    /// (`y[c.fn * N + ...]`, and `n2 = N - SPLIT` on the fused road), where it
+    /// is loop-invariant per dispatch. The live decode widths are admission
+    /// pins, so each static-N kernel below passes its admitted total as a
+    /// literal: the inlined body folds the store addresses exactly as the
+    /// header-constexpr folds on the o_proj and dense-down roads, with no
+    /// shared-header surgery. No floating-point expression changes; integer
+    /// addressing only, bit-identical by construction.
+    /// `DARKBLOOM_GEMMA4_QKV_STATIC_N=0` restores the promoted rsp dispatches
+    /// under their promoted names.
+    public static let staticNEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_STATIC_N"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Fused sliding Q|K pair (4096 + 2048): N = 6144.
+    private static let fusedSlidingRspStaticNKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_staticn_v1",
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y", "y2"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816, 4096>(
+                w, scales, biases, x, rs_table, y,
+                6144, int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup, y2);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    /// Fused full Q|K pair (8192 + 1024): N = 9216.
+    private static let fusedFullRspStaticNKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_staticn_v1",
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y", "y2"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816, 8192>(
+                w, scales, biases, x, rs_table, y,
+                9216, int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup, y2);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    /// Standalone V plane on sliding layers: N = 2048.
+    private static let multiTileRspStaticNKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_staticn2048_v1",
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816>(
+                w, scales, biases, x, rs_table, y,
+                2048, int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
     /// MMA-RS-001 table for one activation tensor. Returns nil unless the
     /// tensor matches the exact decode shape the rsp bodies admit, so a nil
     /// table always means "use the incumbent dispatch".
@@ -1005,10 +1076,25 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             && rsTable!.dtype == .float32
             && rsTable!.shape == [batch, inputWidth / Self.groupSize]
 
-        let kernel =
+        let promotedKernel =
             qWidth == 4096
             ? (tableReady ? fusedSlidingRspKernel : fusedSlidingKernel)
             : (tableReady ? fusedFullRspKernel : fusedFullKernel)
+        // QKV-STATIC-N-001: the rsp store epilogue's N is the admitted pair
+        // total. Gate each static-N kernel on its exact (Q, K) pair so any
+        // other geometry keeps the promoted dispatch.
+        let kernel = {
+            guard staticNEnabled, tableReady else { return promotedKernel }
+            if qWidth == 4096, kWidth == 2048 {
+                CBv2EngageMark.once("qkv-static-n-qk6144")
+                return fusedSlidingRspStaticNKernel
+            }
+            if qWidth == 8192, kWidth == 1024 {
+                CBv2EngageMark.once("qkv-static-n-qk9216")
+                return fusedFullRspStaticNKernel
+            }
+            return promotedKernel
+        }()
         let total = qWidth + kWidth
         let yTiles = total / outputsPerGroup
         guard yTiles % tilesPerGroup == 0 else { return nil }
@@ -1034,6 +1120,161 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             outputShapes: [[batch, sequence, qWidth], [batch, sequence, kWidth]],
             outputDTypes: [x.dtype, x.dtype])
         return (outputs[0], outputs[1])
+    }
+
+    // MARK: - QKV-COMPILED-094 --- one compiled identity for the Q|K and V pair
+
+    /// Default ON. `DARKBLOOM_GEMMA4_COMPILED_QKV=0` (or an externally set
+    /// `MLX_DISABLE_COMPILE`) keeps the two separate wrapper calls.
+    private static let compiledQKVEnabled: Bool = {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["MLX_DISABLE_COMPILE"] == nil else { return false }
+        guard let raw = environment["DARKBLOOM_GEMMA4_COMPILED_QKV"] else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Stream and arm checks run on every call, outside the trace.
+    public static var compiledQKVAvailable: Bool {
+        compiledQKVEnabled && MLXHardwareInfo.isCompiledDecodeSupported
+            && StreamOrDevice.default == .gpu
+            && enabled && fuseQKEnabled && multiTileEnabled && rsPrepassEnabled
+    }
+
+    private static let compiledQKVLock = NSLock()
+    nonisolated(unsafe) private static var compiledQKVPlans:
+        [Int: @Sendable ([MLXArray]) -> [MLXArray]] = [:]
+
+    /// The trace bakes the two launches' grids, so one identity per output
+    /// width triple. There are two on this model (sliding and full), and the
+    /// table cannot grow past the widths `liveFusedSplit`/`liveOutputWidth`
+    /// admit.
+    private static func compiledQKVPlan(
+        qWidth: Int, kWidth: Int, vWidth: Int
+    ) -> @Sendable ([MLXArray]) -> [MLXArray] {
+        let key = (qWidth &* 100_003 &+ kWidth) &* 100_003 &+ vWidth
+        compiledQKVLock.lock()
+        defer { compiledQKVLock.unlock() }
+        if let hit = compiledQKVPlans[key] { return hit }
+        let plan = makeCompiledQKVPlan(qWidth: qWidth, kWidth: kWidth, vWidth: vWidth)
+        compiledQKVPlans[key] = plan
+        return plan
+    }
+
+    private static func makeCompiledQKVPlan(
+        qWidth: Int, kWidth: Int, vWidth: Int
+    ) -> @Sendable ([MLXArray]) -> [MLXArray] {
+        let qkKernel = qWidth == 4096 ? fusedSlidingRspKernel : fusedFullRspKernel
+        let qkGroups = ((qWidth + kWidth) / outputsPerGroup / tilesPerGroup) * simdGroups
+        let vTiles = vWidth / outputsPerGroup
+        let vMultiTile = vTiles % tilesPerGroup == 0
+        let vKernel =
+            vMultiTile
+            ? (vWidth == 2048 ? multiTileRspKernelN2048 : multiTileRspKernel)
+            : mma8RspKernel
+        let vGroups = vMultiTile ? (vTiles / tilesPerGroup) * simdGroups : vTiles * simdGroups
+        return MLX.compile(shapeless: false) { inputs in
+            let x = inputs[0]
+            let table = inputs[7]
+            let qk = qkKernel(
+                [x, inputs[1], inputs[2], inputs[3], table],
+                template: [("T", DType.bfloat16)],
+                grid: (simdWidth, qkGroups, 1),
+                threadGroup: (simdWidth, simdGroups, 1),
+                outputShapes: [[batch, sequence, qWidth], [batch, sequence, kWidth]],
+                outputDTypes: [.bfloat16, .bfloat16])
+            let v = vKernel(
+                [x, inputs[4], inputs[5], inputs[6], table],
+                template: [("T", DType.bfloat16)],
+                grid: (simdWidth, vGroups, 1),
+                threadGroup: (simdWidth, simdGroups, 1),
+                outputShapes: [[batch, sequence, vWidth]],
+                outputDTypes: [.bfloat16])[0]
+            return [qk[0], qk[1], v]
+        }
+    }
+
+    /// QKFUSE-001's fused Q|K dispatch and the V projection under ONE compiled
+    /// identity. Both read the same activation and the same run-sum table and
+    /// neither depends on the other, so the trace holds exactly the two GPU
+    /// dispatches the incumbent pair issues, in the same order, with the same
+    /// operands, grids, threadgroups, output shapes and output dtypes. Nothing
+    /// is fused, reassociated or skipped: the saving is the repeated Swift
+    /// kernel-wrapper and graph construction on a warm compiled call, the same
+    /// mechanism the dense MLP pair takes in `CBv2DenseMLPQMVV1`.
+    ///
+    /// The closure captures no module and no tensor. All eight arrays -- the
+    /// activation, the fused Q|K plane's three tensors, the V plane's three,
+    /// and the run-sum table -- are substituted on every call.
+    ///
+    /// nil whenever any incumbent guard fails, which keeps the two separate
+    /// dispatches byte for byte.
+    public static func compiledQKVMatmul(
+        x: MLXArray,
+        qWeight: MLXArray, qScales: MLXArray, qBiases: MLXArray?,
+        kWeight: MLXArray, kScales: MLXArray, kBiases: MLXArray?,
+        vWeight: MLXArray, vScales: MLXArray, vBiases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode,
+        cacheKey: ObjectIdentifier,
+        rsTable: MLXArray?
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard compiledQKVAvailable,
+            groupSize == Self.groupSize,
+            bits == Self.bits,
+            mode == .affine,
+            let qBiases, let kBiases, let vBiases,
+            let rsTable,
+            rsTable.dtype == .float32,
+            rsTable.shape == [batch, inputWidth / Self.groupSize],
+            x.dtype == .bfloat16,
+            qScales.dtype == .bfloat16, qBiases.dtype == .bfloat16,
+            kScales.dtype == .bfloat16, kBiases.dtype == .bfloat16,
+            vScales.dtype == .bfloat16, vBiases.dtype == .bfloat16,
+            qWeight.dtype == .uint32, kWeight.dtype == .uint32, vWeight.dtype == .uint32,
+            x.ndim == 3,
+            x.dim(0) == batch, x.dim(1) == sequence, x.dim(2) == inputWidth,
+            x.size == batch * sequence * inputWidth,
+            qWeight.ndim == 2, kWeight.ndim == 2, vWeight.ndim == 2,
+            qWeight.dim(1) == inputWidth * Self.bits / 32,
+            kWeight.dim(1) == inputWidth * Self.bits / 32,
+            vWeight.dim(1) == inputWidth * Self.bits / 32
+        else { return nil }
+
+        let qWidth = qWeight.dim(0)
+        let kWidth = kWeight.dim(0)
+        let vWidth = vWeight.dim(0)
+        guard liveFusedSplit(qWidth), liveOutputWidth(kWidth), liveOutputWidth(vWidth),
+            qScales.shape == [qWidth, inputWidth / Self.groupSize],
+            qBiases.shape == qScales.shape,
+            kScales.shape == [kWidth, inputWidth / Self.groupSize],
+            kBiases.shape == kScales.shape,
+            vScales.shape == [vWidth, inputWidth / Self.groupSize],
+            vBiases.shape == vScales.shape,
+            ((qWidth + kWidth) / outputsPerGroup) % tilesPerGroup == 0,
+            (vWidth / outputsPerGroup) % tilesPerGroup == 0
+        else { return nil }
+
+        // The same memoized concatenated plane the incumbent fused dispatch
+        // reads; built here only if this layer has not built it yet.
+        fusedLock.lock()
+        var plane = fusedPlanes[cacheKey]
+        if plane == nil {
+            let w = concatenated([qWeight, kWeight], axis: 0)
+            let s = concatenated([qScales, kScales], axis: 0)
+            let b = concatenated([qBiases, kBiases], axis: 0)
+            eval(w, s, b)
+            plane = (w, s, b)
+            fusedPlanes[cacheKey] = plane
+        }
+        fusedLock.unlock()
+        guard let (fw, fs, fb) = plane else { return nil }
+
+        CBv2EngageMark.once("qkv-compiled-pair")
+        let outputs = compiledQKVPlan(qWidth: qWidth, kWidth: kWidth, vWidth: vWidth)(
+            [x, fw, fs, fb, vWeight, vScales, vBiases, rsTable])
+        guard outputs.count == 3 else { return nil }
+        return (outputs[0], outputs[1], outputs[2])
     }
 
     /// Q widths the fused kernels bake as a compile-time split point.
@@ -1107,6 +1348,19 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
                 )[0]
             }
             if tableReady {
+                // QKV-STATIC-N-001: the sliding V plane is always 2048 wide;
+                // any other width keeps the promoted kernel.
+                if staticNEnabled, outputWidth == 2048 {
+                    CBv2EngageMark.once("qkv-static-n-v2048")
+                    return multiTileRspStaticNKernel(
+                        [x, weight, scales, biases, rsTable!],
+                        template: [("T", x.dtype)],
+                        grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),
+                        threadGroup: (simdWidth, simdGroups, 1),
+                        outputShapes: [[batch, sequence, outputWidth]],
+                        outputDTypes: [x.dtype]
+                    )[0]
+                }
                 return multiTileRspKernel(
                     [x, weight, scales, biases, rsTable!],
                     template: [("T", x.dtype)],

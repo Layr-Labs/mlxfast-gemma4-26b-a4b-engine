@@ -9,6 +9,12 @@ enum CBv2GroupedPrefillPVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    private static let tightSwizzleEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_GROUPED_PV_TIGHT_SWIZZLE_V1"] else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private struct Geometry {
         let bm: Int
         let bk: Int
@@ -29,7 +35,8 @@ enum CBv2GroupedPrefillPVV1 {
             generation >= (suffix == "p" ? 18 : 17)
         else { return nil }
         if suffix == "s" || suffix == "c" || suffix == "d" {
-            return Geometry(bm: 64, bk: 256, wm: 2, swizzle: 2)
+            let swizzle = tightSwizzleEnabled ? 1 : 2
+            return Geometry(bm: 64, bk: 256, wm: 2, swizzle: swizzle)
         }
         return Geometry(bm: 128, bk: 512, wm: 4, swizzle: 0)
         #else

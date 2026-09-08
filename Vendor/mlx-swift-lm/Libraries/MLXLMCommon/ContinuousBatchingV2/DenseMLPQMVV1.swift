@@ -1136,6 +1136,45 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         return compiledPair(inputs).first
     }
 
+    private static let compiledFencedPair: @Sendable ([MLXArray]) -> [MLXArray] =
+        MLX.compile(shapeless: false) { inputs in
+            let denseIn = MLX.depends(input: inputs[0], dependencies: [inputs[8]])
+            let activated = gateUpGeluCall([denseIn, inputs[1], inputs[2], inputs[3]])
+            let held = MLX.depends(input: activated, dependencies: [inputs[7]])
+            let denseOut = downStaticKNCall([held, inputs[4], inputs[5], inputs[6]])
+            let expertNorm = MLX.depends(input: inputs[9], dependencies: [denseOut])
+            return [denseOut, expertNorm]
+        }
+
+    public static func compiledGateUpGeluDownFenced(
+        _ inputs: [MLXArray], groupSize: Int, bits: Int, mode: QuantizationMode
+    ) -> (denseOut: MLXArray, expertNorm: MLXArray)? {
+        guard compiledPairAvailable,
+            groupSize == Self.groupSize, bits == Self.bits, mode == .affine,
+            inputs.count == 10
+        else { return nil }
+        let x = inputs[0], guWeight = inputs[1], guScales = inputs[2], guBiases = inputs[3]
+        let downWeight = inputs[4], downScales = inputs[5], downBiases = inputs[6]
+        let scores = inputs[7], routerNorm = inputs[8], expertNormIn = inputs[9]
+        guard x.dtype == .bfloat16, (x.ndim == 3 && x.dim(0) == batch && x.dim(1) == sequence && x.dim(2) == 2816),
+            guWeight.dtype == .uint32, (guWeight.ndim == 2 && guWeight.dim(0) == 4224 && guWeight.dim(1) == 704),
+            guScales.dtype == .bfloat16, (guScales.ndim == 2 && guScales.dim(0) == 4224 && guScales.dim(1) == 44),
+            guBiases.dtype == .bfloat16, guBiases.shape == guScales.shape,
+            downWeight.dtype == .uint32, (downWeight.ndim == 2 && downWeight.dim(0) == 2816 && downWeight.dim(1) == 528),
+            downScales.dtype == .bfloat16, (downScales.ndim == 2 && downScales.dim(0) == 2816 && downScales.dim(1) == 33),
+            downBiases.dtype == .bfloat16, downBiases.shape == downScales.shape,
+            scores.dtype == .bfloat16, (scores.ndim == 3 && scores.dim(0) == batch && scores.dim(1) == sequence && scores.dim(2) == 128),
+            routerNorm.dtype == .bfloat16, routerNorm.shape == x.shape,
+            expertNormIn.dtype == .bfloat16, expertNormIn.shape == x.shape
+        else { return nil }
+        CBv2EngageMark.once("dense-gelu-epilogue-decode")
+        CBv2EngageMark.once("mlp-down-static-n")
+        CBv2EngageMark.once("dense-compiled-gu-down")
+        CBv2EngageMark.once("dense-compiled-fenced-pair")
+        let outputs = compiledFencedPair(inputs)
+        return (outputs[0], outputs[1])
+    }
+
     /// Raw launch shared with the guarded public entry and the pure trace.
     private static func gateUpGeluCall(_ inputs: [MLXArray]) -> MLXArray {
         let yTiles = 2112 / outputsPerGroup

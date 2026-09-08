@@ -25,6 +25,11 @@ public enum Gemma4DecodeFusedGUV1 {
         return Int(raw).map { min(max($0, 1), 4) } ?? 2
     }()
 
+    private static let staticKEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_STATIC_K"] else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     static func call(x: MLXArray, storage: SwitchGateUpFusedStorage,
         lhs: MLXArray, rhs: MLXArray, taggedRoute: Bool = false) -> MLXArray {
         call([storage.weight, storage.scales, storage.biases, x, lhs, rhs],
@@ -83,7 +88,8 @@ uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
 
 """#,
         header: "#define GU_RUN_CAP \(runCap)\n"
-            + "#define GU_TAGGED_ROUTE \(tagged ? 1 : 0)\n" + #"""
+            + "#define GU_TAGGED_ROUTE \(tagged ? 1 : 0)\n"
+            + (staticKEnabled ? "#define GU_IN_VEC 2816\n" : "") + #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helpers from 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -764,8 +770,15 @@ METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
   thread float result0[results_per_simdgroup] = {0};
   thread float result1[results_per_simdgroup] = {0};
 
+#ifdef GU_IN_VEC
+  constexpr int in_vec_size_w = GU_IN_VEC / 2;
+  constexpr int in_vec_size_g = GU_IN_VEC / 64;
+  constexpr int in_vec_limit = GU_IN_VEC - block_size;
+#else
   const int in_vec_size_w = in_vec_size / 2;
   const int in_vec_size_g = in_vec_size / 64;
+  const int in_vec_limit = in_vec_size - block_size;
+#endif
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
@@ -778,7 +791,10 @@ METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
   y1 += out_row;
 
   int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
+#ifdef GU_IN_VEC
+  #pragma unroll
+#endif
+  for (; k <= in_vec_limit; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
       scale_local[row] = scales[row * in_vec_size_g];
@@ -804,6 +820,7 @@ METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
     x1 += block_size;
   }
 
+#ifndef GU_IN_VEC
   // Every Gemma 4 caller entering this specialized g64 path has K aligned to
   // 64.  The final block therefore contains an integral number of complete
   // eight-value lane packets (32 lanes for K=2816, 24 for expert down_proj
@@ -830,6 +847,7 @@ METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
       result1[row] += dot1;
     }
   }
+#endif
 
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
@@ -866,8 +884,15 @@ METAL_FUNC void tg_qmv_affine4_g64_solo_impl(
   thread float bias_local[results_per_simdgroup];
   thread float result0[results_per_simdgroup] = {0};
 
+#ifdef GU_IN_VEC
+  constexpr int in_vec_size_w = GU_IN_VEC / 2;
+  constexpr int in_vec_size_g = GU_IN_VEC / 64;
+  constexpr int in_vec_limit = GU_IN_VEC - block_size;
+#else
   const int in_vec_size_w = in_vec_size / 2;
   const int in_vec_size_g = in_vec_size / 64;
+  const int in_vec_limit = in_vec_size - block_size;
+#endif
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
@@ -878,7 +903,10 @@ METAL_FUNC void tg_qmv_affine4_g64_solo_impl(
   y0 += out_row;
 
   int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
+#ifdef GU_IN_VEC
+  #pragma unroll
+#endif
+  for (; k <= in_vec_limit; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
       scale_local[row] = scales[row * in_vec_size_g];
@@ -898,6 +926,7 @@ METAL_FUNC void tg_qmv_affine4_g64_solo_impl(
     x0 += block_size;
   }
 
+#ifndef GU_IN_VEC
   // Same whole-packet tail contract as the pair path: the only caller enters
   // with K=guK=2816, a whole number of 256-value blocks, so the final block
   // holds complete eight-value lane packets and no lane takes this branch.
@@ -917,6 +946,7 @@ METAL_FUNC void tg_qmv_affine4_g64_solo_impl(
           packed[row], x0_thread, scale_local[row], bias_local[row], sum0);
     }
   }
+#endif
 
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
@@ -958,8 +988,15 @@ METAL_FUNC void tg_qmv_affine4_g64_triple_stream_impl(
   thread float result1[results_per_simdgroup] = {0};
   thread float result2[results_per_simdgroup] = {0};
 
+#ifdef GU_IN_VEC
+  constexpr int in_vec_size_w = GU_IN_VEC / 2;
+  constexpr int in_vec_size_g = GU_IN_VEC / 64;
+  constexpr int in_vec_limit = GU_IN_VEC - block_size;
+#else
   const int in_vec_size_w = in_vec_size / 2;
   const int in_vec_size_g = in_vec_size / 64;
+  const int in_vec_limit = in_vec_size - block_size;
+#endif
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
@@ -974,7 +1011,10 @@ METAL_FUNC void tg_qmv_affine4_g64_triple_stream_impl(
   y2 += out_row;
 
   int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
+#ifdef GU_IN_VEC
+  #pragma unroll
+#endif
+  for (; k <= in_vec_limit; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] =
           *((const device uint*)(ws + row * in_vec_size_w));
@@ -1006,6 +1046,7 @@ METAL_FUNC void tg_qmv_affine4_g64_triple_stream_impl(
     x2 += block_size;
   }
 
+#ifndef GU_IN_VEC
   const int remaining = clamp(
       static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
       0,
@@ -1037,6 +1078,7 @@ METAL_FUNC void tg_qmv_affine4_g64_triple_stream_impl(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
   }
+#endif
 
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
@@ -1087,8 +1129,15 @@ METAL_FUNC void tg_qmv_affine4_g64_quad_stream_impl(
   thread float result2[results_per_simdgroup] = {0};
   thread float result3[results_per_simdgroup] = {0};
 
+#ifdef GU_IN_VEC
+  constexpr int in_vec_size_w = GU_IN_VEC / 2;
+  constexpr int in_vec_size_g = GU_IN_VEC / 64;
+  constexpr int in_vec_limit = GU_IN_VEC - block_size;
+#else
   const int in_vec_size_w = in_vec_size / 2;
   const int in_vec_size_g = in_vec_size / 64;
+  const int in_vec_limit = in_vec_size - block_size;
+#endif
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
@@ -1105,7 +1154,10 @@ METAL_FUNC void tg_qmv_affine4_g64_quad_stream_impl(
   y3 += out_row;
 
   int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
+#ifdef GU_IN_VEC
+  #pragma unroll
+#endif
+  for (; k <= in_vec_limit; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] =
           *((const device uint*)(ws + row * in_vec_size_w));
@@ -1143,6 +1195,7 @@ METAL_FUNC void tg_qmv_affine4_g64_quad_stream_impl(
     x3 += block_size;
   }
 
+#ifndef GU_IN_VEC
   const int remaining = clamp(
       static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
       0,
@@ -1180,6 +1233,7 @@ METAL_FUNC void tg_qmv_affine4_g64_quad_stream_impl(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
   }
+#endif
 
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
@@ -1220,7 +1274,12 @@ constant int guPairs=GU_PAIRS;
 #define GU_RUN_CAP 4
 #endif
 constant uint guRunCap=GU_RUN_CAP;
-constant int guK=2816,guN=704,guSliceN=8;
+#ifdef GU_IN_VEC
+constant constexpr int guK=GU_IN_VEC;
+#else
+constant int guK=2816;
+#endif
+constant int guN=704,guSliceN=8;
 struct ExpertRun { uint expert; uint count; bool leader; };
 METAL_FUNC ExpertRun expert_run(const device uint* rhs,uint assignment) {
     const uint word=rhs[assignment];

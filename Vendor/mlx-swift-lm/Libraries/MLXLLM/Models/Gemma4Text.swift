@@ -5674,6 +5674,28 @@ private class Gemma4MLP: Module {
              down.weight, down.scales, downBiases, expertScores],
             groupSize: gate.groupSize, bits: gate.bits, mode: gate.mode)
     }
+
+    fileprivate func zipCompiledGateUpGeluDownFenced(
+        n1: MLXArray, expertScores: MLXArray, routerNorm: MLXArray, expertNormIn: MLXArray
+    ) -> (denseOut: MLXArray, expertNorm: MLXArray)? {
+        guard gemma4DenseGateUpJoinEnabled,
+            let storage = fusedGateUpStorage,
+            let gate = gateProj as? QuantizedLinear,
+            let up = upProj as? QuantizedLinear,
+            let down = downProj as? QuantizedLinear,
+            gate.bias == nil, up.bias == nil, down.bias == nil,
+            gate.groupSize == 64, up.groupSize == gate.groupSize,
+            down.groupSize == gate.groupSize,
+            gate.bits == 8, up.bits == gate.bits, down.bits == gate.bits,
+            gate.mode == .affine, up.mode == gate.mode, down.mode == gate.mode,
+            let downBiases = down.biases
+        else { return nil }
+        return CBv2DenseMLPQMVV1.compiledGateUpGeluDownFenced(
+            [n1, storage.weight, storage.scales, storage.biases,
+             down.weight, down.scales, downBiases, expertScores,
+             routerNorm, expertNormIn],
+            groupSize: gate.groupSize, bits: gate.bits, mode: gate.mode)
+    }
 }
 
 /// ZIP-ROUTER-001 -- interleave the MoE layer's router chain with the
@@ -5841,12 +5863,24 @@ private enum Gemma4ZipRouterV1 {
         let normed = carriedRouterNorm ?? router.zipNorm(out)
 
         // Default ZIP only. The trace keeps the score dependency BETWEEN the
-        // same two dense kernels; incoming and outgoing fences stay outside it.
+        // same two dense kernels, and fences router and expert norm dependencies.
         if plan == 1, gemma4DenseGateUpJoinEnabled,
             Gemma4FusedLayerGlue.denseXSumElideEnabled,
             CBv2DenseMLPQMVV1.compiledPairAvailable
         {
             let expertScores = router.zipScores(normed)
+            if let (denseOut, expertNorm) = mlp.zipCompiledGateUpGeluDownFenced(
+                n1: n1, expertScores: expertScores, routerNorm: normed, expertNormIn: n2)
+            {
+                let selected = selectAfterDense(
+                    router: router, expertScores: expertScores, denseOut: denseOut)
+                Gemma4RouterProbe.recorder?(expertScores, selected.indices)
+                CBv2EngageMark.once("zip-router")
+                return Zipped(
+                    denseOut: denseOut, expertNorm: expertNorm,
+                    topKIndices: selected.indices, topKWeights: selected.weights,
+                    routeTable: selected.table)
+            }
             let denseIn = MLX.depends(input: n1, dependencies: [normed])
             if let denseOut = mlp.zipCompiledGateUpGeluDown(
                 denseIn, expertScores: expertScores)

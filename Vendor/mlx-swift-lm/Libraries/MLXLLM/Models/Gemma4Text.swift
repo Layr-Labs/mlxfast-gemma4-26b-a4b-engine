@@ -54,6 +54,15 @@ private let gemma4DecodeIntermediatesReuseEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// An identity KV-sharing map has no consumer of the intermediate carrier.
+/// Disable this optimization to retain the ownership-safe carrier path.
+private let gemma4UnusedKVCarrierElisionEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_UNUSED_KV_CARRIER_ELISION"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Pure, fail-closed policy for the Gemma 4 decode submission ladder.
 ///
 /// Layer indices name boundaries AFTER a complete decoder layer. In
@@ -2500,6 +2509,28 @@ private class Gemma4Attention: Module {
             rsTable: rsTable)
     }
 
+    /// Compiled sliding Q|K fuse plus V. Nil keeps the two incumbent launches.
+    @inline(__always)
+    private func compiledSlidingQKVProjection(
+        _ x: MLXArray, rsTable: MLXArray? = nil
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard gemma4QKFuseSlidingEnabled,
+            let q = qProj as? QuantizedLinear, q.bias == nil,
+            let kProj, let k = kProj as? QuantizedLinear, k.bias == nil,
+            let vProj, let v = vProj as? QuantizedLinear, v.bias == nil,
+            q.groupSize == k.groupSize, q.bits == k.bits, q.mode == k.mode,
+            v.groupSize == q.groupSize, v.bits == q.bits, v.mode == q.mode
+        else { return nil }
+        return CBv2AttentionQKVMMA8V1.compiledSlidingQKV(
+            x: x,
+            qWeight: q.weight, qScales: q.scales, qBiases: q.biases,
+            kWeight: k.weight, kScales: k.scales, kBiases: k.biases,
+            vWeight: v.weight, vScales: v.scales, vBiases: v.biases,
+            groupSize: q.groupSize, bits: q.bits, mode: q.mode,
+            cacheKey: ObjectIdentifier(q),
+            rsTable: rsTable)
+    }
+
     /// Exact B8/L1 attention output projection. Sliding/full K widths select
     /// the tight affine4 fast-QMV replica; every other path keeps the layer.
     /// MMA-RS-001: the projection input's run-sum table is computed here (the
@@ -2750,10 +2781,23 @@ private class Gemma4Attention: Module {
         // table — the table is per activation row and per 64-group of K,
         // independent of N, so the concatenated-N dispatch reads the same
         // entries the separate Q and K dispatches would.
-        let fusedQK: (MLXArray, MLXArray)? =
-            (lastQueryCache == nil && !usesSharedKV
-                && (vProj == nil || gemma4QKFuseSlidingEnabled))
-            ? fusedQKProjection(x, rsTable: qkvRunsumTable) : nil
+        var compiledSlidingV: MLXArray? = nil
+        let fusedQK: (MLXArray, MLXArray)?
+        if lastQueryCache == nil, !usesSharedKV,
+            (vProj == nil || gemma4QKFuseSlidingEnabled)
+        {
+            if vProj != nil,
+                let triple = compiledSlidingQKVProjection(
+                    x, rsTable: qkvRunsumTable)
+            {
+                compiledSlidingV = triple.2
+                fusedQK = (triple.0, triple.1)
+            } else {
+                fusedQK = fusedQKProjection(x, rsTable: qkvRunsumTable)
+            }
+        } else {
+            fusedQK = nil
+        }
         let queryRaw = (
             fusedQK?.0 ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
         ).reshaped(B, queryLength, nHeads, effectiveHeadDim)
@@ -2822,7 +2866,9 @@ private class Gemma4Attention: Module {
             fusedQK?.1 ?? tierProjection(kProj, x, rsTable: qkvRunsumTable)
         ).reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
-        if let vProj {
+        if let compiledSlidingV {
+            vRaw = compiledSlidingV.reshaped(B, L, nKvHeads, effectiveHeadDim)
+        } else if let vProj {
             vRaw = tierProjection(vProj, x, rsTable: qkvRunsumTable)
                 .reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
@@ -7080,17 +7126,19 @@ public class Gemma4TextModelInner: Module {
 
     // KV sharing mapping: for each layer, which earlier layer provides KVs
     let previousKvs: [Int]
+    private let hasKVSharingConsumers: Bool
     let firstKvSharedLayerIdx: Int
 
     /// Index of the last non-shared full-attention layer (-1 if none).
     /// Used by the shared-KV capture hook for the MTP drafter.
     let lastFullAttentionNonSharedIdx: Int
     let lastSlidingAttentionNonSharedIdx: Int
-    /// Engine-thread-confined scratch for the layer-to-layer KV-sharing
-    /// carriers. The array storage is reused only for the scored serial
-    /// CBv2 decode geometry; values are reset before each layer reads them.
+    /// A one-slot pool for layer-to-layer KV-sharing scratch. A forward takes
+    /// exclusive ownership of the array: constructor warmup can outlive its
+    /// bounded drain and overlap another forward on the same model.
     private var reusableIntermediates:
         [(kv: (MLXArray, MLXArray)?, positionOffset: Gemma4.PositionOffset?)] = []
+    private let intermediatesPoolLock = NSLock()
 
     public init(
         _ config: Gemma4TextConfiguration, forceSharedKV: Bool = false,
@@ -7139,6 +7187,7 @@ public class Gemma4TextModelInner: Module {
             }
         }
         self.previousKvs = kvMap
+        self.hasKVSharingConsumers = kvMap.enumerated().contains { $0.offset != $0.element }
 
         // Capture indices for MTP drafter: the last layer of each type that
         // still has its own K/V (not shared from an earlier layer).
@@ -7421,20 +7470,33 @@ public class Gemma4TextModelInner: Module {
         }
 
         // Forward through layers, tracking intermediate KV pairs for sharing
+        // With an identity map every read would see its own still-empty slot.
+        // Capture hooks consume the layer result directly and do not need this
+        // carrier. Avoid retaining unused KV/offset tuples across layers.
+        let trackIntermediates =
+            hasKVSharingConsumers || !gemma4UnusedKVCarrierElisionEnabled
         let reuseDecodeIntermediates =
-            gemma4DecodeIntermediatesReuseEnabled
+            trackIntermediates && gemma4DecodeIntermediatesReuseEnabled
             && isCBv2 && inputBatchSize == 8 && inputLength == 1
+        var intermediates:
+            [(kv: (MLXArray, MLXArray)?, positionOffset: Gemma4.PositionOffset?)] = []
         if reuseDecodeIntermediates {
-            if reusableIntermediates.count != config.numHiddenLayers {
-                reusableIntermediates = Array(
-                    repeating: (kv: nil, positionOffset: nil),
-                    count: config.numHiddenLayers)
-            }
+            intermediatesPoolLock.lock()
+            swap(&intermediates, &reusableIntermediates)
+            intermediatesPoolLock.unlock()
             CBv2EngageMark.once("gemma4-decode-intermediate-buffer")
-        } else {
-            reusableIntermediates = Array(
+        }
+        if trackIntermediates && intermediates.count != config.numHiddenLayers {
+            intermediates = Array(
                 repeating: (kv: nil, positionOffset: nil),
                 count: config.numHiddenLayers)
+        }
+        defer {
+            if reuseDecodeIntermediates {
+                intermediatesPoolLock.lock()
+                swap(&intermediates, &reusableIntermediates)
+                intermediatesPoolLock.unlock()
+            }
         }
 
         // GLUE-003: one chain box per forward; layer L's fused tail hands
@@ -7446,11 +7508,12 @@ public class Gemma4TextModelInner: Module {
         for (idx, layer) in layers.enumerated() {
             let prevIdx = previousKvs[idx]
             if reuseDecodeIntermediates {
-                reusableIntermediates[idx] = (kv: nil, positionOffset: nil)
+                intermediates[idx] = (kv: nil, positionOffset: nil)
             }
 
-            let sharedKV = reusableIntermediates[prevIdx].kv
-            let sharedPositionOffset = reusableIntermediates[prevIdx].positionOffset
+            let sharedKV = trackIntermediates ? intermediates[prevIdx].kv : nil
+            let sharedPositionOffset =
+                trackIntermediates ? intermediates[prevIdx].positionOffset : nil
 
             // CBv2: KV-shared layers attend by borrowing the SOURCE layer's
             // cache object (attendBorrowing) instead of consuming raw K/V
@@ -7502,7 +7565,9 @@ public class Gemma4TextModelInner: Module {
                     && !capturePreNorm && dFlashHiddenCapture == nil
             )
             h = out
-            reusableIntermediates[idx] = (kvPair, positionOffset)
+            if trackIntermediates {
+                intermediates[idx] = (kvPair, positionOffset)
+            }
             captureHook?(idx, kvPair)
             dFlashHiddenCapture?.capture(h, layer: idx)
 

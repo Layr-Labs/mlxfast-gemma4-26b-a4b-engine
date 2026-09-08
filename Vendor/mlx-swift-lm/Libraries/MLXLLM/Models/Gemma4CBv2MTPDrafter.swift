@@ -46,10 +46,13 @@ public struct DrafterRoPETable: @unchecked Sendable {
     public let windowAhead: Int
     /// RoPE base the table was built for (full-attention theta).
     public let base: Float
+    /// Device scalar carrying `startPosition` without a host readback.
+    public let startIndex: MLXArray
 
     public init(
         cos: MLXArray, sin: MLXArray, dims: Int,
-        startPosition: Int, windowAhead: Int, base: Float
+        startPosition: Int, windowAhead: Int, base: Float,
+        startIndex: MLXArray? = nil
     ) {
         self.cos = cos
         self.sin = sin
@@ -57,6 +60,7 @@ public struct DrafterRoPETable: @unchecked Sendable {
         self.startPosition = startPosition
         self.windowAhead = windowAhead
         self.base = base
+        self.startIndex = startIndex ?? MLXArray(Int32(startPosition))
     }
 }
 
@@ -177,14 +181,14 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         }
         // If the round has a cached RoPE table, pre-rotate the drafter's
         // carried hidden along its rotary prefix using the cached
-        // (cos, sin) for the per-step query position. The drafter's
-        // `preProjection` is a Linear, so pre-rotation of the input is
-        // a real, distinct transformation from the drafter's downstream
-        // RoPE on Q/K. The pre-rotation is intentionally cheap (one
-        // per-round table lookup + an `a*cos-b*sin` slice) and amortizes
-        // the per-step `MLXFast.RoPE` frequency compute into the single
-        // `prepare(rows:)` materialization: the downstream rope module
-        // no longer pays the table-build cost on every draft step.
+        // (cos, sin) for the per-step query position. The exact scored
+        // batch uses one fused device pass for the table lookup, rotation,
+        // and non-rotary tail copy; the reference graph remains available
+        // for other shapes and the kill switch.
+        //
+        // The drafter's `preProjection` is a Linear, so pre-rotation of the
+        // input is a real, distinct transformation from the downstream RoPE
+        // on Q/K. The table is still materialized once in `prepare(rows:)`.
         let rotatedHidden: MLXArray
         if let table = prepared.ropeTable {
             rotatedHidden = Self.applyCachedDrafterRoPE(
@@ -322,14 +326,110 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
             base: base)
     }
 
-    /// Rotate `hidden`'s rotary prefix using the cached `table` at the
-    /// per-step position read from `positionOffset`. The non-rotary tail
-    /// passes through unchanged. The pre-rotation is a real, distinct
-    /// transformation from the drafter's downstream rope on Q/K (the
-    /// downstream rope sees the post-`preProjection` activations, not
-    /// the carried hidden), and exists so the per-round cos/sin table
-    /// is exercised on every step rather than left unreferenced.
+    /// Default ON. The fused path consumes the per-row position array
+    /// directly, so it does not force the CBv2 graph offset through `.asArray`.
+    /// Disable to restore the reference gather-and-elementwise graph.
+    private static let fusedCachedRoPEEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MTP_ROPE_FUSED"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// One device pass for the exact B=8/query-length-one drafter geometry.
+    /// It reads the cached table at each row's graph-visible position, rotates
+    /// the prefix, and copies the non-rotary tail directly to a float output.
+    private static let fusedCachedRoPEKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_mtp_cached_rope_fused_b8_v1",
+            inputNames: ["hidden", "cos", "sin", "positions", "start"],
+            outputNames: ["out"],
+            source: """
+                const uint index = thread_position_in_grid.x;
+                if (index >= 8u * H) {
+                    return;
+                }
+                const uint row = index / H;
+                const uint col = index - row * H;
+                const device T* in_row = hidden + row * H;
+                const int step = positions[row] - start[0];
+
+                if (step < 0 || step >= WINDOW || col >= H) {
+                    out[index] = float(in_row[col]);
+                    return;
+                }
+                if (col >= D) {
+                    out[index] = float(in_row[col]);
+                    return;
+                }
+
+                const uint pair = col >> 1;
+                const float a = float(in_row[pair * 2u]);
+                const float b = float(in_row[pair * 2u + 1u]);
+                const uint table_index = uint(step) * (D / 2u) + pair;
+                const float c = cos[table_index];
+                const float s = sin[table_index];
+                const float ac = a * c;
+                const float bs = b * s;
+                const float as = a * s;
+                const float bc = b * c;
+                out[index] = (col & 1u) == 0u ? ac - bs : as + bc;
+            """,
+            ensureRowContiguous: true)
+
+    /// Fused path for the scored CBv2 batch. The reference implementation
+    /// remains below for every other geometry and for the kill switch.
     static func applyCachedDrafterRoPE(
+        hidden: MLXArray, table: DrafterRoPETable,
+        positionOffset: Gemma4.PositionOffset
+    ) -> MLXArray {
+        let rotaryPrefix = table.dims
+        let featureDim = hidden.dim(-1)
+        let positions: MLXArray
+        switch positionOffset {
+        case .batch(let values), .graphArray(let values):
+            positions = values
+        case .scalar:
+            return applyCachedDrafterRoPEReference(
+                hidden: hidden, table: table, positionOffset: positionOffset)
+        }
+        guard fusedCachedRoPEEnabled,
+            hidden.ndim == 3,
+            hidden.dim(0) == 8,
+            hidden.dim(1) == 1,
+            positions.ndim == 1,
+            positions.size == 8,
+            positions.dtype == .int32,
+            table.cos.dtype == .float32,
+            table.sin.dtype == .float32,
+            rotaryPrefix > 0,
+            rotaryPrefix <= featureDim,
+            table.windowAhead == defaultRoPEWindowAhead
+        else {
+            return applyCachedDrafterRoPEReference(
+                hidden: hidden, table: table, positionOffset: positionOffset)
+        }
+
+        CBv2EngageMark.once("mtp-rope-fused")
+        let threads = 256
+        let gridX = (hidden.size + threads - 1) / threads * threads
+        return fusedCachedRoPEKernel(
+            [hidden, table.cos, table.sin, positions, table.startIndex],
+            template: [
+                ("T", hidden.dtype),
+                ("H", featureDim),
+                ("D", rotaryPrefix),
+                ("WINDOW", table.windowAhead),
+            ],
+            grid: (gridX, 1, 1),
+            threadGroup: (threads, 1, 1),
+            outputShapes: [hidden.shape],
+            outputDTypes: [.float32]
+        )[0]
+    }
+
+    /// Reference graph retained for non-ranked shapes and the kill switch.
+    private static func applyCachedDrafterRoPEReference(
         hidden: MLXArray, table: DrafterRoPETable,
         positionOffset: Gemma4.PositionOffset
     ) -> MLXArray {
@@ -340,10 +440,6 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         }
         let halfDim = rotaryPrefix / 2
 
-        // Read the per-row query position from the position offset. The
-        // round is a drafter step (B rows, query length 1) so the offset
-        // resolves to a `[B]` int32 array; `.batch` and `.graphArray`
-        // share that layout.
         let perRow: [Int32]
         switch positionOffset {
         case .scalar(let v):
@@ -354,26 +450,23 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
             perRow = arr.asArray(Int32.self)
         }
 
-        // Build the index into the pre-computed cos/sin rows.
         let steps = perRow.map { Int32($0) - Int32(table.startPosition) }
         let inRange = steps.allSatisfy { $0 >= 0 && $0 < Int32(table.windowAhead) }
         guard inRange else { return hidden }
 
         let indices = MLXArray(steps, [perRow.count, 1])
-        let cosRows = table.cos[indices]  // [B, halfDim]
-        let sinRows = table.sin[indices]  // [B, halfDim]
+        let cosRows = table.cos[indices]
+        let sinRows = table.sin[indices]
 
-        // Reshape hidden so the rotary prefix is `[B, L, 1, halfDim, 2]`.
         let leadShape = Array(hidden.shape.dropLast())
         let flat = hidden.reshaped(leadShape + [featureDim])
         let prefixLead = leadShape.dropLast()
         let prefixShape = Array(prefixLead) + [1, halfDim, 2]
         let pairs = flat[.ellipsis, 0 ..< rotaryPrefix]
             .reshaped(Array(prefixShape))
-        let a = pairs[.ellipsis, 0]  // [.., halfDim]
-        let b = pairs[.ellipsis, 1]  // [.., halfDim]
+        let a = pairs[.ellipsis, 0]
+        let b = pairs[.ellipsis, 1]
 
-        // Broadcast cos/sin to the query/head axes.
         let cosBroadcastShape = Array(prefixLead) + [1, halfDim]
         let sinBroadcastShape = Array(prefixLead) + [1, halfDim]
         let cosB = cosRows.reshaped(cosBroadcastShape)
@@ -386,4 +479,5 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         let tail = flat[.ellipsis, rotaryPrefix ..< featureDim]
         return MLX.concatenated([rotatedPrefix, tail], axis: -1)
     }
+
 }

@@ -9,6 +9,23 @@ enum CBv2GroupedPrefillPVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// GROUPED-PV-SWIZZLE-TIGHT. The stage attends 128 query rows, so at
+    /// `bm` 64 there are exactly two row tiles. The launcher rounds the row
+    /// extent up to a whole swizzle tile, so a swizzle of 2 (tile 4) rounds
+    /// two tiles up to one group of four and launches twice the tiles the
+    /// bounds test admits; the surplus threadgroups return at that test
+    /// without addressing an operand. A swizzle of 1 (tile 2) spans the two
+    /// row tiles exactly, so every launched threadgroup carries a tile, and
+    /// it holds the column tile constant across each consecutive pair the
+    /// same way the wider tile does -- the value operand's walk is unchanged.
+    /// Every tile is still computed once, by one threadgroup, over the same
+    /// operands in the same order. `0` restores the wider tile.
+    private static let swizzleTight: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_GROUPED_PV_SWIZZLE"] else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private struct Geometry {
         let bm: Int
         let bk: Int
@@ -29,7 +46,7 @@ enum CBv2GroupedPrefillPVV1 {
             generation >= (suffix == "p" ? 18 : 17)
         else { return nil }
         if suffix == "s" || suffix == "c" || suffix == "d" {
-            return Geometry(bm: 64, bk: 256, wm: 2, swizzle: 2)
+            return Geometry(bm: 64, bk: 256, wm: 2, swizzle: swizzleTight ? 1 : 2)
         }
         return Geometry(bm: 128, bk: 512, wm: 4, swizzle: 0)
         #else
@@ -126,7 +143,7 @@ enum CBv2GroupedPrefillPVV1 {
                 bidirectional: false, sinks: sinks,
                 queryPlaneSlice: queryPlane[0..., 0..., 0..., start..<end, 0...]),
                 let statistics = CBv2PrefillAttnTrafficV1.statistics(
-                    scores: stage.scores, values: stage.values)
+                    scores: stage.scores, values: stage.values, causalRows: 128)
             else { return nil }
             scores.append(stage.scores)
             stats.append(statistics)

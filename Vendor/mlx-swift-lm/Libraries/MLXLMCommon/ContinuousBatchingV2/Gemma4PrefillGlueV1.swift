@@ -342,6 +342,10 @@ public enum Gemma4PrefillGlueV1 {
         public let out: MLXArray
         public let denseNorm: MLXArray
         public let routerNorm: MLXArray
+        /// PREFILL-SCATTER-INV: the second reduction's inverse root mean
+        /// square, one `float` per plane row, when the inv twin produced it.
+        /// `nil` from the promoted three-output kernel.
+        public let invRMS: MLXArray?
     }
 
     private static let attentionBranchPrefixKernel: MLXFast.MLXFastKernel =
@@ -407,6 +411,82 @@ public enum Gemma4PrefillGlueV1 {
             ensureRowContiguous: true
         )
 
+    /// `attentionBranchPrefixKernel` with the second reduction's inverse root
+    /// mean square emitted as a fourth output, one `float` per row. Every
+    /// other statement, its order and its rounding are the promoted body
+    /// verbatim; the only added statement is the `invrms` store, which no
+    /// thread in this kernel reads and which touches no other output.
+    private static let attentionBranchPrefixInvKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name:
+                "gemma4_prefill_glue_attention_branch_prefix_inv_2816_unroll_v2\(vec4Suffix)",
+            inputNames: ["x", "w", "res", "wd", "wr"],
+            outputNames: ["out", "dense", "router", "invrms"],
+            source: """
+                threadgroup float local_sums[32];
+                threadgroup float local_inv[1];
+
+                const uint row = threadgroup_position_in_grid.y;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+                const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+                float xv[GLUE_NREADS];
+                GLUE_LOADF(xv, x, base);
+
+                const float inv = glue_inv_rms(
+                    xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+                // `normResidualKernel`'s row, verbatim; the T values just
+                // stored to `out` are kept in registers instead of re-read.
+                T resv[GLUE_NREADS];
+                GLUE_LOADT(resv, res, base);
+                T outv[GLUE_NREADS];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    const uint j = lid * GLUE_NREADS + i;
+                    const T normed = static_cast<T>(w[j] * static_cast<T>(xv[i] * inv));
+                    outv[i] = resv[i] + normed;
+                }
+                GLUE_STORET(out, base, outv);
+
+                float ov[GLUE_NREADS];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    ov[i] = static_cast<float>(outv[i]);
+                }
+
+                // One sum-of-squares over the rounded `out` row serves both
+                // the dense weight and the router weight: the two stock
+                // kernels reduce the identical array.
+                const float inv2 = glue_inv_rms(
+                    ov, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+                // The expert scatter reduces this same rounded row with the
+                // same lane partition and the same eps. Publish the value so
+                // it does not have to be recomputed there.
+                if (lid == 0) {
+                    invrms[row] = inv2;
+                }
+
+                T densev[GLUE_NREADS];
+                T routerv[GLUE_NREADS];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    const uint j = lid * GLUE_NREADS + i;
+                    const T scaled = static_cast<T>(ov[i] * inv2);
+                    densev[i] = wd[j] * scaled;
+                    routerv[i] = wr[j] * scaled;
+                }
+                GLUE_STORET(dense, base, densev);
+                GLUE_STORET(router, base, routerv);
+                """,
+            header: kernelHeader,
+            ensureRowContiguous: true
+        )
+
     /// `(out, denseNorm, routerNorm)`: `normResidual(attn, wPostAttn,
     /// residual)` plus the dense pre-norm and the router norm of that `out`,
     /// in one dispatch. Returns `nil` off the prefill plane, with the arm
@@ -431,6 +511,21 @@ public enum Gemma4PrefillGlueV1 {
         else { return nil }
 
         CBv2EngageMark.once("prefill-attention-branch-prefix")
+        // PREFILL-SCATTER-INV: same launch geometry, same five inputs, same
+        // three activation outputs; the twin adds `[rows]` of float32.
+        if scatterInvEnabled {
+            CBv2EngageMark.once("prefill-scatter-inv-prefix")
+            let inv = attentionBranchPrefixInvKernel(
+                [x, weight, residual, wDense, wRouter],
+                template: [("T", x.dtype)],
+                grid: (threadsPerRow, rows, 1),
+                threadGroup: (threadsPerRow, 1, 1),
+                outputShapes: [x.shape, x.shape, x.shape, [rows]],
+                outputDTypes: [x.dtype, x.dtype, x.dtype, .float32]
+            )
+            return AttentionBranchPrefix(
+                out: inv[0], denseNorm: inv[1], routerNorm: inv[2], invRMS: inv[3])
+        }
         let outs = attentionBranchPrefixKernel(
             [x, weight, residual, wDense, wRouter],
             template: [("T", x.dtype)],
@@ -440,7 +535,7 @@ public enum Gemma4PrefillGlueV1 {
             outputDTypes: [x.dtype, x.dtype, x.dtype]
         )
         return AttentionBranchPrefix(
-            out: outs[0], denseNorm: outs[1], routerNorm: outs[2])
+            out: outs[0], denseNorm: outs[1], routerNorm: outs[2], invRMS: nil)
     }
 
     // MARK: - dual pre-norm (2 dispatches -> 1)
@@ -625,6 +720,22 @@ public enum Gemma4PrefillGlueV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// PREFILL-SCATTER-INV: the branch prefix already reduced the exact row
+    /// the expert scatter re-reduces, so it emits that reduction's inverse
+    /// root mean square as a fourth output and the scatter consumes it
+    /// instead of computing the identical value a second time.
+    ///
+    /// `DARKBLOOM_GEMMA4_PREFILL_SCATTER_INV` set to `0`/`false`/`no`/`off`
+    /// restores the promoted prefix kernel, the promoted scatter selection
+    /// and both shipped kernel names byte for byte. Default ON.
+    /// Engage marks: `prefill-scatter-inv-prefix`, `prefill-scatter-inv`.
+    static let scatterInvEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_SCATTER_INV"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// `preNormScatterKernel` with the `K` index reads lifted above the stores.
     private static let preNormScatterHoistKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
@@ -736,6 +847,64 @@ public enum Gemma4PrefillGlueV1 {
             ensureRowContiguous: true
         )
 
+    /// PREFILL-SCATTER-INV: `preNormScatterThreadgroupIndexKernel` -- the
+    /// kernel this plane actually dispatches -- with its `glue_inv_rms` call
+    /// replaced by the value the branch prefix already produced for the
+    /// identical row. The normed expression, its rounding, the eight sorted
+    /// positions and the store order are the promoted body verbatim.
+    ///
+    /// The promoted body published `cached_positions` through the first
+    /// threadgroup barrier inside `glue_inv_rms`. That reduction is gone
+    /// here, so the publication carries its own barrier: one, where the
+    /// promoted body had two.
+    private static let preNormScatterThreadgroupIndexInvKernel:
+        MLXFast.MLXFastKernel = MLXFast.metalKernel(
+            name: "gemma4_prefill_glue_prenorm_scatter_inv_2816_idx_tgcache_v4\(vec4Suffix)",
+            inputNames: ["x", "w", "inverse", "invrms"],
+            outputNames: ["out"],
+            source: """
+                threadgroup uint cached_positions[8];
+
+                const uint row = threadgroup_position_in_grid.y;
+                const uint lid = thread_position_in_threadgroup.x;
+                const size_t assignment_base = size_t(row) * 8;
+
+                // The first eight threads issue the row's complete metadata
+                // load while every thread begins its independent work.
+                if (lid < 8) {
+                    cached_positions[lid] = inverse[assignment_base + lid];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+                float xv[GLUE_NREADS];
+                GLUE_LOADF(xv, x, base);
+
+                // The prefix reduced this exact rounded row, over the same
+                // 704x4 lane partition, with the same GLUE_EPS and the same
+                // `metal::precise::rsqrt`. Reuse, do not recompute.
+                const float inv = invrms[row];
+
+                T normed[GLUE_NREADS];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    const uint j = lid * GLUE_NREADS + i;
+                    const T scaled = static_cast<T>(xv[i] * inv);
+                    normed[i] = w[j] * scaled;
+                }
+
+                #pragma clang loop unroll(full)
+                for (uint k = 0; k < 8; ++k) {
+                    const size_t pos = size_t(cached_positions[k]);
+                    const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
+                    GLUE_STORET(out, obase, normed);
+                }
+                """,
+            header: kernelHeader,
+            ensureRowContiguous: true
+        )
+
     /// `dualPreNorm`'s second output written straight into expert-sorted
     /// order. One threadgroup per token row, as before; the row's normed
     /// values are computed once into registers and stored to each of the
@@ -812,7 +981,7 @@ public enum Gemma4PrefillGlueV1 {
     /// `uint32` per assignment.
     public static func preNormScatter(
         x: MLXArray, weight: MLXArray, inverseOrder: MLXArray, topK: Int,
-        eps epsIn: Float
+        eps epsIn: Float, invRMS: MLXArray? = nil
     ) -> MLXArray? {
         guard prenormGatherEnabled,
             let rows = planeRows(x, weight: weight, eps: epsIn),
@@ -823,6 +992,32 @@ public enum Gemma4PrefillGlueV1 {
         else { return nil }
 
         CBv2EngageMark.once("prefill-prenorm-gather")
+        // PREFILL-SCATTER-INV: only when the caller handed over the inverse
+        // root mean square the branch prefix computed for this exact `x`,
+        // and only on the selection the plane actually reaches. Every other
+        // combination falls through to the promoted chain untouched.
+        if scatterInvEnabled,
+            let invRMS,
+            scatterIndexHoistEnabled,
+            scatterThreadgroupIndexCacheEnabled,
+            topK == 8,
+            invRMS.ndim == 1,
+            invRMS.dim(0) == rows,
+            invRMS.dtype == .float32
+        {
+            // The mark rides the SCATTER dispatch, not the branch that chose
+            // it: the prefix twin can run and this guard still decline, so a
+            // mark on the branch alone would not prove this body executed.
+            CBv2EngageMark.once("prefill-scatter-inv")
+            return preNormScatterThreadgroupIndexInvKernel(
+                [x, weight, inverseOrder, invRMS],
+                template: [("T", x.dtype), ("K", topK)],
+                grid: (threadsPerRow, rows, 1),
+                threadGroup: (threadsPerRow, 1, 1),
+                outputShapes: [[rows * topK, 1, axis]],
+                outputDTypes: [x.dtype]
+            )[0]
+        }
         let scatter: MLXFast.MLXFastKernel
         if scatterIndexHoistEnabled,
             scatterThreadgroupIndexCacheEnabled,

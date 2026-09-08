@@ -1144,4 +1144,116 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             outputDTypes: [x.dtype]
         )[0]
     }
+
+    /// Sliding-decode Q|K fuse plus V as one reusable compiled identity.
+    /// The two Metal launches stay the incumbent fused-sliding rsp kernel and
+    /// the N=2048 V rsp kernel; only the per-layer host rebuild of that pair
+    /// goes away. `DARKBLOOM_GEMMA4_COMPILED_SLIDING_QKV=0` restores the two
+    /// separate launches. Engage mark: `sliding-qkv-compiled`.
+    private static let compiledSlidingQKVEnabled: Bool = {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["MLX_DISABLE_COMPILE"] == nil else { return false }
+        guard let raw = environment["DARKBLOOM_GEMMA4_COMPILED_SLIDING_QKV"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    public static var compiledSlidingQKVAvailable: Bool {
+        compiledSlidingQKVEnabled && MLXHardwareInfo.isCompiledDecodeSupported
+            && StreamOrDevice.default == .gpu
+            && enabled && fuseQKEnabled && multiTileEnabled && rsPrepassEnabled
+    }
+
+    private static func fusedSlidingRspCall(_ inputs: [MLXArray]) -> [MLXArray] {
+        let yTiles = 6144 / outputsPerGroup
+        return fusedSlidingRspKernel(
+            inputs,
+            template: [("T", DType.bfloat16)],
+            grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [[batch, sequence, 4096], [batch, sequence, 2048]],
+            outputDTypes: [.bfloat16, .bfloat16])
+    }
+
+    private static func v2048RspCall(_ inputs: [MLXArray]) -> MLXArray {
+        let yTiles = 2048 / outputsPerGroup
+        return multiTileRspKernelN2048(
+            inputs,
+            template: [("T", DType.bfloat16)],
+            grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [[batch, sequence, 2048]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+
+    private static let compiledSlidingQKVPair: @Sendable ([MLXArray]) -> [MLXArray] =
+        MLX.compile(shapeless: false) { inputs in
+            let qk = fusedSlidingRspCall([
+                inputs[0], inputs[1], inputs[2], inputs[3], inputs[7]])
+            let v = v2048RspCall([
+                inputs[0], inputs[4], inputs[5], inputs[6], inputs[7]])
+            return [qk[0], qk[1], v]
+        }
+
+    /// Sliding B=8/L=1 Q|K fuse plus V. Concatenated Q||K storage is resolved
+    /// outside the trace. Nil keeps the two incumbent launches.
+    public static func compiledSlidingQKV(
+        x: MLXArray,
+        qWeight: MLXArray, qScales: MLXArray, qBiases: MLXArray?,
+        kWeight: MLXArray, kScales: MLXArray, kBiases: MLXArray?,
+        vWeight: MLXArray, vScales: MLXArray, vBiases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode,
+        cacheKey: ObjectIdentifier,
+        rsTable: MLXArray?
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard compiledSlidingQKVAvailable,
+            groupSize == Self.groupSize,
+            bits == Self.bits,
+            mode == .affine,
+            let qBiases, let kBiases, let vBiases, let rsTable,
+            x.dtype == .bfloat16,
+            qScales.dtype == x.dtype, qBiases.dtype == x.dtype,
+            kScales.dtype == x.dtype, kBiases.dtype == x.dtype,
+            vScales.dtype == x.dtype, vBiases.dtype == x.dtype,
+            qWeight.dtype == .uint32, kWeight.dtype == .uint32,
+            vWeight.dtype == .uint32,
+            x.ndim == 3,
+            x.dim(0) == batch, x.dim(1) == sequence, x.dim(2) == inputWidth,
+            x.size == batch * sequence * inputWidth,
+            qWeight.ndim == 2, kWeight.ndim == 2, vWeight.ndim == 2,
+            qWeight.dim(0) == 4096, kWeight.dim(0) == 2048, vWeight.dim(0) == 2048,
+            qWeight.dim(1) == inputWidth * Self.bits / 32,
+            kWeight.dim(1) == inputWidth * Self.bits / 32,
+            vWeight.dim(1) == inputWidth * Self.bits / 32,
+            qScales.shape == [4096, inputWidth / Self.groupSize],
+            qBiases.shape == qScales.shape,
+            kScales.shape == [2048, inputWidth / Self.groupSize],
+            kBiases.shape == kScales.shape,
+            vScales.shape == [2048, inputWidth / Self.groupSize],
+            vBiases.shape == vScales.shape,
+            rsTable.dtype == .float32,
+            rsTable.shape == [batch, inputWidth / Self.groupSize]
+        else { return nil }
+
+        fusedLock.lock()
+        var plane = fusedPlanes[cacheKey]
+        if plane == nil {
+            let w = concatenated([qWeight, kWeight], axis: 0)
+            let s = concatenated([qScales, kScales], axis: 0)
+            let b = concatenated([qBiases, kBiases], axis: 0)
+            eval(w, s, b)
+            plane = (w, s, b)
+            fusedPlanes[cacheKey] = plane
+        }
+        fusedLock.unlock()
+        guard let (fw, fs, fb) = plane else { return nil }
+
+        CBv2EngageMark.once("sliding-qkv-compiled")
+        let outputs = compiledSlidingQKVPair(
+            [x, fw, fs, fb, vWeight, vScales, vBiases, rsTable])
+        return (outputs[0], outputs[1], outputs[2])
+    }
 }

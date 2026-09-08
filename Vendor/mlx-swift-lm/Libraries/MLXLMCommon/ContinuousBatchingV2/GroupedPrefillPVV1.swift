@@ -61,7 +61,6 @@ enum CBv2GroupedPrefillPVV1 {
             case 6: scores = s6; stats = r6; break;
             default: scores = s7; stats = r7; break;
         }
-        threadgroup_barrier(mem_flags::mem_none);
         constexpr short SM = BM / WM;
         constexpr short SN = 128 / 4;
         const short tm = SM * (simdgroup_index_in_threadgroup / 4);

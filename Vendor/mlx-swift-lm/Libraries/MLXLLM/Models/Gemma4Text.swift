@@ -5653,6 +5653,31 @@ private class Gemma4MLP: Module {
         denseProjection(downProj, activated)
     }
 
+    /// Keep current layer storage and admission outside the two-output trace.
+    fileprivate func zipCompiledGateUpGeluDownFenced(
+        _ x: MLXArray, expertScores: MLXArray,
+        routerNorm: MLXArray, expertNorm: MLXArray
+    ) -> (denseOut: MLXArray, expertNorm: MLXArray)? {
+        guard CBv2DenseMLPQMVV1.compiledFencedPairAvailable,
+            gemma4DenseGateUpJoinEnabled,
+            let storage = fusedGateUpStorage,
+            let gate = gateProj as? QuantizedLinear,
+            let up = upProj as? QuantizedLinear,
+            let down = downProj as? QuantizedLinear,
+            gate.bias == nil, up.bias == nil, down.bias == nil,
+            gate.groupSize == 64, up.groupSize == gate.groupSize,
+            down.groupSize == gate.groupSize,
+            gate.bits == 8, up.bits == gate.bits, down.bits == gate.bits,
+            gate.mode == .affine, up.mode == gate.mode, down.mode == gate.mode,
+            let downBiases = down.biases
+        else { return nil }
+        return CBv2DenseMLPQMVV1.compiledGateUpGeluDownFenced(
+            [x, storage.weight, storage.scales, storage.biases,
+             down.weight, down.scales, downBiases, expertScores,
+             routerNorm, expertNorm],
+            groupSize: gate.groupSize, bits: gate.bits, mode: gate.mode)
+    }
+
     /// Resolve immutable storage outside the trace; every tensor is explicit.
     fileprivate func zipCompiledGateUpGeluDown(
         _ x: MLXArray, expertScores: MLXArray
@@ -5847,6 +5872,18 @@ private enum Gemma4ZipRouterV1 {
             CBv2DenseMLPQMVV1.compiledPairAvailable
         {
             let expertScores = router.zipScores(normed)
+            if let fenced = mlp.zipCompiledGateUpGeluDownFenced(
+                n1, expertScores: expertScores, routerNorm: normed, expertNorm: n2)
+            {
+                let selected = selectAfterDense(
+                    router: router, expertScores: expertScores, denseOut: fenced.denseOut)
+                Gemma4RouterProbe.recorder?(expertScores, selected.indices)
+                CBv2EngageMark.once("zip-router")
+                return Zipped(
+                    denseOut: fenced.denseOut, expertNorm: fenced.expertNorm,
+                    topKIndices: selected.indices, topKWeights: selected.weights,
+                    routeTable: selected.table)
+            }
             let denseIn = MLX.depends(input: n1, dependencies: [normed])
             if let denseOut = mlp.zipCompiledGateUpGeluDown(
                 denseIn, expertScores: expertScores)

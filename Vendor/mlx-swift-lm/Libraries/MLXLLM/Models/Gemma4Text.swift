@@ -54,6 +54,13 @@ private let gemma4DecodeIntermediatesReuseEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+private let gemma4DecodePrefix03Enabled: Bool = {
+    let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DECODE_PREFIX_03_V1"] ?? "1"
+    return !["0", "false", "no", "off"].contains(
+        raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+}()
+
 /// Pure, fail-closed policy for the Gemma 4 decode submission ladder.
 ///
 /// Layer indices name boundaries AFTER a complete decoder layer. In
@@ -92,8 +99,10 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     // The empty-set row is the control that matters: this is not "fewer is
     // always better", it is "the early pair carries all of the overlap".
     switch layerIndex {
-    case 0, 1, 2, 3:
+    case 0, 3:
         return true
+    case 1, 2:
+        return !gemma4DecodePrefix03Enabled
     default:
         return false
     }

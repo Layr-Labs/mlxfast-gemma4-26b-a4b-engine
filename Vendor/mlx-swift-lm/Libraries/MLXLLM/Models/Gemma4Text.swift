@@ -2500,6 +2500,32 @@ private class Gemma4Attention: Module {
             rsTable: rsTable)
     }
 
+    /// QKV-COMPILED-094. The fused Q|K dispatch and the V projection under one
+    /// compiled identity: same two GPU dispatches, same operands, same order,
+    /// with the repeated Swift wrapper and graph construction removed from the
+    /// warm call. The quantization contract of all three projections is checked
+    /// here, outside the trace; any mismatch returns nil and the caller keeps
+    /// its incumbent `fusedQKProjection` + `tierProjection` pair.
+    @inline(__always)
+    private func compiledQKVProjection(
+        _ x: MLXArray, rsTable: MLXArray?
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard let q = qProj as? QuantizedLinear, q.bias == nil,
+            let kProj, let k = kProj as? QuantizedLinear, k.bias == nil,
+            let vProj, let v = vProj as? QuantizedLinear, v.bias == nil,
+            q.groupSize == k.groupSize, q.bits == k.bits, q.mode == k.mode,
+            q.groupSize == v.groupSize, q.bits == v.bits, q.mode == v.mode
+        else { return nil }
+        return CBv2AttentionQKVMMA8V1.compiledQKVMatmul(
+            x: x,
+            qWeight: q.weight, qScales: q.scales, qBiases: q.biases,
+            kWeight: k.weight, kScales: k.scales, kBiases: k.biases,
+            vWeight: v.weight, vScales: v.scales, vBiases: v.biases,
+            groupSize: q.groupSize, bits: q.bits, mode: q.mode,
+            cacheKey: ObjectIdentifier(q),
+            rsTable: rsTable)
+    }
+
     /// Exact B8/L1 attention output projection. Sliding/full K widths select
     /// the tight affine4 fast-QMV replica; every other path keeps the layer.
     /// MMA-RS-001: the projection input's run-sum table is computed here (the
@@ -2750,10 +2776,17 @@ private class Gemma4Attention: Module {
         // table — the table is per activation row and per 64-group of K,
         // independent of N, so the concatenated-N dispatch reads the same
         // entries the separate Q and K dispatches would.
+        // QKV-COMPILED-094: the fused Q|K dispatch and the V dispatch share one
+        // compiled identity when this layer projects its own V. Same two GPU
+        // dispatches; nil keeps the two separate wrapper calls below.
+        let compiledQKV: (MLXArray, MLXArray, MLXArray)? =
+            (lastQueryCache == nil && !usesSharedKV && gemma4QKFuseSlidingEnabled)
+            ? compiledQKVProjection(x, rsTable: qkvRunsumTable) : nil
         let fusedQK: (MLXArray, MLXArray)? =
-            (lastQueryCache == nil && !usesSharedKV
+            compiledQKV.map { ($0.0, $0.1) }
+            ?? ((lastQueryCache == nil && !usesSharedKV
                 && (vProj == nil || gemma4QKFuseSlidingEnabled))
-            ? fusedQKProjection(x, rsTable: qkvRunsumTable) : nil
+                ? fusedQKProjection(x, rsTable: qkvRunsumTable) : nil)
         let queryRaw = (
             fusedQK?.0 ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
         ).reshaped(B, queryLength, nHeads, effectiveHeadDim)
@@ -2822,7 +2855,9 @@ private class Gemma4Attention: Module {
             fusedQK?.1 ?? tierProjection(kProj, x, rsTable: qkvRunsumTable)
         ).reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
-        if let vProj {
+        if let compiledQKV {
+            vRaw = compiledQKV.2.reshaped(B, L, nKvHeads, effectiveHeadDim)
+        } else if let vProj {
             vRaw = tierProjection(vProj, x, rsTable: qkvRunsumTable)
                 .reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {

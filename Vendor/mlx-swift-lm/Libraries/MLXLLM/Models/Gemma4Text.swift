@@ -4677,16 +4677,20 @@ private enum Gemma4FusedLayerGlue {
         \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
             of: "(float)outv[base + i]", with: "(float)outv[i]"))
             const float inv4 = local_inv[0];
+            T nq[4];
             for (int i = 0; i < 4; i++) {
-                normed[base + i] =
-                    wn[wbase + i] * static_cast<T>((float)outv[i] * inv4);
+                nq[i] = wn[wbase + i]
+                    * static_cast<T>((float)outv[i] * inv4);
+                normed[base + i] = nq[i];
             }
+        \(qkvRunsumEpilogue("nq").replacingOccurrences(
+            of: "qkv_rs", with: "rs"))
         """
 
     private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_glue_tail_chain_2816_bf16_v1_nb1",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
-        outputNames: ["out", "normed"],
+        outputNames: ["out", "normed", "rs"],
         source: tailChainSource,
         ensureRowContiguous: true
     )
@@ -4694,7 +4698,7 @@ private enum Gemma4FusedLayerGlue {
     private static let pairedTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_glue_tail_chain_paired_rms_2816_bf16_v1_nb1",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
-        outputNames: ["out", "normed"],
+        outputNames: ["out", "normed", "rs"],
         source: pairedRmsTailSource(tailChainSource),
         ensureRowContiguous: true
     )
@@ -5021,7 +5025,7 @@ private enum Gemma4FusedLayerGlue {
         mlpOut: MLXArray, expertOut: MLXArray, residual: MLXArray,
         w1: MLXArray, w2: MLXArray, w3: MLXArray, layerScalar: MLXArray,
         nextInputNormWeight: MLXArray, eps: Float
-    ) -> (out: MLXArray, normedNext: MLXArray)? {
+    ) -> (out: MLXArray, normedNext: MLXArray, rs: MLXArray)? {
         guard admits(mlpOut, weight: w1, eps: eps),
             expertOut.shape == mlpOut.shape, expertOut.dtype == .bfloat16,
             residual.shape == mlpOut.shape, residual.dtype == .bfloat16,
@@ -5032,6 +5036,7 @@ private enum Gemma4FusedLayerGlue {
             nextInputNormWeight.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-tail-chain")
+        CBv2EngageMark.once("glue-tail-chain-rs")
         let selected = pairedRmsEnabled ? pairedTailChainKernel : tailChainKernel
         let outs = selected(
             [mlpOut, expertOut, residual, w1, w2, w3, layerScalar,
@@ -5039,10 +5044,12 @@ private enum Gemma4FusedLayerGlue {
             template: [("T", mlpOut.dtype)],
             grid: (rows * tgThreads, 1, 1),
             threadGroup: (tgThreads, 1, 1),
-            outputShapes: [[rows, 1, axis], [rows, 1, axis]],
-            outputDTypes: [.bfloat16, .bfloat16]
+            outputShapes: [
+                [rows, 1, axis], [rows, 1, axis], [rows, axis / 64],
+            ],
+            outputDTypes: [.bfloat16, .bfloat16, .float32]
         )
-        return (outs[0], outs[1])
+        return (outs[0], outs[1], outs[2])
     }
 
     static func tail(
@@ -6338,7 +6345,8 @@ public class Gemma4DecoderLayer: Module {
                         eps: config.rmsNormEps)
                 {
                     out = chained.out
-                    chain.pending = (source: chained.out, normed: chained.normedNext, rs: nil)
+                    chain.pending = (
+                        source: chained.out, normed: chained.normedNext, rs: chained.rs)
                     tailApplied = true
                     scalarFolded = true
                 } else if canFoldScalar,

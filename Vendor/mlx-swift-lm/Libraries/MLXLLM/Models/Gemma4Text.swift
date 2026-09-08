@@ -5652,6 +5652,28 @@ private class Gemma4MLP: Module {
     fileprivate func zipDown(_ activated: MLXArray) -> MLXArray {
         denseProjection(downProj, activated)
     }
+
+    /// Resolve immutable storage outside the trace; every tensor is explicit.
+    fileprivate func zipCompiledGateUpGeluDown(
+        _ x: MLXArray, expertScores: MLXArray
+    ) -> MLXArray? {
+        guard gemma4DenseGateUpJoinEnabled,
+            let storage = fusedGateUpStorage,
+            let gate = gateProj as? QuantizedLinear,
+            let up = upProj as? QuantizedLinear,
+            let down = downProj as? QuantizedLinear,
+            gate.bias == nil, up.bias == nil, down.bias == nil,
+            gate.groupSize == 64, up.groupSize == gate.groupSize,
+            down.groupSize == gate.groupSize,
+            gate.bits == 8, up.bits == gate.bits, down.bits == gate.bits,
+            gate.mode == .affine, up.mode == gate.mode, down.mode == gate.mode,
+            let downBiases = down.biases
+        else { return nil }
+        return CBv2DenseMLPQMVV1.compiledGateUpGeluDown(
+            [x, storage.weight, storage.scales, storage.biases,
+             down.weight, down.scales, downBiases, expertScores],
+            groupSize: gate.groupSize, bits: gate.bits, mode: gate.mode)
+    }
 }
 
 /// ZIP-ROUTER-001 -- interleave the MoE layer's router chain with the
@@ -5731,6 +5753,25 @@ private enum Gemma4ZipRouterV1 {
         let routeTable: SwitchRouteTable?
     }
 
+    /// Preserve the default route-selection tail after the compiled dense pair.
+    private static func selectAfterDense(
+        router: Gemma4Router, expertScores: MLXArray, denseOut: MLXArray
+    ) -> (indices: MLXArray, weights: MLXArray, table: SwitchRouteTable?) {
+        if let fold = Gemma4RouteGlueFoldV1.apply(
+            MLX.depends(input: expertScores, dependencies: [denseOut]),
+            perExpertScale: router.perExpertScale,
+            topK: router.topK, kth: router.kth)
+        {
+            return (fold.indices, fold.weights, fold.table)
+        }
+        let partition = router.zipPartition(
+            MLX.depends(input: expertScores, dependencies: [denseOut]))
+        let indices = router.zipSelected(partition)
+        let weights = router.zipWeights(
+            expertScores: expertScores, topKIndices: indices)
+        return (indices, weights, nil)
+    }
+
     /// PREFIX-001 admission lives beside the ZIP admission so the eager
     /// custom producer is never built unless this exact consumer will use all
     /// of its outputs.
@@ -5798,6 +5839,29 @@ private enum Gemma4ZipRouterV1 {
         // dual pre-norm arrays unreferenced, so MLX never evaluates them and
         // the caller's stock path rebuilds the identical pair.
         let normed = carriedRouterNorm ?? router.zipNorm(out)
+
+        // Default ZIP only. The trace keeps the score dependency BETWEEN the
+        // same two dense kernels; incoming and outgoing fences stay outside it.
+        if plan == 1, gemma4DenseGateUpJoinEnabled,
+            Gemma4FusedLayerGlue.denseXSumElideEnabled,
+            CBv2DenseMLPQMVV1.compiledPairAvailable
+        {
+            let expertScores = router.zipScores(normed)
+            let denseIn = MLX.depends(input: n1, dependencies: [normed])
+            if let denseOut = mlp.zipCompiledGateUpGeluDown(
+                denseIn, expertScores: expertScores)
+            {
+                let selected = selectAfterDense(
+                    router: router, expertScores: expertScores, denseOut: denseOut)
+                Gemma4RouterProbe.recorder?(expertScores, selected.indices)
+                let expertNorm = MLX.depends(input: n2, dependencies: [denseOut])
+                CBv2EngageMark.once("zip-router")
+                return Zipped(
+                    denseOut: denseOut, expertNorm: expertNorm,
+                    topKIndices: selected.indices, topKWeights: selected.weights,
+                    routeTable: selected.table)
+            }
+        }
 
         // Stage 2: router QMV | dense gate + up.
         //

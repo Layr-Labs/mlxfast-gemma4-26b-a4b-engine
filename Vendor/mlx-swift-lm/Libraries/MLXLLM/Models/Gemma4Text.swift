@@ -9,6 +9,11 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+/// Resample marker: never called; makes this tree distinct from the previous
+/// submission of the same mechanism so the benchmarker takes a fresh timing
+/// draw. No behaviour change.
+@inline(never) private func gemma4TextResampleMarker_27c821c() -> Int { 0 }
+
 // Yukon executable-equivalent frontier sample: delordemm1 / e8f / de1.
 
 // MARK: - vMLX decode hot-path helpers (ported from osaurus/main Gemma4Text)

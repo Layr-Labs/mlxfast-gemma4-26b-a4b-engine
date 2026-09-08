@@ -33,7 +33,20 @@ public enum Gemma4DecodeFusedGUV1 {
 
     /// Raw launch for callers that already passed the fused-GU contract.
     static func call(_ inputs: [MLXArray], taggedRoute: Bool = false) -> MLXArray {
-        (taggedRoute ? kernelTagged : kernelGeneral)(inputs,
+        if packetSumsEnabled, runCap == 4, inputs.count == 6,
+            inputs[3].dtype == .bfloat16,
+            (inputs[3].shape == [8, 2816] || inputs[3].shape == [8, 1, 2816]),
+            inputs[4].dtype == .uint32, inputs[4].shape == [64],
+            inputs[5].dtype == .uint32, inputs[5].shape == [64]
+        {
+            let sums = packetSumKernel([inputs[3]],
+                grid: (2816, 1, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[8, 352]], outputDTypes: [.float32])[0]
+            return (taggedRoute ? kernelTaggedSums : kernelGeneralSums)(inputs + [sums],
+                grid: (32, 176 * 2, 64), threadGroup: (32, 2, 1),
+                outputShapes: [outputShape], outputDTypes: [outputDType])[0]
+        }
+        return (taggedRoute ? kernelTagged : kernelGeneral)(inputs,
             grid: (32, 176 * 2, 64), threadGroup: (32, 2, 1),
             outputShapes: [outputShape], outputDTypes: [outputDType])[0]
     }
@@ -48,11 +61,12 @@ public enum Gemma4DecodeFusedGUV1 {
     /// two carry distinct kernel names so their pipeline-cache entries never
     /// alias. Only an already-unreachable branch is removed, so the output is
     /// bit-identical.
-    private static func makeKernel(tagged: Bool) -> MLXFast.MLXFastKernel {
+    private static func makeKernel(tagged: Bool, inputSums: Bool = false) -> MLXFast.MLXFastKernel {
         MLXFast.metalKernel(
-        name: "gemma4_b8_decode_gateup_geglu_threadgroup_v2_solo1"
-            + (tagged ? "_tagged_v1" : ""),
-        inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"],
+        name: "gemma4_b8_decode_gateup_geglu_threadgroup_v3_packetsum1"
+            + (tagged ? "_tagged_v1" : "") + (inputSums ? "_sum" : "_direct"),
+        inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"]
+            + (inputSums ? ["inputSums"] : []),
         outputNames: ["y"],
         source: #"""
 uint3 tid=threadgroup_position_in_grid;
@@ -69,7 +83,7 @@ uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
     threadgroup bfloat* scratch=tile+(localSg==1 ? 4*guPairs:0)+localColumn-localSg*4;
     uint3 mathTid=tid;mathTid.y=0;
     tg_execute_projection<bfloat>(w+(expertBase+packedRow)*352,scales+(expertBase+packedRow)*44,biases+(expertBase+packedRow)*44,
-        x,lhs,scratch,8*guPairs,guSliceN,assignment,run.count,mathTid,localSg,lane);
+        x,lhs,scratch,8*guPairs,guSliceN,assignment,run.count,mathTid,localSg,lane GU_KERNEL_SUM_ARGS);
     // BF16 closes remain explicit; only the scratch address space changes.
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if((sg&1u)==0 && lane<run.count*4){
@@ -83,7 +97,33 @@ uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
 
 """#,
         header: "#define GU_RUN_CAP \(runCap)\n"
-            + "#define GU_TAGGED_ROUTE \(tagged ? 1 : 0)\n" + #"""
+            + "#define GU_TAGGED_ROUTE \(tagged ? 1 : 0)\n"
+            + "#define GU_INPUT_SUMS \(inputSums ? 1 : 0)\n"
+            + kernelHeader,
+        ensureRowContiguous: true)
+    }
+
+    private static let packetSumsEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_PACKET_SUMS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let kernelHeader = #"""
+#if GU_INPUT_SUMS
+#define GU_SUM_PARAMS , const device float* inputSums, const device T* inputBase
+#define GU_DISPATCH_SUM_PARAMS , const device float* inputSums
+#define GU_KERNEL_SUM_ARGS , inputSums
+#define GU_HELPER_SUM_ARGS , inputSums, x
+#define GU_VECTOR_LOAD(X, V) load_vector_sum_only<T, float, values_per_thread, 4>(X, V, inputSums, inputBase)
+#else
+#define GU_SUM_PARAMS
+#define GU_DISPATCH_SUM_PARAMS
+#define GU_KERNEL_SUM_ARGS
+#define GU_HELPER_SUM_ARGS
+#define GU_VECTOR_LOAD(X, V) load_vector<T, float, values_per_thread, 4>(X, V)
+#endif
+
 // Copyright © 2023-2024 Apple Inc. Canonical helpers from 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -735,6 +775,19 @@ METAL_FUNC void tg_qmv_impl(
   }
 }
 
+
+template<typename T,typename U,int values_per_thread,int bits>
+METAL_FUNC U load_vector_sum_only(const device T* x,thread U* v,
+    const device float* inputSums,const device T* inputBase) {
+  static_assert(values_per_thread == 8 && bits == 4, "GU sum-only packet");
+  for (int i=0; i<8; i+=4) {
+    v[i]=x[i]; v[i+1]=x[i+1]/16.0f;
+    v[i+2]=x[i+2]/256.0f; v[i+3]=x[i+3]/4096.0f;
+  }
+  const size_t packet=size_t(x-inputBase)/8u;
+  return static_cast<U>(inputSums[packet]);
+}
+
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
     const device uint32_t* w,
@@ -747,7 +800,7 @@ METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
     const constant int& in_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]] GU_SUM_PARAMS) {
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
@@ -785,8 +838,8 @@ METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
       bias_local[row] = biases[row * in_vec_size_g];
     }
 
-    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
-    float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+    float sum0 = GU_VECTOR_LOAD(x0, x0_thread);
+    float sum1 = GU_VECTOR_LOAD(x1, x1_thread);
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       float dot0;
@@ -818,9 +871,9 @@ METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
     }
 
     float sum0 =
-        load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+        GU_VECTOR_LOAD(x0, x0_thread);
     float sum1 =
-        load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+        GU_VECTOR_LOAD(x1, x1_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       float dot0;
       float dot1;
@@ -851,7 +904,7 @@ METAL_FUNC void tg_qmv_affine4_g64_solo_impl(
     const constant int& in_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]] GU_SUM_PARAMS) {
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
@@ -885,7 +938,7 @@ METAL_FUNC void tg_qmv_affine4_g64_solo_impl(
       bias_local[row] = biases[row * in_vec_size_g];
     }
 
-    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+    float sum0 = GU_VECTOR_LOAD(x0, x0_thread);
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
@@ -911,7 +964,7 @@ METAL_FUNC void tg_qmv_affine4_g64_solo_impl(
     }
 
     float sum0 =
-        load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+        GU_VECTOR_LOAD(x0, x0_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
           packed[row], x0_thread, scale_local[row], bias_local[row], sum0);
@@ -941,7 +994,7 @@ METAL_FUNC void tg_qmv_affine4_g64_triple_stream_impl(
     const int in_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]] GU_SUM_PARAMS) {
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
@@ -982,17 +1035,17 @@ METAL_FUNC void tg_qmv_affine4_g64_triple_stream_impl(
       bias_local[row] = biases[row * in_vec_size_g];
     }
 
-    float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
+    float sum = GU_VECTOR_LOAD(x0, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
+    sum = GU_VECTOR_LOAD(x1, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
+    sum = GU_VECTOR_LOAD(x2, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
@@ -1069,7 +1122,7 @@ METAL_FUNC void tg_qmv_affine4_g64_quad_stream_impl(
     const int in_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]] GU_SUM_PARAMS) {
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
@@ -1113,22 +1166,22 @@ METAL_FUNC void tg_qmv_affine4_g64_quad_stream_impl(
       bias_local[row] = biases[row * in_vec_size_g];
     }
 
-    float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
+    float sum = GU_VECTOR_LOAD(x0, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
+    sum = GU_VECTOR_LOAD(x1, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
+    sum = GU_VECTOR_LOAD(x2, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
+    sum = GU_VECTOR_LOAD(x3, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine4_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
@@ -1246,24 +1299,36 @@ METAL_FUNC ExpertRun expert_run(const device uint* rhs,uint assignment) {
 template<typename T>
 METAL_FUNC void tg_execute_projection(const device uint* w,const device T* scales,const device T* biases,
     const device T* x,const device uint* lhs,threadgroup T* y0,int rowStride,
-    const constant int& outputN,uint assignment,uint count,uint3 tid,uint sg,uint lane) {
+    const constant int& outputN,uint assignment,uint count,uint3 tid,uint sg,uint lane GU_DISPATCH_SUM_PARAMS) {
     const device T* x0=x+lhs[assignment]*2816;
-    if(count==1){tg_qmv_affine4_g64_solo_impl<T,64,4>(w,scales,biases,x0,y0,guK,tid,sg,lane);return;}
+    if(count==1){tg_qmv_affine4_g64_solo_impl<T,64,4>(w,scales,biases,x0,y0,guK,tid,sg,lane GU_HELPER_SUM_ARGS);return;}
     const device T* x1=x+lhs[assignment+1]*2816;threadgroup T* y1=y0+rowStride;
-    if(count==2){tg_qmv_affine4_g64_pair_impl<T,64,4>(w,scales,biases,x0,x1,y0,y1,guK,tid,sg,lane);return;}
+    if(count==2){tg_qmv_affine4_g64_pair_impl<T,64,4>(w,scales,biases,x0,x1,y0,y1,guK,tid,sg,lane GU_HELPER_SUM_ARGS);return;}
 #if GU_RUN_CAP >= 3
     const device T* x2=x+lhs[assignment+2]*2816;threadgroup T* y2=y1+rowStride;
-    if(count==3){tg_qmv_affine4_g64_triple_stream_impl<T,64,4>(w,scales,biases,x0,x1,x2,y0,y1,y2,guK,tid,sg,lane);return;}
+    if(count==3){tg_qmv_affine4_g64_triple_stream_impl<T,64,4>(w,scales,biases,x0,x1,x2,y0,y1,y2,guK,tid,sg,lane GU_HELPER_SUM_ARGS);return;}
 #endif
 #if GU_RUN_CAP >= 4
     const device T* x3=x+lhs[assignment+3]*2816;threadgroup T* y3=y2+rowStride;
-    tg_qmv_affine4_g64_quad_stream_impl<T,64,4>(w,scales,biases,x0,x1,x2,x3,y0,y1,y2,y3,guK,tid,sg,lane);
+    tg_qmv_affine4_g64_quad_stream_impl<T,64,4>(w,scales,biases,x0,x1,x2,x3,y0,y1,y2,y3,guK,tid,sg,lane GU_HELPER_SUM_ARGS);
 #endif
 }
 
-"""#,
+"""#
+
+    private static let packetSumKernel = MLXFast.metalKernel(
+        name: "gemma4_b8_gu_packet_sums_v1", inputNames: ["x"], outputNames: ["sums"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            if (i >= 2816u) return;
+            thread float terms[8];
+            sums[i] = load_vector<bfloat, float, 8, 4>(x + i * 8u, terms);
+            """,
+        header: "#define GU_RUN_CAP 4\n#define GU_TAGGED_ROUTE 0\n#define GU_INPUT_SUMS 0\n" + kernelHeader,
         ensureRowContiguous: true)
-    }
+
+    private static let kernelGeneralSums: MLXFast.MLXFastKernel = makeKernel(tagged: false, inputSums: true)
+    private static let kernelTaggedSums: MLXFast.MLXFastKernel = makeKernel(tagged: true, inputSums: true)
 
     private static let kernelGeneral: MLXFast.MLXFastKernel = makeKernel(tagged: false)
     private static let kernelTagged: MLXFast.MLXFastKernel = makeKernel(tagged: true)

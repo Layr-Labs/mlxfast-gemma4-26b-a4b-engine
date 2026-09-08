@@ -6318,6 +6318,11 @@ public class Gemma4DecoderLayer: Module {
                     // a lazy fallback: it is dispatched only if SwitchGLU
                     // declines the producer, and never otherwise.
                     let expertNormWeight = preFeedforwardLayernorm2.weight
+                    // PREFILL-SCATTER-INV: only when this exact `out` came
+                    // from the prefill prefix, which reduced that same row.
+                    // `out` is not reassigned between that binding and the
+                    // producer below, so the two rows are the same bytes.
+                    let prefixInvRMS = prefillBranchPrefix?.invRMS
                     let expertTopK = topKIndices.dim(-1)
                     let normEps = config.rmsNormEps
                     h1Raw = mlp(n1)
@@ -6331,7 +6336,8 @@ public class Gemma4DecoderLayer: Module {
                                 weight: expertNormWeight,
                                 inverseOrder: inverseOrder,
                                 topK: expertTopK,
-                                eps: normEps)
+                                eps: normEps,
+                                invRMS: prefixInvRMS)
                         })
                 } else if let (n1, n2) = Gemma4PrefillGlueV1.dualPreNorm(
                     x: out,

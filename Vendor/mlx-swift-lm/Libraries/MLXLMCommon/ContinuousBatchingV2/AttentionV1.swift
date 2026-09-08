@@ -486,6 +486,34 @@ enum CBv2AttentionV1 {
         let effectiveSinks = dispatchSinks(
             sinks, kind: kind, queries: queries, softcap: softcap)
 
+        // A quant-authoritative row can outlive its original eight-row batch.
+        // Keep those live rows on the mirror road when membership shrinks;
+        // their elided BF16 rings must never reach the row-local fallback.
+        // Fresh smaller batches retain the incumbent dispatch. Borrowed caches
+        // are excluded by the same ownership capability as the eight-row path.
+        if B < 8, L == 1, allowFusedRingWrite, let decodeRingWriteFence,
+            canUseRaggedTwoPassDecode(
+                batch: B, cacheKind: kind, queryKind: kind,
+                scale: scale, sinks: effectiveSinks, softcap: softcap,
+                allowPartialBatch: true)
+        {
+            let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
+            if ringRows.count == B, ringRows.contains(where: \.bf16RingStale) {
+                let preWrite = ringRows.compactMap { $0.decodeRingQuantViewBeforeWrite }
+                if preWrite.count == B,
+                    let fused = CBv2RaggedTwoPassDecodeAttentionV1.attendRingQuantWriting(
+                        queries: queries, mirrors: preWrite.map(\.mirror),
+                        starts: preWrite.map(\.start), newKeys: keys, newValues: values,
+                        previousWriteFence: decodeRingWriteFence.value, scale: scale,
+                        slidingWindowLength: ringRows[0].window)
+                {
+                    for row in ringRows { row.advanceDecodeRingAfterQuantWrite() }
+                    decodeRingWriteFence.value = fused.nextWriteFence
+                    return fused.output
+                }
+            }
+        }
+
         if B == 1 {
             if serializeQueries, L > 1 {
                 return updateAndAttendRowSerialQueries(
@@ -1554,9 +1582,9 @@ enum CBv2AttentionV1 {
     @inline(__always)
     private static func canUseRaggedTwoPassDecode(
         batch: Int, cacheKind: CBv2LayerKind, queryKind: CBv2LayerKind,
-        scale: Float, sinks: MLXArray?, softcap: Float?
+        scale: Float, sinks: MLXArray?, softcap: Float?, allowPartialBatch: Bool = false
     ) -> Bool {
-        guard batch == 8,
+        guard batch == 8 || (allowPartialBatch && (1 ..< 8).contains(batch)),
             scale == 1.0,
             sinks == nil,
             softcap == nil,

@@ -11,6 +11,28 @@ constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
 constant bool align_K [[function_constant(202)]];
 
+// DARKBLOOM GEMMA4 NAX LOOP UNIFY.
+// The accelerated steel GEMM carried TWO complete K-loop function templates --
+// gemm_loop and gemm_loop_softmax -- differing only in whether the prompt
+// softmax expression is applied to the A fragments after they are loaded. The
+// choice between them is a runtime predicate on constant-buffer values, so a
+// single nn/axpby pipeline instantiated both bodies in full and executed at
+// most one. With the unify on there is one body: the transform is predicated
+// at the A-load site, which is where the non-accelerated twin has always taken
+// the same decision (steel_gemm_fused.h). Loads, K order, tensor ops, the
+// accumulator and the store are untouched, and the transform is applied to
+// exactly the elements, with exactly the limits, it was applied to before, so
+// every stored element is bit-identical.
+// The transform is admitted only on the layout the incumbent admitted it on
+// (non-transposed A, non-transposed B, bfloat16), which is a compile-time
+// property, so every other pipeline compiles to the incumbent body unchanged.
+// Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_LOOP_UNIFY=0 to restore the
+// two separate templates and the two call sites.
+#ifndef DARKBLOOM_GEMMA4_NAX_LOOP_UNIFY
+#define DARKBLOOM_GEMMA4_NAX_LOOP_UNIFY 1
+#endif
+
+
 // DARKBLOOM GEMMA4 NAX SKIP-EMPTY.
 // Restores NAX-SKIP-EMPTY-001 (upstream ml-explore/mlx 66a0407) behind a kill
 // switch. A steel NAX GEMM simdgroup whose output extent is empty in either
@@ -292,6 +314,33 @@ template <
   dispatch_bool(align_K, [&](auto kAlignedK) {
     dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
       dispatch_bool(align_N || !is_unaligned_sn, [&](auto kAlignedN) {
+#if DARKBLOOM_GEMMA4_NAX_LOOP_UNIFY
+        // One K-loop body. A consumed statistics operand selects the at1
+        // loader transform inside it; a null one selects the plain load. The
+        // sequence of loads, transforms, tensor ops and accumulator updates is
+        // the one the selected separate template performed.
+        Dtile = gemm_loop<
+            T,
+            SM,
+            SN,
+            SK,
+            BK,
+            transpose_a,
+            transpose_b,
+            kAlignedM.value,
+            kAlignedN.value,
+            kAlignedK.value,
+            AccumType>(
+            A,
+            B,
+            params->lda,
+            params->ldb,
+            params->K,
+            params->gemm_k_iterations_aligned,
+            sgp_sm,
+            sgp_sn,
+            softmax_loader ? sm_stats : nullptr);
+#else
         bool loop_done = false;
         if constexpr (kSoftmaxLoaderEligible) {
           if (softmax_loader) {
@@ -342,6 +391,7 @@ template <
               sgp_sm,
               sgp_sn);
         }
+#endif
         if ((DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY == 0) ||
             ((kAlignedM.value || sgp_sm > 0) &&
              (kAlignedN.value || sgp_sn > 0))) {

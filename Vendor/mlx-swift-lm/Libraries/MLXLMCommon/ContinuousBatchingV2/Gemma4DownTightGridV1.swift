@@ -65,13 +65,19 @@ public enum Gemma4DownTightGridV1 {
         tagged: Bool
     ) -> @Sendable ([MLXArray]) -> [MLXArray] {
         MLX.compile(shapeless: false) { inputs in
-            let activated = Gemma4DecodeFusedGUV1.call(
-                [inputs[0], inputs[1], inputs[2], inputs[6], inputs[7], inputs[8]],
-                taggedRoute: tagged)
-            return [Gemma4DownTightGridV1.call(
-                [inputs[3], inputs[4], inputs[5], activated, inputs[9], inputs[8]],
-                span: tileSpan, taggedRoute: tagged)]
+            [buildGateUpDown(inputs, taggedRoute: tagged)]
         }
+    }
+
+    public static func buildGateUpDown(
+        _ inputs: [MLXArray], taggedRoute: Bool
+    ) -> MLXArray {
+        let activated = Gemma4DecodeFusedGUV1.call(
+            [inputs[0], inputs[1], inputs[2], inputs[6], inputs[7], inputs[8]],
+            taggedRoute: taggedRoute)
+        return call(
+            [inputs[3], inputs[4], inputs[5], activated, inputs[9], inputs[8]],
+            span: tileSpan, taggedRoute: taggedRoute)
     }
 
     /// Bound to the immutable sanitized checkpoint, like the fused gate/up storage.
@@ -88,6 +94,10 @@ public enum Gemma4DownTightGridV1 {
             self.weight = weight
             self.scales = scales
             self.biases = biases
+        }
+
+        func gateUpDownParameters(_ storage: SwitchGateUpFusedStorage) -> [MLXArray] {
+            [storage.weight, storage.scales, storage.biases, weight, scales, biases]
         }
 
         static func admits(x: MLXArray, indices: MLXArray) -> Bool {

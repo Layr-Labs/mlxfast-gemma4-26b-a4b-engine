@@ -1103,14 +1103,43 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
             biases.shape == scales.shape
         else { return nil }
         CBv2EngageMark.once("dense-gelu-epilogue-decode")
+        return buildFFNGateUp([x, weight, scales, biases])
+    }
+
+    public static var compiledFFNAvailable: Bool {
+        enabled && denseGeluEpilogueEnabled && mma8DownEnabled && !mma8DownLaneSumsEnabled
+    }
+
+    public static func recordCompiledFFNEngagement() {
+        CBv2EngageMark.once("dense-gelu-epilogue-decode")
+        if mma8DownStaticKEnabled && mma8DownStaticNEnabled {
+            CBv2EngageMark.once("mlp-down-static-n")
+        }
+    }
+
+    public static func buildFFNGateUp(_ inputs: [MLXArray]) -> MLXArray {
         let yTiles = 2112 / outputsPerGroup
         return mma8GateUpGeluKernel(
-            [x, weight, scales, biases],
-            template: [("T", x.dtype)],
+            inputs,
+            template: [("T", DType.bfloat16)],
             grid: (simdWidth, yTiles * simdGroups, 1),
             threadGroup: (simdWidth, simdGroups, 1),
             outputShapes: [[batch, sequence, 2112]],
-            outputDTypes: [x.dtype]
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+
+    public static func buildFFNDown(_ inputs: [MLXArray]) -> MLXArray {
+        let selected = mma8DownStaticKEnabled
+            ? (mma8DownStaticNEnabled ? mma8DownStaticKNKernel : mma8DownStaticKKernel)
+            : mma8Kernel
+        return selected(
+            inputs,
+            template: [("T", DType.bfloat16)],
+            grid: (simdWidth, (2816 / outputsPerGroup) * simdGroups, 1),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [[batch, sequence, 2816]],
+            outputDTypes: [.bfloat16]
         )[0]
     }
 
@@ -1590,17 +1619,8 @@ inline U qdot_affine8_registered_v4(
             } else {
                 if mma8DownStaticKEnabled && mma8DownStaticNEnabled {
                     CBv2EngageMark.once("mlp-down-static-n")
-                    return mma8DownStaticKNKernel(
-                        [x, weight, scales, biases],
-                        template: [("T", x.dtype)],
-                        grid: (simdWidth, yTiles * simdGroups, 1),
-                        threadGroup: (simdWidth, simdGroups, 1),
-                        outputShapes: [[batch, sequence, outDim]],
-                        outputDTypes: [x.dtype]
-                    )[0]
                 }
-                selectedMMA = mma8DownStaticKEnabled
-                    ? mma8DownStaticKKernel : mma8Kernel
+                return buildFFNDown([x, weight, scales, biases])
             }
             return selectedMMA(
                 [x, weight, scales, biases],

@@ -1638,6 +1638,29 @@ public class SwitchGLU: Module {
         return (storage, contract.groupSize, contract.bits, contract.mode)
     }
 
+    public func compiledFFNParameters(taggedRoute: Bool) -> [MLXArray]? {
+        guard Gemma4DecodeFusedGUV1.enabled,
+            Gemma4DownTightGridV1.compiledGateUpAvailable,
+            MLXHardwareInfo.isCompiledDecodeSupported, switchGeluShapedFuseEnabled,
+            routeSimdRank64Enabled,
+            inputDims == 2816, hiddenDims == 704, numExperts == 128,
+            weightedReductionProfile == .gemma4ProductionGeGLU,
+            gateUpProj == nil, activationProduct == nil, isGeluActivation,
+            (expertPrefixBoundsEnabled || taggedRoute) == taggedRoute,
+            !taggedRoute || expertPrefixBoundsProjectionsEligible,
+            let fused = fusedGateUpDispatch(),
+            let down = resolveTightDownStorage(
+                xShape: Gemma4DecodeFusedGUV1.outputShape,
+                xDType: Gemma4DecodeFusedGUV1.outputDType,
+                indices: switchDownIdentity64, sorted: true)
+        else { return nil }
+        return down.gateUpDownParameters(fused.storage) + [switchDownIdentity64]
+    }
+
+    public func recordCompiledFFNDeferredRows() {
+        weightedExpertUnsortProbe.recordEffective()
+    }
+
     private func projectExperts(
         _ x: MLXArray, _ indices: MLXArray,
         sortedPlane: SwitchSortedPlaneProducer? = nil,

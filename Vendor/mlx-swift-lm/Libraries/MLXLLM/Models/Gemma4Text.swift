@@ -3943,18 +3943,8 @@ private enum Gemma4RouteGlueFoldV1 {
             perExpertScale.ndim == 1, perExpertScale.dim(0) == 128,
             perExpertScale.dtype == .bfloat16
         else { return nil }
-        CBv2EngageMark.once("glue-fold")
-        if orderKeysEnabled { CBv2EngageMark.once("router-native-max8-sg1-decode") }
-        if switchRouteGluePrefixBoundsEnabled {
-            CBv2EngageMark.once("route-glue-prefix-bounds")
-        }
-        let outs = kernel(
-            [scores, perExpertScale],
-            grid: (orderKeysEnabled ? 256 : 1024, 1, 1),
-            threadGroup: (orderKeysEnabled ? 256 : 1024, 1, 1),
-            outputShapes: [[8, 1, 8], [8, 1, 8], [64], [64], [64]],
-            outputDTypes: [.uint32, .bfloat16, .uint32, .uint32, .uint32]
-        )
+        recordEngagement()
+        let outs = build([scores, perExpertScale])
         return Fold(
             indices: outs[0],
             weights: outs[1],
@@ -3963,6 +3953,24 @@ private enum Gemma4RouteGlueFoldV1 {
                 sortedKeys: outs[3],
                 inverseOrder: outs[4],
                 hasExpertPrefixBounds: switchRouteGluePrefixBoundsEnabled))
+    }
+
+    static func recordEngagement() {
+        CBv2EngageMark.once("glue-fold")
+        if orderKeysEnabled { CBv2EngageMark.once("router-native-max8-sg1-decode") }
+        if switchRouteGluePrefixBoundsEnabled {
+            CBv2EngageMark.once("route-glue-prefix-bounds")
+        }
+    }
+
+    static func build(_ inputs: [MLXArray]) -> [MLXArray] {
+        kernel(
+            inputs,
+            grid: (orderKeysEnabled ? 256 : 1024, 1, 1),
+            threadGroup: (orderKeysEnabled ? 256 : 1024, 1, 1),
+            outputShapes: [[8, 1, 8], [8, 1, 8], [64], [64], [64]],
+            outputDTypes: [.uint32, .bfloat16, .uint32, .uint32, .uint32]
+        )
     }
 }
 
@@ -4555,26 +4563,13 @@ private enum Gemma4FusedLayerGlue {
             routerWeight.dtype == .bfloat16
         else { return nil }
         if denseXSumElideEnabled {
-            CBv2EngageMark.once("dense-xsum-elide")
-            let outs = attentionBranchPrefixKernelV2(
+            recordFFNPrefixEngagement()
+            let outs = buildFFNPrefix(
                 [
                     attn, residual, postAttentionWeight, denseWeight,
                     expertWeight, routerWeight,
-                ],
-                template: [("T", attn.dtype)],
-                grid: (rows * tgThreads, 1, 1),
-                threadGroup: (tgThreads, 1, 1),
-                outputShapes: [
-                    [rows, 1, axis],
-                    [rows, 1, axis],
-                    [rows, 1, axis],
-                    [rows, 1, axis],
-                ],
-                outputDTypes: [
-                    .bfloat16, .bfloat16, .bfloat16, .bfloat16,
                 ]
             )
-            CBv2EngageMark.once("attention-branch-prefix")
             return AttentionBranchPrefix(
                 out: outs[0],
                 denseNorm: outs[1],
@@ -4611,6 +4606,22 @@ private enum Gemma4FusedLayerGlue {
             expertNorm: outs[2],
             routerNorm: outs[3],
             denseSums: denseSums)
+    }
+
+    static func recordFFNPrefixEngagement() {
+        CBv2EngageMark.once("dense-xsum-elide")
+        CBv2EngageMark.once("attention-branch-prefix")
+    }
+
+    static func buildFFNPrefix(_ inputs: [MLXArray]) -> [MLXArray] {
+        attentionBranchPrefixKernelV2(
+            inputs,
+            template: [("T", DType.bfloat16)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: Array(repeating: [rows, 1, axis], count: 4),
+            outputDTypes: Array(repeating: .bfloat16, count: 4)
+        )
     }
 
     static func dualPreNorm(
@@ -4963,21 +4974,13 @@ private enum Gemma4FusedLayerGlue {
             nextInputNormWeight.dim(0) == axis,
             nextInputNormWeight.dtype == .bfloat16
         else { return nil }
-        CBv2EngageMark.once("glue-deferred-expert-tail-chain")
-        if deferredPairedRmsEnabled {
-            CBv2EngageMark.once("glue-deferred-expert-tail-chain-paired-rms")
-        }
-        let outs = deferredTailChainKernel(
+        recordFFNTailEngagement(chained: true)
+        let outs = buildFFNTail(
             [
                 mlpOut, expertRows.sortedOutputs, expertRows.inverseOrder,
                 expertRows.weights, residual, w1, w2, w3, layerScalar,
                 nextInputNormWeight,
-            ],
-            template: [("T", mlpOut.dtype)],
-            grid: (rows * tgThreads, 1, 1),
-            threadGroup: (tgThreads, 1, 1),
-            outputShapes: [[rows, 1, axis], [rows, 1, axis], [rows, axis / 64]],
-            outputDTypes: [.bfloat16, .bfloat16, .float32]
+            ], chained: true
         )
         return (outs[0], outs[1], outs[2])
     }
@@ -5000,21 +5003,31 @@ private enum Gemma4FusedLayerGlue {
             w3.ndim == 1, w3.dim(0) == axis, w3.dtype == .bfloat16,
             layerScalar.size == 1, layerScalar.dtype == .bfloat16
         else { return nil }
-        CBv2EngageMark.once("glue-deferred-expert-tail")
-        if deferredPairedRmsEnabled {
-            CBv2EngageMark.once("glue-deferred-expert-tail-paired-rms")
-        }
-        return deferredTailKernel(
+        recordFFNTailEngagement(chained: false)
+        return buildFFNTail(
             [
                 mlpOut, expertRows.sortedOutputs, expertRows.inverseOrder,
                 expertRows.weights, residual, w1, w2, w3, layerScalar,
-            ],
-            template: [("T", mlpOut.dtype)],
+            ], chained: false
+        )[0]
+    }
+
+    static func recordFFNTailEngagement(chained: Bool) {
+        let tag = chained ? "glue-deferred-expert-tail-chain" : "glue-deferred-expert-tail"
+        CBv2EngageMark.once(tag)
+        if deferredPairedRmsEnabled { CBv2EngageMark.once(tag + "-paired-rms") }
+    }
+
+    static func buildFFNTail(_ inputs: [MLXArray], chained: Bool) -> [MLXArray] {
+        (chained ? deferredTailChainKernel : deferredTailKernel)(
+            inputs,
+            template: [("T", DType.bfloat16)],
             grid: (rows * tgThreads, 1, 1),
             threadGroup: (tgThreads, 1, 1),
-            outputShapes: [[rows, 1, axis]],
-            outputDTypes: [.bfloat16]
-        )[0]
+            outputShapes: chained
+                ? [[rows, 1, axis], [rows, 1, axis], [rows, axis / 64]] : [[rows, 1, axis]],
+            outputDTypes: chained ? [.bfloat16, .bfloat16, .float32] : [.bfloat16]
+        )
     }
 
     static func tailChained(
@@ -5420,6 +5433,25 @@ private class Gemma4MLP: Module {
 
     fileprivate func bindFusedGateUpStorage(_ storage: Gemma4DenseGateUpStorage) {
         fusedGateUpStorage = storage
+    }
+
+    fileprivate func compiledFFNParameters() -> [MLXArray]? {
+        guard gemma4DenseGateUpJoinEnabled, CBv2DenseMLPQMVV1.compiledFFNAvailable,
+            let storage = fusedGateUpStorage,
+            let gate = gateProj as? QuantizedLinear,
+            let up = upProj as? QuantizedLinear,
+            let down = downProj as? QuantizedLinear,
+            gate.bias == nil, up.bias == nil, down.bias == nil,
+            gate.groupSize == 64, up.groupSize == 64, down.groupSize == 64,
+            gate.bits == 8, up.bits == 8, down.bits == 8,
+            gate.mode == .affine, up.mode == .affine, down.mode == .affine,
+            down.weight.dtype == .uint32, down.weight.shape == [2816, 528],
+            down.scales.dtype == .bfloat16, down.scales.shape == [2816, 33],
+            let downBiases = down.biases,
+            downBiases.dtype == .bfloat16, downBiases.shape == [2816, 33]
+        else { return nil }
+        return [storage.weight, storage.scales, storage.biases,
+                down.weight, down.scales, downBiases]
     }
 
     // MARK: DENSE-GEGLU-EPILOGUE (prefill)
@@ -5920,6 +5952,118 @@ private enum Gemma4ZipRouterV1 {
     }
 }
 
+private enum Gemma4CompiledFFNV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_COMPILED_FFN"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let chained: @Sendable ([MLXArray]) -> [MLXArray] =
+        makeCompiled(chained: true, tagged: switchRouteGluePrefixBoundsEnabled)
+    private static let terminal: @Sendable ([MLXArray]) -> [MLXArray] =
+        makeCompiled(chained: false, tagged: switchRouteGluePrefixBoundsEnabled)
+
+    private static func makeCompiled(
+        chained: Bool, tagged: Bool
+    ) -> @Sendable ([MLXArray]) -> [MLXArray] {
+        MLX.compile(shapeless: false) { inputs in
+            // 0..<6 prefix; 6..<10 router; 10..<16 dense; 16..<22 experts;
+            // 22..<26 tail norms/scalar; 26 down LHS; 27 optional next norm.
+            let prefix = Gemma4FusedLayerGlue.buildFFNPrefix(Array(inputs[0..<6]))
+            let scores = MLX.quantizedMM(
+                prefix[3], inputs[6], scales: inputs[7], biases: inputs[8],
+                transpose: true, groupSize: 64, bits: 8, mode: .affine)
+            let denseInput = MLX.depends(input: prefix[1], dependencies: [prefix[3]])
+            let denseActivated = CBv2DenseMLPQMVV1.buildFFNGateUp(
+                [denseInput, inputs[10], inputs[11], inputs[12]])
+            let activated = MLX.depends(inputs: [denseActivated], dependencies: [scores])[0]
+            let denseOut = CBv2DenseMLPQMVV1.buildFFNDown(
+                [activated, inputs[13], inputs[14], inputs[15]])
+            let route = Gemma4RouteGlueFoldV1.build(
+                [MLX.depends(input: scores, dependencies: [denseOut]), inputs[9]])
+            let expertNorm = MLX.depends(input: prefix[2], dependencies: [denseOut])
+            let expertInput = MLX.expandedDimensions(
+                expertNorm.reshaped(8, 2816), axes: [-2, -3]
+            ).flattened(start: 0, end: -3)
+            let expertOut = Gemma4DownTightGridV1.buildGateUpDown(
+                [inputs[16], inputs[17], inputs[18], inputs[19], inputs[20], inputs[21],
+                 expertInput, route[2], route[3], inputs[26]],
+                taggedRoute: tagged)
+            var tailInputs = [
+                denseOut, MLX.squeezed(expertOut, axis: -2), route[4],
+                route[1].reshaped(8, 8), prefix[0],
+                inputs[22], inputs[23], inputs[24], inputs[25],
+            ]
+            if chained { tailInputs.append(inputs[27]) }
+            return Gemma4FusedLayerGlue.buildFFNTail(tailInputs, chained: chained)
+        }
+    }
+
+    private static func normWeight(_ weight: MLXArray) -> Bool {
+        weight.shape == [2816] && weight.dtype == .bfloat16
+    }
+
+    static func run(
+        attn: MLXArray, residual: MLXArray,
+        router: Gemma4Router, mlp: Gemma4MLP, experts: Gemma4Experts,
+        postAttentionWeight: MLXArray, denseWeight: MLXArray, expertWeight: MLXArray,
+        postDenseWeight: MLXArray, postExpertWeight: MLXArray, postWeight: MLXArray,
+        layerScalar: MLXArray, nextInputNormWeight: MLXArray?, eps: Float
+    ) -> [MLXArray]? {
+        guard enabled, StreamOrDevice.default == .gpu,
+            Gemma4RouterProbe.recorder == nil,
+            Gemma4FusedLayerGlue.enabled, Gemma4FusedLayerGlue.denseXSumElideEnabled,
+            Gemma4ZipRouterV1.enabled, Gemma4ZipRouterV1.plan == 1,
+            Gemma4RouteGlueFoldV1.enabled, Gemma4RouterFinalistsV1.enabled,
+            !Gemma4PrefillDeqGEMMV1.enabled || Gemma4PrefillDeqGEMMV1.minRows > 8,
+            eps == 1e-6, router.eps == eps,
+            attn.shape == [8, 1, 2816], attn.dtype == .bfloat16,
+            residual.shape == attn.shape, residual.dtype == .bfloat16,
+            [postAttentionWeight, denseWeight, expertWeight,
+             postDenseWeight, postExpertWeight, postWeight].allSatisfy(normWeight),
+            nextInputNormWeight.map(normWeight) ?? true,
+            layerScalar.size == 1, layerScalar.dtype == .bfloat16,
+            router.zipAdmits, router.topK == 8, router.kth == 120,
+            router.perExpertScale.shape == [128], router.perExpertScale.dtype == .bfloat16,
+            let projection = router.proj as? QuantizedLinear,
+            projection.bias == nil, projection.groupSize == 64, projection.bits == 8,
+            projection.mode == .affine,
+            projection.weight.shape == [128, 704], projection.weight.dtype == .uint32,
+            projection.scales.shape == [128, 44], projection.scales.dtype == .bfloat16,
+            let projectionBiases = projection.biases,
+            projectionBiases.shape == [128, 44], projectionBiases.dtype == .bfloat16,
+            experts.fuseWeightedUnsort,
+            let dense = mlp.compiledFFNParameters(),
+            let expert = experts.switchGLU.compiledFFNParameters(
+                taggedRoute: switchRouteGluePrefixBoundsEnabled)
+        else { return nil }
+        let routerScale = router.zipEffectiveScale()
+        guard normWeight(routerScale) else { return nil }
+
+        var inputs = [
+            attn, residual, postAttentionWeight, denseWeight, expertWeight, routerScale,
+            projection.weight, projection.scales, projectionBiases, router.perExpertScale,
+        ]
+        inputs.append(contentsOf: dense)
+        inputs.append(contentsOf: expert.prefix(6))
+        inputs.append(contentsOf: [postDenseWeight, postExpertWeight, postWeight,
+                                   layerScalar, expert[6]])
+        if let nextInputNormWeight { inputs.append(nextInputNormWeight) }
+        let hasNext = nextInputNormWeight != nil
+        let outputs = (hasNext ? chained : terminal)(inputs)
+        guard outputs.count == (hasNext ? 3 : 1) else { return nil }
+        Gemma4FusedLayerGlue.recordFFNPrefixEngagement()
+        CBv2DenseMLPQMVV1.recordCompiledFFNEngagement()
+        Gemma4RouteGlueFoldV1.recordEngagement()
+        CBv2EngageMark.once("zip-router")
+        experts.switchGLU.recordCompiledFFNDeferredRows()
+        Gemma4FusedLayerGlue.recordFFNTailEngagement(chained: hasNext)
+        CBv2EngageMark.once(hasNext ? "compiled-ffn-chain" : "compiled-ffn-terminal")
+        return outputs
+    }
+}
+
 // MARK: - Decoder Layer
 
 /// Gemma 4 decoder layer. Combines `Gemma4Attention` with an MLP (or MoE)
@@ -6075,6 +6219,27 @@ public class Gemma4DecoderLayer: Module {
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
             useLastQueryPrefill: useLastQueryPrefill, carriedRunsum: carriedRunsum)
+        if enableAttentionBranchPrefix, !isExpertPrefill, isMoE,
+            perLayerInputGate == nil || activePerLayerInput == nil,
+            let router, let experts, let preFeedforwardLayernorm2,
+            let postFeedforwardLayernorm1, let postFeedforwardLayernorm2,
+            let outputs = Gemma4CompiledFFNV1.run(
+                attn: attnOut, residual: residual, router: router, mlp: mlp, experts: experts,
+                postAttentionWeight: postAttentionLayernorm.weight,
+                denseWeight: preFeedforwardLayernorm.weight,
+                expertWeight: preFeedforwardLayernorm2.weight,
+                postDenseWeight: postFeedforwardLayernorm1.weight,
+                postExpertWeight: postFeedforwardLayernorm2.weight,
+                postWeight: postFeedforwardLayernorm.weight,
+                layerScalar: layerScalar,
+                nextInputNormWeight: glueChain == nil ? nil : nextInputLayernormWeight,
+                eps: config.rmsNormEps)
+        {
+            if outputs.count == 3 {
+                glueChain?.pending = (source: outputs[0], normed: outputs[1], rs: outputs[2])
+            }
+            return (outputs[0], kvPair, attnPositionOffset)
+        }
         // PREFIX-001: only build the joined producer when the ZIP consumer is
         // guaranteed to accept it. A nil leaves the established attention
         // residual and branch pre-norm paths untouched.
@@ -6875,28 +7040,11 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             """
     }()
 
-    /// HEAD-XT. The tied head reads each contraction index across all eight
-    /// activation rows; publishing the same values a second time with the
-    /// rows adjacent lets it take the pair as one word. The values are the
-    /// producer's own `outv[i]`, stored twice, never recomputed.
-    private static let xtEnabled: Bool =
-        Gemma4MMAQuantizedGEMV.consumesTransposedActivation
-
-    private static let xtSuffix: String = xtEnabled ? "_xt1" : ""
-
-    private static let xtOutputNames: [String] =
-        xtEnabled ? ["out", "xSums", "xT"] : ["out", "xSums"]
-
-    /// Appended to the existing store statement, so with HEAD-XT off the
-    /// producer source is the incumbent's byte for byte.
-    private static let xtStore: String = xtEnabled
-        ? "\n                xT[(wbase + i) * 8 + row] = outv[i];" : ""
-
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v1"
-            + nbSuffix + xtSuffix,
+            + nbSuffix,
         inputNames: ["x", "w"],
-        outputNames: xtOutputNames,
+        outputNames: ["out", "xSums"],
         source: """
             const uint row = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
@@ -6923,7 +7071,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
                 // Preserve the stock RMSNorm's BF16 boundary exactly.
                 outv[i] = w[wbase + i]
                     * static_cast<T>((float)x[base + i] * \(finalNormRiEnabled ? "inv" : "local_inv[0]"));
-                out[base + i] = outv[i];\(xtStore)
+                out[base + i] = outv[i];
             }
 
             // This four-value expression is exactly one addend of the head's
@@ -6949,11 +7097,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
 
     static func apply(
         _ x: MLXArray, weight: MLXArray, eps: Float
-    ) -> (
-        postNorm: MLXArray,
-        sums: Gemma4MMAQuantizedGEMV.ActivationSums,
-        transposed: Gemma4MMAQuantizedGEMV.TransposedActivation?
-    )? {
+    ) -> (postNorm: MLXArray, sums: Gemma4MMAQuantizedGEMV.ActivationSums)? {
         guard Gemma4MMAQuantizedGEMV.consumesActivationSums,
             eps == Self.eps,
             x.dtype == .bfloat16,
@@ -6972,26 +7116,16 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             template: [("T", x.dtype)],
             grid: (rows * threadgroupSize, 1, 1),
             threadGroup: (threadgroupSize, 1, 1),
-            outputShapes: xtEnabled
-                ? [[rows, 1, axis], [rows * (axis / groupSize)], [axis, rows]]
-                : [[rows, 1, axis], [rows * (axis / groupSize)]],
-            outputDTypes: xtEnabled
-                ? [.bfloat16, .float32, .bfloat16]
-                : [.bfloat16, .float32]
+            outputShapes: [[rows, 1, axis], [rows * (axis / groupSize)]],
+            outputDTypes: [.bfloat16, .float32]
         )
         guard let sums = Gemma4MMAQuantizedGEMV.activationSums(
             produced: outputs[1], for: outputs[0])
         else { return nil }
-        let transposed: Gemma4MMAQuantizedGEMV.TransposedActivation? =
-            xtEnabled
-            ? Gemma4MMAQuantizedGEMV.transposedActivation(
-                produced: outputs[2], for: outputs[0])
-            : nil
         CBv2EngageMark.once("final-norm-mma-xsum")
         if finalNormNbEnabled { CBv2EngageMark.once("final-norm-nb") }
         if finalNormRiEnabled { CBv2EngageMark.once("final-norm-ri") }
-        if transposed != nil { CBv2EngageMark.once("final-norm-xt") }
-        return (outputs[0], sums, transposed)
+        return (outputs[0], sums)
     }
 }
 
@@ -7124,14 +7258,13 @@ public class Gemma4TextModelInner: Module {
         cache: [KVCache]? = nil
     ) -> (
         postNorm: MLXArray,
-        activationSums: Gemma4MMAQuantizedGEMV.ActivationSums?,
-        transposedActivation: Gemma4MMAQuantizedGEMV.TransposedActivation?
+        activationSums: Gemma4MMAQuantizedGEMV.ActivationSums?
     ) {
         let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
         let result = forwardTrunk(
             inputs, cache: cache, captureHook: nil, capturePreNorm: false,
             emitMMAHeadSums: true)
-        return (result.postNorm, result.mmaHeadSums, result.mmaHeadXT)
+        return (result.postNorm, result.mmaHeadSums)
     }
 
     /// CBv2 prompt-forward entry point. Keeping the scheduled-prefill
@@ -7213,8 +7346,7 @@ public class Gemma4TextModelInner: Module {
     ) -> (
         postNorm: MLXArray,
         preNorm: MLXArray?,
-        mmaHeadSums: Gemma4MMAQuantizedGEMV.ActivationSums?,
-        mmaHeadXT: Gemma4MMAQuantizedGEMV.TransposedActivation?
+        mmaHeadSums: Gemma4MMAQuantizedGEMV.ActivationSums?
     ) {
         // Shape queries cross the Swift/C boundary. Cache the two immutable
         // input dimensions once rather than paying for them at every ladder
@@ -7476,20 +7608,17 @@ public class Gemma4TextModelInner: Module {
 
         let postNorm: MLXArray
         let mmaHeadSums: Gemma4MMAQuantizedGEMV.ActivationSums?
-        let mmaHeadXT: Gemma4MMAQuantizedGEMV.TransposedActivation?
         if emitMMAHeadSums,
             let produced = Gemma4FinalNormMMAHeadSumsV1.apply(
                 h, weight: norm.weight, eps: norm.eps)
         {
             postNorm = produced.postNorm
             mmaHeadSums = produced.sums
-            mmaHeadXT = produced.transposed
         } else {
             postNorm = norm(h)
             mmaHeadSums = nil
-            mmaHeadXT = nil
         }
-        return (postNorm, capturePreNorm ? h : nil, mmaHeadSums, mmaHeadXT)
+        return (postNorm, capturePreNorm ? h : nil, mmaHeadSums)
     }
 }
 
@@ -8222,7 +8351,6 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
         // only this path was still paying for both dispatches.
         let hidden: MLXArray
         let carriedSums: Gemma4MMAQuantizedGEMV.ActivationSums?
-        let carriedXT: Gemma4MMAQuantizedGEMV.TransposedActivation?
         if gemma4DecodeHeadNormXSumFoldEnabled,
             lmHead == nil,
             tokens.ndim == 2,
@@ -8237,11 +8365,9 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
             let produced = model.callWithMMAHeadSums(tokens, cache: caches)
             hidden = produced.postNorm
             carriedSums = produced.activationSums
-            carriedXT = produced.transposedActivation
         } else {
             hidden = model(tokens, cache: caches)
             carriedSums = nil
-            carriedXT = nil
         }
         let rows = tokens.dim(0)
         guard lmHead == nil,
@@ -8254,8 +8380,7 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
                 biases: quantized.biases,
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
-                activationSums: carriedSums,
-                transposedActivation: carriedXT)
+                activationSums: carriedSums)
         else {
             return applyLMHead(hidden).argMax(axis: -1).asType(.int32).reshaped([rows])
         }

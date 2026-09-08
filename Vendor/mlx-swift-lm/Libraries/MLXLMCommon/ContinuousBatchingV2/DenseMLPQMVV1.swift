@@ -33,6 +33,7 @@
 // (`DARKBLOOM_GEMMA4_MLP_MMA8_GATEUP=1`) -- see the switch doc comment for why
 // the two planes are not shipped together.
 
+import Cmlx
 import Foundation
 import MLX
 import MLXFast
@@ -1088,6 +1089,74 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+
+    private static let compiledFencesEnabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_COMPILED_DENSE_FENCES_V2"] ?? "1"
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }()
+
+    public static var compiledFencedPairAvailable: Bool {
+        compiledFencesEnabled && compiledPairAvailable
+    }
+
+    // Copy is a value/gradient identity. The compiler removes the no-op,
+    // while Depends retains the explicit GPU stream chosen during tracing.
+    private static func denseFenceStreamInput(_ input: MLXArray) -> MLXArray {
+        var result = mlx_array_new()
+        let rc = mlx_copy(&result, input.ctx, StreamOrDevice.default.ctx)
+        guard rc == 0 else {
+            fatalError("dense fence stream identity failed")
+        }
+        return MLXArray(result)
+    }
+
+    // Retain the same three ordering edges on the admitted GPU stream.
+    // Neither normalized input nor any weight is captured from a model layer.
+    private static let compiledFencedPair: @Sendable ([MLXArray]) -> [MLXArray] =
+        MLX.compile(shapeless: false) { inputs in
+            let denseIn = MLX.depends(
+                input: denseFenceStreamInput(inputs[0]), dependencies: [inputs[8]])
+            let activated = gateUpGeluCall(
+                [denseIn, inputs[1], inputs[2], inputs[3]])
+            let held = MLX.depends(input: activated, dependencies: [inputs[7]])
+            let denseOut = downStaticKNCall(
+                [held, inputs[4], inputs[5], inputs[6]])
+            let expertNorm = MLX.depends(
+                input: denseFenceStreamInput(inputs[9]), dependencies: [denseOut])
+            return [denseOut, expertNorm]
+        }
+
+    /// Current dense input, GU w/s/b, DOWN w/s/b, scores, router norm, expert norm.
+    /// Shape, quantization and task-local stream admission stay outside tracing.
+    public static func compiledGateUpGeluDownFenced(
+        _ inputs: [MLXArray], groupSize: Int, bits: Int, mode: QuantizationMode
+    ) -> (denseOut: MLXArray, expertNorm: MLXArray)? {
+        guard compiledFencedPairAvailable,
+            groupSize == Self.groupSize, bits == Self.bits, mode == .affine,
+            inputs.count == 10
+        else { return nil }
+        let x = inputs[0], guWeight = inputs[1], guScales = inputs[2], guBiases = inputs[3]
+        let downWeight = inputs[4], downScales = inputs[5], downBiases = inputs[6]
+        let scores = inputs[7], routerNorm = inputs[8], expertNorm = inputs[9]
+        guard x.dtype == .bfloat16, (x.ndim == 3 && x.dim(0) == batch && x.dim(1) == sequence && x.dim(2) == 2816),
+            guWeight.dtype == .uint32, (guWeight.ndim == 2 && guWeight.dim(0) == 4224 && guWeight.dim(1) == 704),
+            guScales.dtype == .bfloat16, (guScales.ndim == 2 && guScales.dim(0) == 4224 && guScales.dim(1) == 44),
+            guBiases.dtype == .bfloat16, guBiases.shape == guScales.shape,
+            downWeight.dtype == .uint32, (downWeight.ndim == 2 && downWeight.dim(0) == 2816 && downWeight.dim(1) == 528),
+            downScales.dtype == .bfloat16, (downScales.ndim == 2 && downScales.dim(0) == 2816 && downScales.dim(1) == 33),
+            downBiases.dtype == .bfloat16, downBiases.shape == downScales.shape,
+            scores.dtype == .bfloat16, (scores.ndim == 3 && scores.dim(0) == batch && scores.dim(1) == sequence && scores.dim(2) == 128),
+            routerNorm.dtype == .bfloat16, (routerNorm.ndim == 3 && routerNorm.dim(0) == batch && routerNorm.dim(1) == sequence && routerNorm.dim(2) == 2816),
+            expertNorm.dtype == .bfloat16, (expertNorm.ndim == 3 && expertNorm.dim(0) == batch && expertNorm.dim(1) == sequence && expertNorm.dim(2) == 2816)
+        else { return nil }
+        CBv2EngageMark.once("dense-gelu-epilogue-decode")
+        CBv2EngageMark.once("mlp-down-static-n")
+        CBv2EngageMark.once("dense-compiled-gu-down")
+        let outputs = compiledFencedPair(inputs)
+        return (outputs[0], outputs[1])
+    }
 
     /// Admission and task-local stream checks run outside the compiled trace.
     /// Other dense variants keep their existing launch and fallback paths.

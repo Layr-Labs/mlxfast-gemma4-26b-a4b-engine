@@ -83,6 +83,13 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    private static let sharedRopeTableEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_SHARED_ROPE_TABLE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let ropeInverseFrequencyKernel = MLXFast.metalKernel(
         name: "cbv2_sliding_rope_inverse_frequencies_v1",
         inputNames: ["rope_log2_base"],
@@ -111,6 +118,50 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             outputShapes: [[dimensions / 2]], outputDTypes: [.float32])[0]
     }
 
+    private static let sharedRopeTableKernel = MLXFast.metalKernel(
+        name: "cbv2_gemma4_shared_rope_table_v1",
+        inputNames: ["position_offsets", "rope_parameters"],
+        outputNames: ["rope_table"],
+        source: """
+            const uint pair = thread_position_in_grid.x;
+            const uint batch_index = thread_position_in_grid.y;
+            const float L = static_cast<float>(position_offsets[batch_index]);
+            const float inv_freq = RECIPROCAL_FREQUENCIES
+                ? 1.0f / rope_parameters[pair]
+                : rope_parameters[pair];
+            const float theta = L * inv_freq;
+            const size_t output_index =
+                (size_t(batch_index) * size_t(D / 2) + size_t(pair)) * 2;
+            rope_table[output_index] = metal::fast::cos(theta);
+            rope_table[output_index + 1] = metal::fast::sin(theta);
+            """,
+        ensureRowContiguous: true)
+
+    public static func makeSharedRopeTable(
+        positionOffsets: MLXArray,
+        ropeParameters: MLXArray,
+        dimensions: Int,
+        reciprocalFrequencies: Bool
+    ) -> MLXArray? {
+        guard sharedRopeTableEnabled,
+            (dimensions == 256 || dimensions == 512),
+            positionOffsets.dtype == .int32,
+            positionOffsets.shape == [batch],
+            ropeParameters.dtype == .float32,
+            ropeParameters.shape == [dimensions / 2]
+        else { return nil }
+        return sharedRopeTableKernel(
+            [positionOffsets, ropeParameters],
+            template: [
+                ("D", dimensions),
+                ("RECIPROCAL_FREQUENCIES", reciprocalFrequencies),
+            ],
+            grid: (dimensions / 2, batch, 1),
+            threadGroup: (dimensions / 2, 1, 1),
+            outputShapes: [[batch, dimensions / 2, 2]],
+            outputDTypes: [.float32])[0]
+    }
+
     private struct ResidentNormRopeInputs {
         let normalizedKeys: ObjectIdentifier
         let normalizedValues: ObjectIdentifier
@@ -122,6 +173,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         let positionOffsets: MLXArray
         let ropeLog2Base: MLXArray
         let ropeInverseFrequencies: MLXArray?
+        let sharedRopeTable: MLXArray?
     }
 
     private static let residentNormRopeLock = NSLock()
@@ -145,6 +197,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         positionOffsets: MLXArray,
         ropeLog2Base: MLXArray,
         ropeInverseFrequencies: MLXArray? = nil,
+        sharedRopeTable: MLXArray? = nil,
         eps: Float,
         appliedRope: Bool
     ) -> Bool {
@@ -189,6 +242,12 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         {
             return false
         }
+        if let sharedRopeTable,
+            (sharedRopeTable.dtype != .float32
+                || sharedRopeTable.shape != [batch, headDim / 2, 2])
+        {
+            return false
+        }
 
         residentNormRopeLock.lock()
         if residentNormRopeInputs.count >= 64 {
@@ -205,7 +264,8 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 kWeight: kWeight,
                 positionOffsets: positionOffsets,
                 ropeLog2Base: ropeLog2Base,
-                ropeInverseFrequencies: ropeInverseFrequencies)
+                ropeInverseFrequencies: ropeInverseFrequencies,
+                sharedRopeTable: sharedRopeTable)
         residentNormRopeLock.unlock()
         return true
     }
@@ -3200,14 +3260,24 @@ for (int element = 0; element < values_per_lane; ++element) {
                     #pragma clang loop unroll(full)
                     for (int i = 0; i < 4; ++i) {
                         const int pair = lane * 4 + i;
-                        const float d = static_cast<float>(pair)
-                            / static_cast<float>(D / 2);
-                        const float inv_freq = ROPE_INV_FREQS
-                            ? rope_parameters[pair]
-                            : metal::exp2(-d * rope_parameters[0]);
-                        const float theta = L * inv_freq;
-                        const float costheta = metal::fast::cos(theta);
-                        const float sintheta = metal::fast::sin(theta);
+                        float costheta;
+                        float sintheta;
+                        if (USE_SHARED_ROPE) {
+                            const size_t trig_index =
+                                (size_t(batch_index) * size_t(D / 2)
+                                    + size_t(pair)) * 2;
+                            costheta = rope_table[trig_index];
+                            sintheta = rope_table[trig_index + 1];
+                        } else {
+                            const float d = static_cast<float>(pair)
+                                / static_cast<float>(D / 2);
+                            const float inv_freq = ROPE_INV_FREQS
+                                ? rope_parameters[pair]
+                                : metal::exp2(-d * rope_parameters[0]);
+                            const float theta = L * inv_freq;
+                            costheta = metal::fast::cos(theta);
+                            sintheta = metal::fast::sin(theta);
+                        }
                         const float x1 =
                             static_cast<float>(normalized_row[pair]);
                         const float x2 =
@@ -3306,14 +3376,24 @@ for (int element = 0; element < values_per_lane; ++element) {
                         #pragma clang loop unroll(full)
                         for (int i = 0; i < 4; ++i) {
                             const int pair = lane * 4 + i;
-                            const float d = static_cast<float>(pair)
-                                / static_cast<float>(D / 2);
-                            const float inv_freq = ROPE_INV_FREQS
-                                ? rope_parameters[pair]
-                                : metal::exp2(-d * rope_parameters[0]);
-                            const float theta = L * inv_freq;
-                            const float costheta = metal::fast::cos(theta);
-                            const float sintheta = metal::fast::sin(theta);
+                            float costheta;
+                            float sintheta;
+                            if (USE_SHARED_ROPE) {
+                                const size_t trig_index =
+                                    (size_t(batch_index) * size_t(D / 2)
+                                        + size_t(pair)) * 2;
+                                costheta = rope_table[trig_index];
+                                sintheta = rope_table[trig_index + 1];
+                            } else {
+                                const float d = static_cast<float>(pair)
+                                    / static_cast<float>(D / 2);
+                                const float inv_freq = ROPE_INV_FREQS
+                                    ? rope_parameters[pair]
+                                    : metal::exp2(-d * rope_parameters[0]);
+                                const float theta = L * inv_freq;
+                                costheta = metal::fast::cos(theta);
+                                sintheta = metal::fast::sin(theta);
+                            }
                             const float x1 = static_cast<float>(rounded_first[i]);
                             const float x2 = static_cast<float>(rounded_second[i]);
                             const T rx1 = static_cast<T>(
@@ -3670,7 +3750,7 @@ for (int element = 0; element < values_per_lane; ++element) {
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
                 "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
-                "position_offsets", "rope_parameters", "write_fence",
+                "position_offsets", "rope_parameters", "rope_table", "write_fence",
             ],
             outputNames: ["out", "fence", "k_out", "v_out"],
             source: residentNormRopeSource(withORunsum: false, directRope: false),
@@ -3686,7 +3766,7 @@ for (int element = 0; element < values_per_lane; ++element) {
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
                 "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
-                "position_offsets", "rope_parameters", "write_fence",
+                "position_offsets", "rope_parameters", "rope_table", "write_fence",
             ],
             outputNames: ["out", "fence", "k_out", "v_out", "o_rs"],
             source: residentNormRopeSource(withORunsum: true, directRope: false),
@@ -3703,7 +3783,7 @@ for (int element = 0; element < values_per_lane; ++element) {
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
                 "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
-                "position_offsets", "rope_parameters", "write_fence",
+                "position_offsets", "rope_parameters", "rope_table", "write_fence",
             ],
             outputNames: ["out", "fence", "k_out", "v_out"],
             source: residentNormRopeSource(withORunsum: false, directRope: true),
@@ -3717,7 +3797,7 @@ for (int element = 0; element < values_per_lane; ++element) {
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
                 "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
-                "position_offsets", "rope_parameters", "write_fence",
+                "position_offsets", "rope_parameters", "rope_table", "write_fence",
             ],
             outputNames: ["out", "fence", "k_out", "v_out", "o_rs"],
             source: residentNormRopeSource(withORunsum: true, directRope: true),
@@ -3881,6 +3961,9 @@ for (int element = 0; element < values_per_lane; ++element) {
                         normRope.kWeight,
                         normRope.positionOffsets,
                         normRope.ropeInverseFrequencies ?? normRope.ropeLog2Base,
+                        normRope.sharedRopeTable
+                            ?? normRope.ropeInverseFrequencies
+                            ?? normRope.ropeLog2Base,
                         previousWriteFence,
                     ])
                 let residentTemplate: [(String, any KernelTemplateArg)] = [
@@ -3891,6 +3974,7 @@ for (int element = 0; element < values_per_lane; ++element) {
                     ("KV_HEADS", kvHeads),
                     ("BLOCKS", blocks),
                     ("ROPE_INV_FREQS", normRope.ropeInverseFrequencies != nil),
+                    ("USE_SHARED_ROPE", normRope.sharedRopeTable != nil),
                 ]
                 let residentShapes = [
                     [batch, queryHeads, 1, headDim], [1],
@@ -4351,6 +4435,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let kWeight: MLXArray
         let positionOffsets: MLXArray
         let ropeFrequencies: MLXArray
+        let sharedRopeTable: MLXArray?
     }
 
     private static let fullNormRopeLock = NSLock()
@@ -4376,6 +4461,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         kWeight: MLXArray,
         positionOffsets: MLXArray,
         ropeFrequencies: MLXArray,
+        sharedRopeTable: MLXArray? = nil,
         eps: Float,
         appliedRope: Bool
     ) -> Bool {
@@ -4404,6 +4490,12 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             ropeFrequencies.dtype == .float32,
             ropeFrequencies.shape == [headDim / 2]
         else { return false }
+        if let sharedRopeTable,
+            (sharedRopeTable.dtype != .float32
+                || sharedRopeTable.shape != [batch, headDim / 2, 2])
+        {
+            return false
+        }
 
         fullNormRopeLock.lock()
         if fullNormRopeInputs.count >= 64 {
@@ -4419,7 +4511,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 qWeight: qWeight,
                 kWeight: kWeight,
                 positionOffsets: positionOffsets,
-                ropeFrequencies: ropeFrequencies)
+                ropeFrequencies: ropeFrequencies,
+                sharedRopeTable: sharedRopeTable)
         fullNormRopeLock.unlock()
         return true
     }
@@ -6145,7 +6238,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
             "params", "raw_queries", "raw_keys", "q_weight", "k_weight",
-            "position_offsets", "rope_freqs", "write_fence",
+            "position_offsets", "rope_freqs", "rope_table", "write_fence",
         ],
         outputNames: ["fence", "q_out", "k_out", "v_out"],
         source: """
@@ -6253,10 +6346,20 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 const float L = static_cast<float>(position_offsets[batch_index]);
                 for (int i = 0; i < reads; ++i) {
                     const int pair = lid * reads + i;
-                    const float inv_freq = 1.0f / rope_freqs[pair];
-                    const float theta = L * inv_freq;
-                    const float costheta = metal::fast::cos(theta);
-                    const float sintheta = metal::fast::sin(theta);
+                    float costheta;
+                    float sintheta;
+                    if (USE_SHARED_ROPE) {
+                        const size_t trig_index =
+                            (size_t(batch_index) * size_t(D / 2)
+                                + size_t(pair)) * 2;
+                        costheta = rope_table[trig_index];
+                        sintheta = rope_table[trig_index + 1];
+                    } else {
+                        const float inv_freq = 1.0f / rope_freqs[pair];
+                        const float theta = L * inv_freq;
+                        costheta = metal::fast::cos(theta);
+                        sintheta = metal::fast::sin(theta);
+                    }
                     const float x1 = static_cast<float>(rounded[pair]);
                     const float x2 = static_cast<float>(rounded[pair + D / 2]);
                     const float rx1 = x1 * costheta - x2 * sintheta;
@@ -6423,9 +6526,12 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     normRope.kWeight,
                     normRope.positionOffsets,
                     normRope.ropeFrequencies,
+                    normRope.sharedRopeTable ?? normRope.ropeFrequencies,
                     previousWriteFence,
                 ],
-                template: template,
+                template: template + [
+                    ("USE_SHARED_ROPE", normRope.sharedRopeTable != nil)
+                ],
                 grid: (128, 1, batch * kvHeads + batch * queryHeads),
                 threadGroup: (128, 1, 1),
                 outputShapes: [

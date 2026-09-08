@@ -2545,7 +2545,8 @@ private class Gemma4Attention: Module {
         v2SharedSource: (any CBv2AttendingLayerCache)? = nil,
         outputStart: Int = 0,
         useLastQueryPrefill: Bool = false,
-        carriedRunsum: MLXArray? = nil
+        carriedRunsum: MLXArray? = nil,
+        sharedRopeTable: MLXArray? = nil
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // ContinuousBatchingV2: the layer cache owns both the KV update and
         // the attention computation (no masks, no padding — see
@@ -2556,7 +2557,7 @@ private class Gemma4Attention: Module {
                 x, layerCache: layerCacheV2, source: v2SharedSource,
                 sharedKV: sharedKV, positionOffset: positionOffset,
                 outputStart: outputStart, useLastQueryPrefill: useLastQueryPrefill,
-                carriedRunsum: carriedRunsum)
+                carriedRunsum: carriedRunsum, sharedRopeTable: sharedRopeTable)
         }
         precondition(
             outputStart == 0 && !useLastQueryPrefill,
@@ -2696,7 +2697,8 @@ private class Gemma4Attention: Module {
         positionOffset: Gemma4.PositionOffset?,
         outputStart: Int = 0,
         useLastQueryPrefill: Bool = false,
-        carriedRunsum: MLXArray? = nil
+        carriedRunsum: MLXArray? = nil,
+        sharedRopeTable: MLXArray? = nil
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         let (B, L) = (x.dim(0), x.dim(1))
         precondition(
@@ -2888,6 +2890,7 @@ private class Gemma4Attention: Module {
                 positionOffsets: capturedOffsets,
                 ropeLog2Base: qkvRopeParameters.log2Base,
                 ropeInverseFrequencies: qkvRopeParameters.inverseFrequencies,
+                sharedRopeTable: sharedRopeTable,
                 eps: config.rmsNormEps, appliedRope: appliedRope)
         } else if vProj == nil, qkvRopeParameters.usesFrequencies {
             // NORMROPE-D512: the full layers' store dispatch takes the raw
@@ -2899,6 +2902,7 @@ private class Gemma4Attention: Module {
                 qWeight: qNorm.weight, kWeight: kNorm.weight,
                 positionOffsets: capturedOffsets,
                 ropeFrequencies: qkvRopeParameters.frequencies,
+                sharedRopeTable: sharedRopeTable,
                 eps: config.rmsNormEps, appliedRope: appliedRope)
         }
 
@@ -5652,28 +5656,6 @@ private class Gemma4MLP: Module {
     fileprivate func zipDown(_ activated: MLXArray) -> MLXArray {
         denseProjection(downProj, activated)
     }
-
-    /// Resolve immutable storage outside the trace; every tensor is explicit.
-    fileprivate func zipCompiledGateUpGeluDown(
-        _ x: MLXArray, expertScores: MLXArray
-    ) -> MLXArray? {
-        guard gemma4DenseGateUpJoinEnabled,
-            let storage = fusedGateUpStorage,
-            let gate = gateProj as? QuantizedLinear,
-            let up = upProj as? QuantizedLinear,
-            let down = downProj as? QuantizedLinear,
-            gate.bias == nil, up.bias == nil, down.bias == nil,
-            gate.groupSize == 64, up.groupSize == gate.groupSize,
-            down.groupSize == gate.groupSize,
-            gate.bits == 8, up.bits == gate.bits, down.bits == gate.bits,
-            gate.mode == .affine, up.mode == gate.mode, down.mode == gate.mode,
-            let downBiases = down.biases
-        else { return nil }
-        return CBv2DenseMLPQMVV1.compiledGateUpGeluDown(
-            [x, storage.weight, storage.scales, storage.biases,
-             down.weight, down.scales, downBiases, expertScores],
-            groupSize: gate.groupSize, bits: gate.bits, mode: gate.mode)
-    }
 }
 
 /// ZIP-ROUTER-001 -- interleave the MoE layer's router chain with the
@@ -5753,25 +5735,6 @@ private enum Gemma4ZipRouterV1 {
         let routeTable: SwitchRouteTable?
     }
 
-    /// Preserve the default route-selection tail after the compiled dense pair.
-    private static func selectAfterDense(
-        router: Gemma4Router, expertScores: MLXArray, denseOut: MLXArray
-    ) -> (indices: MLXArray, weights: MLXArray, table: SwitchRouteTable?) {
-        if let fold = Gemma4RouteGlueFoldV1.apply(
-            MLX.depends(input: expertScores, dependencies: [denseOut]),
-            perExpertScale: router.perExpertScale,
-            topK: router.topK, kth: router.kth)
-        {
-            return (fold.indices, fold.weights, fold.table)
-        }
-        let partition = router.zipPartition(
-            MLX.depends(input: expertScores, dependencies: [denseOut]))
-        let indices = router.zipSelected(partition)
-        let weights = router.zipWeights(
-            expertScores: expertScores, topKIndices: indices)
-        return (indices, weights, nil)
-    }
-
     /// PREFIX-001 admission lives beside the ZIP admission so the eager
     /// custom producer is never built unless this exact consumer will use all
     /// of its outputs.
@@ -5839,29 +5802,6 @@ private enum Gemma4ZipRouterV1 {
         // dual pre-norm arrays unreferenced, so MLX never evaluates them and
         // the caller's stock path rebuilds the identical pair.
         let normed = carriedRouterNorm ?? router.zipNorm(out)
-
-        // Default ZIP only. The trace keeps the score dependency BETWEEN the
-        // same two dense kernels; incoming and outgoing fences stay outside it.
-        if plan == 1, gemma4DenseGateUpJoinEnabled,
-            Gemma4FusedLayerGlue.denseXSumElideEnabled,
-            CBv2DenseMLPQMVV1.compiledPairAvailable
-        {
-            let expertScores = router.zipScores(normed)
-            let denseIn = MLX.depends(input: n1, dependencies: [normed])
-            if let denseOut = mlp.zipCompiledGateUpGeluDown(
-                denseIn, expertScores: expertScores)
-            {
-                let selected = selectAfterDense(
-                    router: router, expertScores: expertScores, denseOut: denseOut)
-                Gemma4RouterProbe.recorder?(expertScores, selected.indices)
-                let expertNorm = MLX.depends(input: n2, dependencies: [denseOut])
-                CBv2EngageMark.once("zip-router")
-                return Zipped(
-                    denseOut: denseOut, expertNorm: expertNorm,
-                    topKIndices: selected.indices, topKWeights: selected.weights,
-                    routeTable: selected.table)
-            }
-        }
 
         // Stage 2: router QMV | dense gate + up.
         //
@@ -6084,7 +6024,8 @@ public class Gemma4DecoderLayer: Module {
         isExpertPrefill: Bool = false,
         glueChain: Gemma4GlueChainBox? = nil,
         nextInputLayernormWeight: MLXArray? = nil,
-        enableAttentionBranchPrefix: Bool = false
+        enableAttentionBranchPrefix: Bool = false,
+        sharedRopeTable: MLXArray? = nil
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // Prompt-path narrowing (CBv2 only): attention and every K/V write
         // still cover the full chunk; only the token-local work AFTER
@@ -6138,7 +6079,8 @@ public class Gemma4DecoderLayer: Module {
         let (attnOut, kvPair, attnPositionOffset) = selfAttn(
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
-            useLastQueryPrefill: useLastQueryPrefill, carriedRunsum: carriedRunsum)
+            useLastQueryPrefill: useLastQueryPrefill, carriedRunsum: carriedRunsum,
+            sharedRopeTable: sharedRopeTable)
         // PREFIX-001: only build the joined producer when the ZIP consumer is
         // guaranteed to accept it. A nil leaves the established attention
         // residual and branch pre-norm paths untouched.
@@ -7382,6 +7324,60 @@ public class Gemma4TextModelInner: Module {
             return nil
         }()
 
+        let sharedDecodeRopeTables: [String: MLXArray] = {
+            guard inputBatchSize == 8, inputLength == 1,
+                case .batch(let positionOffsets)? = unifiedCBv2PositionOffset,
+                config.numKvSharedLayers == 0,
+                config.headDim == 256,
+                config.globalHeadDim == 512,
+                config.slidingRopeTheta == 10_000,
+                config.fullRopeTheta == 1_000_000,
+                config.fullPartialRotaryFactor == 0.25,
+                let sliding = layers.first(where: {
+                    $0.layerType == "sliding_attention"
+                })?.selfAttn,
+                let full = layers.first(where: {
+                    $0.layerType == "full_attention"
+                })?.selfAttn,
+                let slidingInverse = sliding.qkvRopeParameters.inverseFrequencies,
+                !sliding.qkvRopeParameters.usesFrequencies,
+                sliding.effectiveHeadDim == 256,
+                full.qkvRopeParameters.usesFrequencies,
+                full.effectiveHeadDim == 512,
+                layers.allSatisfy({
+                    let attention = $0.selfAttn
+                    if $0.layerType == "sliding_attention" {
+                        return attention.effectiveHeadDim == 256
+                            && !attention.qkvRopeParameters.usesFrequencies
+                            && attention.qkvRopeParameters.inverseFrequencies?.shape == [128]
+                    }
+                    if $0.layerType == "full_attention" {
+                        return attention.effectiveHeadDim == 512
+                            && attention.qkvRopeParameters.usesFrequencies
+                            && attention.qkvRopeParameters.frequencies.shape == [256]
+                    }
+                    return false
+                }),
+                let slidingTable =
+                    CBv2RaggedTwoPassDecodeAttentionV1.makeSharedRopeTable(
+                        positionOffsets: positionOffsets,
+                        ropeParameters: slidingInverse,
+                        dimensions: 256,
+                        reciprocalFrequencies: false),
+                let fullTable =
+                    CBv2RaggedTwoPassDecodeAttentionV1.makeSharedRopeTable(
+                        positionOffsets: positionOffsets,
+                        ropeParameters: full.qkvRopeParameters.frequencies,
+                        dimensions: 512,
+                        reciprocalFrequencies: true)
+            else { return [:] }
+            CBv2EngageMark.once("gemma4-shared-decode-rope-tables")
+            return [
+                "sliding_attention": slidingTable,
+                "full_attention": fullTable,
+            ]
+        }()
+
         // Build masks: one per attention type (legacy path only). "vision"
         // overlays bidirectional access within visual spans. "all" preserves
         // Gemma4's fully bidirectional prefill by symmetrizing both global and
@@ -7499,7 +7495,8 @@ public class Gemma4TextModelInner: Module {
                 enableAttentionBranchPrefix:
                     isCBv2 && !schedulePrefill
                     && inputBatchSize == 8 && inputLength == 1
-                    && !capturePreNorm && dFlashHiddenCapture == nil
+                    && !capturePreNorm && dFlashHiddenCapture == nil,
+                sharedRopeTable: sharedDecodeRopeTables[layer.layerType]
             )
             h = out
             reusableIntermediates[idx] = (kvPair, positionOffset)

@@ -15,6 +15,10 @@ constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
 constant bool align_K [[function_constant(202)]];
 
+#ifndef DARKBLOOM_GEMMA4_PREFILL_CAUSAL_KSKIP
+#define DARKBLOOM_GEMMA4_PREFILL_CAUSAL_KSKIP 1
+#endif
+
 // clang-format off
 template <
     typename T,
@@ -234,8 +238,30 @@ template <
   // Prepare iterations
   int gemm_k_iterations = params->gemm_k_iterations_aligned;
 
+  // PREFILL-CAUSAL-KSKIP: number of leading K columns that can hold a live
+  // score for ANY row of this threadgroup. The composed prompt attention is
+  // the only producer of the at1 signature and it always hands over a
+  // bottom-right aligned causal rectangle: row m carries query index
+  // K - M + m and admits key columns 0 .. K - M + m; every column above that
+  // holds the bfloat16 lowest finite word 0xFF7F. Its transformed A element is
+  // fast::exp(-3.3895e38 - maxval) * normalizer, which underflows to +0.0f,
+  // and the accumulator is cleared to +0.0 and only ever gains fma terms, so
+  // it is never negative zero and x + (+-0.0) == x for every reachable x.
+  // Dropping those whole K blocks is bit-exact, not a tolerance, and it drops
+  // the matching B rows with them.
+  // Kill switch: -DDARKBLOOM_GEMMA4_PREFILL_CAUSAL_KSKIP=0.
+  int sm_k_active = params->K;
+#if DARKBLOOM_GEMMA4_PREFILL_CAUSAL_KSKIP
+  if constexpr (kSoftmaxLoaderEligible) {
+    if (softmax_loader && params->K >= params->M) {
+      const int lim = params->K - params->M + c_row + int(tgp_bm);
+      sm_k_active = lim < params->K ? (lim > 0 ? lim : 0) : params->K;
+    }
+  }
+#endif
+
   // Do unaligned K iterations first
-  if (!align_K) {
+  if (!align_K && sm_k_active > params->gemm_k_iterations_aligned * BK) {
     const int k_last = params->gemm_k_iterations_aligned * BK;
     const int k_remain = params->K - k_last;
     const size_t k_jump_a =
@@ -282,6 +308,13 @@ template <
   ///////////////////////////////////////////////////////////////////////////////
   // MNK aligned loop
   if (align_M && align_N) {
+    // PREFILL-CAUSAL-KSKIP: bound the whole-block loop by the causal limit.
+    // Outside the at1 signature sm_k_active is K, so this bound is
+    // ceil(K / BK) >= gemm_k_iterations_aligned and nothing changes.
+    const int sm_k_iters = (sm_k_active + BK - 1) / BK;
+    if (sm_k_iters < gemm_k_iterations) {
+      gemm_k_iterations = sm_k_iters;
+    }
     // Do gemm
     for (int k = 0; k < gemm_k_iterations; k++) {
       threadgroup_barrier(mem_flags::mem_threadgroup);

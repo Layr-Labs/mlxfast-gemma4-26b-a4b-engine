@@ -242,16 +242,16 @@ enum CBv2ComposedPrefillSDPAV1 {
         return queries.reshaped([B, nKVHeads, nRepeats, queries.dim(2), queryDim])
     }
 
-    /// The unchanged BF16 QK and causal-mask stage of the composed fallback.
+    /// The fast.cpp SDPA fallback, minus the identity query scale.
     /// Returns nil when this call is not provably that graph.
     /// `queryPlaneSlice` is this block's view of `queryPlane(...)` when the
     /// caller could hoist it; nil means reshape here instead.
-    static func prepareScores(
+    static func attend(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, L: Int, kL: Int, window: Int?,
         bidirectional: Bool, sinks: MLXArray?,
         queryPlaneSlice: MLXArray? = nil
-    ) -> (scores: MLXArray, values: MLXArray)? {
+    ) -> MLXArray? {
         guard enabled, scale == 1.0, sinks == nil, !bidirectional else { return nil }
         // Decode (L == 1) and every MTP verify width (L in 2...8) keep the
         // stock path: this rider is the prompt plane only.
@@ -323,29 +323,14 @@ enum CBv2ComposedPrefillSDPAV1 {
             scores = MLX.where(causalMask(L: L, kL: kL), scores, bfloat16LowestScalar)
         }
 
-        return (scores, v)
-    }
-
-    static func attend(
-        queries: MLXArray, keys: MLXArray, values: MLXArray,
-        scale: Float, L: Int, kL: Int, window: Int?,
-        bidirectional: Bool, sinks: MLXArray?,
-        queryPlaneSlice: MLXArray? = nil
-    ) -> MLXArray? {
-        guard let stage = prepareScores(
-            queries: queries, keys: keys, values: values,
-            scale: scale, L: L, kL: kL, window: window,
-            bidirectional: bidirectional, sinks: sinks,
-            queryPlaneSlice: queryPlaneSlice)
-        else { return nil }
-        var scores = stage.scores
-        let v = stage.values
-        let B = queries.dim(0)
-        let nQHeads = queries.dim(1)
-        let nRepeats = nQHeads / keys.dim(1)
-        let valueDim = values.dim(3)
         var output: MLXArray
-        if let fused = CBv2PrefillAttnTrafficV1.attend(scores: scores, values: v) {
+        // PREFILL-CAUSAL-KSKIP: both branches above leave exactly one shape --
+        // row m of the block admits columns 0 ..< kL - L + m + 1 and carries
+        // the bfloat16 lowest finite word everywhere above that -- so the row
+        // walk in the statistics pre-pass can stop at the diagonal.
+        if let fused = CBv2PrefillAttnTrafficV1.attend(
+            scores: scores, values: v, causalQueryBlock: L)
+        {
             // PREFILL-ATTN-TRAFFIC (at1): the softmax is applied by the P.V
             // GEMM's own A loader from a per-row statistics pre-pass; the
             // probability rectangle is never written or read.
@@ -868,7 +853,41 @@ enum CBv2PrefillAttnTrafficV1 {
                 Data("[prefill-attn-traffic] pg2 softmax text drifted; twin disabled\n".utf8))
             return nil
         }
-        return text.replacingOccurrences(of: store, with: statsStore)
+        // PREFILL-CAUSAL-KSKIP: bound the row walk by the causal diagonal.
+        let load = [
+            "const bool row_valid = base < axis_size;",
+            "const device T* row_in = scores + size_t(gid) * axis_size;",
+            "if (row_valid) {",
+        ].joined(separator: "\n")
+        let causalLoad = [
+            "const bool row_valid = base < axis_size;",
+            "(void)row_valid;",
+            "// PREFILL-CAUSAL-KSKIP: QB is the query-block length the caller",
+            "// asserts this rectangle is bottom-right causal over, or 0. Row m",
+            "// of the block carries query index axis_size - QB + m, so columns",
+            "// above it hold the bfloat16 lowest finite word and nothing else.",
+            "// Substituting the max identity for those lanes in a REGISTER,",
+            "// instead of loading the word, is bit-identical downstream:",
+            "// fast::exp(-3.3895e38 - maxval) and fast::exp(-INFINITY - maxval)",
+            "// are both exactly +0.0f, so the sum tree sees the same operands,",
+            "// and -INFINITY cannot displace a max that a live lane already",
+            "// holds (every row has at least its own diagonal column live).",
+            "const int causal_cols = (QB > 0 && axis_size >= QB)",
+            "    ? (axis_size - QB + (gid % QB) + 1)",
+            "    : axis_size;",
+            "const bool load_valid = base < causal_cols;",
+            "const device T* row_in = scores + size_t(gid) * axis_size;",
+            "if (load_valid) {",
+        ].joined(separator: "\n")
+        guard text.components(separatedBy: load).count == 2 else {
+            FileHandle.standardError.write(
+                Data("[prefill-attn-traffic] pg2 load text drifted; twin disabled\n".utf8))
+            return nil
+        }
+        return
+            text
+            .replacingOccurrences(of: store, with: statsStore)
+            .replacingOccurrences(of: load, with: causalLoad)
     }()
 
     private static let statsKernel: MLXFast.MLXFastKernel? = statsSource.map { source in
@@ -881,11 +900,20 @@ enum CBv2PrefillAttnTrafficV1 {
         )
     }
 
-    /// The incumbent per-row softmax statistics and launch geometry.
+    /// `matmul(softmax(scores, axis: -1, precise: true), values)` with the
+    /// probabilities never materialized, or nil to keep the incumbent pair.
     /// `scores` is the row-contiguous `[.., L, kL]` score rectangle of one
     /// query block, `values` the `[.., kL, D]` operand the incumbent
     /// `matmul` takes.
-    static func statistics(scores: MLXArray, values: MLXArray) -> MLXArray? {
+    /// `causalQueryBlock` is the caller's assertion that `scores` is a
+    /// bottom-right aligned causal rectangle over its trailing two axes: row
+    /// `m` of every `[L, kL]` slice admits key columns `0 ..< kL - L + m + 1`
+    /// and holds the bfloat16 lowest finite word everywhere above that. Pass
+    /// nil (the default) for a rectangle with no such structure and the row
+    /// walk stays full width.
+    static func attend(
+        scores: MLXArray, values: MLXArray, causalQueryBlock: Int? = nil
+    ) -> MLXArray? {
         guard enabled, CBv2PrefillSoftmaxVecV1.enabled, let statsKernel else { return nil }
         guard scores.dtype == .bfloat16, values.dtype == .bfloat16 else { return nil }
         guard scores.ndim >= 2, values.ndim == scores.ndim else { return nil }
@@ -912,23 +940,25 @@ enum CBv2PrefillAttnTrafficV1 {
         var statsShape = scores.shape
         statsShape[statsShape.count - 1] = 4
 
+        // PREFILL-CAUSAL-KSKIP: only honour the assertion when it names this
+        // rectangle's own query axis; anything else and the row walk stays
+        // full width. `nRows % L == 0` holds because L is a dimension of the
+        // same array the rows were counted from, so `gid % QB` is the row's
+        // index within its query block.
+        var causalQB = 0
+        if let qb = causalQueryBlock, qb == L, axisSize >= L {
+            causalQB = qb
+        }
+
         CBv2EngageMark.once("prefill-attn-traffic")
         let stats = statsKernel(
             [scores, paramsArray],
-            template: [("T", scores.dtype), ("RPT", rows)],
+            template: [("T", scores.dtype), ("RPT", rows), ("QB", causalQB)],
             grid: (threadgroupSize * nRows, 1, 1),
             threadGroup: (threadgroupSize * rows, 1, 1),
             outputShapes: [statsShape],
             outputDTypes: [.bfloat16]
         )[0]
-        return stats
-    }
-
-    static func attend(scores: MLXArray, values: MLXArray) -> MLXArray? {
-        guard let stats = statistics(scores: scores, values: values) else { return nil }
-        let axisSize = scores.dim(-1)
-        let D = values.dim(-1)
-        let nRows = scores.size / axisSize
         // The column view of the carrier: row stride 4, column stride 0 once
         // addmm broadcasts it over the D output columns -- the signature.
         let carrier = stats[.ellipsis, 0 ..< 1]

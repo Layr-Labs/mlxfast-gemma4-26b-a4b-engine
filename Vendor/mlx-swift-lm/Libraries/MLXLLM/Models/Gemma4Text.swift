@@ -3689,6 +3689,15 @@ private enum Gemma4RouteGlueFoldV1 {
                     run_length += other_high == key;
           """
         : ""
+    private static let routePrefixReduceSource =
+        switchRouteGluePrefixBoundsEnabled
+        ? """
+                run_offset += simd_shuffle_xor(run_offset, 1);
+                run_offset += simd_shuffle_xor(run_offset, 2);
+                run_length += simd_shuffle_xor(run_length, 1);
+                run_length += simd_shuffle_xor(run_length, 2);
+          """
+        : ""
     private static let routeSortedKeySource =
         switchRouteGluePrefixBoundsEnabled
         ? """
@@ -3704,10 +3713,10 @@ private enum Gemma4RouteGlueFoldV1 {
     /// pipeline-cache entries from ever aliasing.
     private static let kernelName = switchRouteGluePrefixBoundsEnabled
         ? (orderKeysEnabled
-            ? "gemma4_route_monolithic_top8_e128_k8_bf16_max8_sg1_prefix_v1"
+            ? "gemma4_route_monolithic_top8_e128_k8_bf16_max8_sg1_prefix_w4_v1"
             : "gemma4_route_monolithic_top8_e128_k8_bf16_prefix_v1")
         : (orderKeysEnabled
-            ? "gemma4_route_monolithic_top8_e128_k8_bf16_max8_sg1_v1"
+            ? "gemma4_route_monolithic_top8_e128_k8_bf16_max8_sg1_w4_v1"
             : "gemma4_route_monolithic_top8_e128_k8_bf16_v2")
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
@@ -3761,32 +3770,37 @@ private enum Gemma4RouteGlueFoldV1 {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // Phase 2 -- the incumbent simd-rank scatter, verbatim, over the
-            // staged 64 keys. Threads 0..63 are exactly the two complete
-            // SIMD groups the standalone kernel launched; `assignment` and
-            // `lane` reproduce its coordinates.
-            if (tid < 64u) {
-                const uint assignment = tid;
+            // Phase 2 -- the same global rank of all 64 assignments, with the
+            // source range split four ways across all 256 threads instead of
+            // being walked whole by 64. `rank`, `run_offset` and `run_length`
+            // are integer COUNTS over the 64 staged keys, so any partition of
+            // the sources and any order of summation gives the identical
+            // value; the four partials for one assignment occupy four
+            // consecutive lanes of one simdgroup and combine with two
+            // shuffles, so no barrier and no threadgroup traffic is added.
+            // Every thread enters the block, so the shuffles stay converged.
+            {
+                const uint assignment = tid >> 2;
+                const uint part = tid & 3u;
                 const uint key = sel[assignment];
-                const uint key_low = sel[lane];
-                const uint key_high = sel[32u + lane];
                 uint rank = 0;
         \(routePrefixStateSource)
                 #pragma clang loop unroll(full)
-                for (uint source = 0; source < 32; ++source) {
-                    const uint other_low = simd_broadcast(key_low, ushort(source));
+                for (uint j = 0; j < 16; ++j) {
+                    const uint source = part * 16u + j;
+                    const uint other_low = sel[source];
                     rank += (other_low < key)
                         || (other_low == key && source < assignment);
         \(routePrefixLowSource)
-                    const uint other_high = simd_broadcast(key_high, ushort(source));
-                    const uint high_assignment = 32u + source;
-                    rank += (other_high < key)
-                        || (other_high == key && high_assignment < assignment);
-        \(routePrefixHighSource)
                 }
-                row_order[rank] = assignment / 8;
+                rank += simd_shuffle_xor(rank, 1);
+                rank += simd_shuffle_xor(rank, 2);
+        \(routePrefixReduceSource)
+                if (part == 0u) {
+                    row_order[rank] = assignment / 8;
         \(routeSortedKeySource)
-                inverse_order[assignment] = rank;
+                    inverse_order[assignment] = rank;
+                }
             }
         """ : """
             const uint tid = thread_position_in_threadgroup.x;
@@ -7018,6 +7032,12 @@ public class Gemma4TextModelInner: Module {
     let previousKvs: [Int]
     let firstKvSharedLayerIdx: Int
 
+    /// KVMIRROR-001. True when some layer borrows an earlier layer's K/V, so
+    /// the per-layer pairs this trunk returns have a reader inside the trunk
+    /// itself. Derived from the map above, not from the config field, so a
+    /// map that is identity for any other reason lowers it too.
+    let kvPairsBorrowedDownstream: Bool
+
     /// Index of the last non-shared full-attention layer (-1 if none).
     /// Used by the shared-KV capture hook for the MTP drafter.
     let lastFullAttentionNonSharedIdx: Int
@@ -7075,6 +7095,9 @@ public class Gemma4TextModelInner: Module {
             }
         }
         self.previousKvs = kvMap
+        self.kvPairsBorrowedDownstream = kvMap.enumerated().contains {
+            $0.offset != $0.element
+        }
 
         // Capture indices for MTP drafter: the last layer of each type that
         // still has its own K/V (not shared from an earlier layer).
@@ -7216,6 +7239,20 @@ public class Gemma4TextModelInner: Module {
         mmaHeadSums: Gemma4MMAQuantizedGEMV.ActivationSums?,
         mmaHeadXT: Gemma4MMAQuantizedGEMV.TransposedActivation?
     ) {
+        // KVMIRROR-001. The per-layer K/V pairs this trunk returns are read
+        // in exactly two situations: a later layer borrows an earlier layer's
+        // K/V, or an observer over the pairs was handed in. Tell the decode
+        // attention planes which of those applies to THIS forward, and put
+        // the previous answer back on the way out so no other entry point
+        // inherits it.
+        let outerKVPairMirror =
+            CBv2RaggedTwoPassDecodeAttentionV1.kvPairMirrorRequired
+        CBv2RaggedTwoPassDecodeAttentionV1.kvPairMirrorRequired =
+            kvPairsBorrowedDownstream || captureHook != nil
+        defer {
+            CBv2RaggedTwoPassDecodeAttentionV1.kvPairMirrorRequired =
+                outerKVPairMirror
+        }
         // Shape queries cross the Swift/C boundary. Cache the two immutable
         // input dimensions once rather than paying for them at every ladder
         // policy check while the host is building the decode graph.
@@ -7438,7 +7475,11 @@ public class Gemma4TextModelInner: Module {
                     && !capturePreNorm && dFlashHiddenCapture == nil
             )
             h = out
-            reusableIntermediates[idx] = (kvPair, positionOffset)
+            // KVMIRROR-001: with an identity borrow map this slot is cleared
+            // before any layer reads it, so retaining the pair here only kept
+            // its producer graph alive for the rest of the step.
+            reusableIntermediates[idx] = (
+                kvPairsBorrowedDownstream ? kvPair : nil, positionOffset)
             captureHook?(idx, kvPair)
             dFlashHiddenCapture?.capture(h, layer: idx)
 

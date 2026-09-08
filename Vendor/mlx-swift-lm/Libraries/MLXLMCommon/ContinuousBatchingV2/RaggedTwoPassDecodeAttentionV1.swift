@@ -83,6 +83,36 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// KVMIRROR-001. The sliding resident attention body and the D=512 store
+    /// body each carry two extra outputs holding this layer's normalized K
+    /// and V rows. Their only destination is the attention API's returned K/V
+    /// pair, which has a reader in exactly two situations: a later layer
+    /// borrows an earlier layer's K/V, or the trunk was handed an observer
+    /// over the per-layer pairs. The trunk lowers this flag for a forward in
+    /// which neither holds, and raises it otherwise.
+    ///
+    /// TRUE by default, so every entry point that does not set it keeps the
+    /// established body. Lowered, the two mirror outputs and the stores that
+    /// fill them leave the body, and the returned pair falls back to the
+    /// host-side arrays the F4-off consumer branch already uses.
+    nonisolated(unsafe) public static var kvPairMirrorRequired: Bool = true
+
+    /// Kill switch for the elision only: set to `0`/`false`/`no`/`off` to pin
+    /// the mirror outputs on regardless of what the trunk asked for. Default
+    /// ON, so no environment help is needed to reach the shorter body.
+    static let kvPairMirrorElideEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_KV_PAIR_MIRROR_ELIDE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// The single predicate both decode planes read.
+    @inline(__always)
+    public static var kvPairMirrorElided: Bool {
+        kvPairMirrorElideEnabled && !kvPairMirrorRequired
+    }
+
     private static let ropeInverseFrequencyKernel = MLXFast.metalKernel(
         name: "cbv2_sliding_rope_inverse_frequencies_v1",
         inputNames: ["rope_log2_base"],
@@ -3663,6 +3693,70 @@ for (int element = 0; element < values_per_lane; ++element) {
             """
     }
 
+    /// KVMIRROR-001. The direct-handoff prologue's two mirror stores are the
+    /// only device writes in that body which no consumer of the returned
+    /// arrays reads once the trunk has lowered `kvPairMirrorRequired`. This
+    /// twin takes the promoted composition above exactly as it is and removes
+    /// them by line-exact surgery, so the promoted text is neither edited nor
+    /// copied, and a body that drifts fails closed at initialisation.
+    private static func residentNormRopeSourceNoKVMirror(
+        withORunsum: Bool, directRope: Bool
+    ) -> String {
+        precondition(directRope, "KVMIRROR-001 covers the direct-handoff body")
+        return dropKVPairMirrorStores(
+            residentNormRopeSource(
+                withORunsum: withORunsum, directRope: directRope))
+    }
+
+    /// The promoted direct-handoff mirror block, one trimmed line per entry.
+    private static let residentKVPairMirrorBlock = [
+        "if (block == GQA) {",
+        "device T4* key_output_vectors =",
+        "reinterpret_cast<device T4*>(",
+        "k_out + (batch_index * KV_HEADS + kv_head) * D);",
+        "key_output_vectors[lane] = rounded_first;",
+        "key_output_vectors[lane + simd_width] = rounded_second;",
+        "} else if (block == GQA + 1) {",
+        "device T4* value_output_vectors =",
+        "reinterpret_cast<device T4*>(",
+        "v_out + (batch_index * KV_HEADS + kv_head) * D);",
+        "value_output_vectors[lane] = rounded_first;",
+        "value_output_vectors[lane + simd_width] = rounded_second;",
+        "}",
+    ]
+
+    /// Remove exactly the promoted mirror block, asserting that it matched
+    /// once and that neither mirror name survives anywhere in the result.
+    private static func dropKVPairMirrorStores(_ body: String) -> String {
+        var lines = body.components(separatedBy: "\n")
+        let block = residentKVPairMirrorBlock
+        var index = 0
+        var applied = 0
+        while index < lines.count {
+            guard lines[index].trimmingCharacters(in: .whitespaces) == block[0],
+                index + block.count <= lines.count
+            else {
+                index += 1
+                continue
+            }
+            let window = (0..<block.count).map {
+                lines[index + $0].trimmingCharacters(in: .whitespaces)
+            }
+            guard window == block else {
+                index += 1
+                continue
+            }
+            lines.removeSubrange(index..<(index + block.count))
+            applied += 1
+        }
+        precondition(applied == 1, "KVMIRROR-001 sliding block matched \(applied) times")
+        let result = lines.joined(separator: "\n")
+        precondition(
+            !result.contains("k_out") && !result.contains("v_out"),
+            "KVMIRROR-001 left a sliding mirror reference behind")
+        return result
+    }
+
     private static let portQuantFusedWriteResidentNormRopeKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
             name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)\(slidingSoftRefKey)_ropefreq_v1",
@@ -3721,6 +3815,25 @@ for (int element = 0; element < values_per_lane; ++element) {
             ],
             outputNames: ["out", "fence", "k_out", "v_out", "o_rs"],
             source: residentNormRopeSource(withORunsum: true, directRope: true),
+            ensureRowContiguous: true
+        )
+
+    /// KVMIRROR-001 twin of the incumbent above with the layer K/V mirror
+    /// dropped: same inputs, same launch, same attention and run-sum results,
+    /// two fewer outputs and two fewer device stores. Its own name keeps the
+    /// pipeline cache from serving either body for the other.
+    private static let portQuantFusedWriteResidentNormRopeDirectORunsumNoMirrorKernel:
+        MLXFast.MLXFastKernel = MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_directrope_ors_nokvmirror_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)\(slidingSoftRefKey)_ropefreq_v1",
+            inputNames: [
+                "raw_queries",
+                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+                "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
+                "position_offsets", "rope_parameters", "write_fence",
+            ],
+            outputNames: ["out", "fence", "o_rs"],
+            source: residentNormRopeSourceNoKVMirror(
+                withORunsum: true, directRope: true),
             ensureRowContiguous: true
         )
 
@@ -3902,7 +4015,32 @@ for (int element = 0; element < values_per_lane; ++element) {
                 ]
                 let resident: [MLXArray]
                 let oRunsum: MLXArray?
-                if oRunsumFoldEnabled {
+                var mirroredKeys: MLXArray? = nil
+                var mirroredValues: MLXArray? = nil
+                // KVMIRROR-001: the trunk has told us nothing reads the pair
+                // this body would mirror, so take the twin without it.
+                let elideKVPairMirror =
+                    oRunsumFoldEnabled && q4ResidentDirectRopeEnabled
+                    && kvPairMirrorElided
+                if elideKVPairMirror {
+                    resident =
+                        portQuantFusedWriteResidentNormRopeDirectORunsumNoMirrorKernel(
+                            residentInputs,
+                            template: residentTemplate,
+                            grid: (kvHeads * blocks * 32, batch, 1),
+                            threadGroup: (blocks * 32, 1, 1),
+                            outputShapes: [
+                                residentShapes[0], residentShapes[1],
+                                [batch, queryHeads * headDim / 64],
+                            ],
+                            outputDTypes: [
+                                residentDTypes[0], residentDTypes[1], .float32,
+                            ]
+                        )
+                    oRunsum = resident[2]
+                    CBv2EngageMark.once("o-runsum-resident-fold")
+                    CBv2EngageMark.once("kvq4-resident-kv-pair-mirror-elided")
+                } else if oRunsumFoldEnabled {
                     let kernel = q4ResidentDirectRopeEnabled
                         ? portQuantFusedWriteResidentNormRopeDirectORunsumKernel
                         : portQuantFusedWriteResidentNormRopeORunsumKernel
@@ -3916,6 +4054,8 @@ for (int element = 0; element < values_per_lane; ++element) {
                         outputDTypes: residentDTypes + [.float32]
                     )
                     oRunsum = resident[4]
+                    mirroredKeys = resident[2]
+                    mirroredValues = resident[3]
                     CBv2EngageMark.once("o-runsum-resident-fold")
                 } else {
                     let kernel = q4ResidentDirectRopeEnabled
@@ -3930,12 +4070,14 @@ for (int element = 0; element < values_per_lane; ++element) {
                         outputDTypes: residentDTypes
                     )
                     oRunsum = nil
+                    mirroredKeys = resident[2]
+                    mirroredValues = resident[3]
                 }
                 publishResidentProducts(
                     ResidentProducts(
                         runsumTable: oRunsum,
-                        normalizedKeys: resident[2],
-                        normalizedValues: resident[3]),
+                        normalizedKeys: mirroredKeys,
+                        normalizedValues: mirroredValues),
                     for: resident[0])
                 CBv2EngageMark.once("kvq4-fused-live-write")
                 CBv2EngageMark.once("kvq4-resident-merge")
@@ -6139,16 +6281,10 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// of `L * inv_freq`, and the same two rotation expressions. The ring
     /// slot receives the K row the standalone kernel would have handed the
     /// incumbent store, so dispatches 1...3 read identical bytes.
-    private static let ringStoreNormRopeKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1",
-        inputNames: [
-            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
-            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-            "params", "raw_queries", "raw_keys", "q_weight", "k_weight",
-            "position_offsets", "rope_freqs", "write_fence",
-        ],
-        outputNames: ["fence", "q_out", "k_out", "v_out"],
-        source: """
+    /// The promoted store body, held as its own text so the KVMIRROR-001
+    /// twin below can be derived from it by line-exact surgery instead of a
+    /// second copy that could drift away from it.
+    private static let ringStoreNormRopeSourceText = """
             constexpr int D = 512;
             constexpr int KV_ROWS = 16;
             constexpr int Q_HEADS = 16;
@@ -6272,7 +6408,118 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             if (z == 0 && lid == 0) {
                 fence[0] = write_fence[0] + 1;
             }
-        """,
+        """
+
+    /// Line-exact surgery over the promoted store text. Every window is
+    /// matched with leading whitespace stripped, because a multi-line literal
+    /// removes the closing delimiter's indentation from every line it holds:
+    /// the text this runs over is NOT indented the way the file shows it, and
+    /// an anchor carrying the file's indentation would match nothing and
+    /// report a confident zero. The indent of the matched line is put back on
+    /// the replacement, so a block substituted here keeps the column it was
+    /// written at.
+    private static func ringStoreLineSurgery(
+        _ text: String, _ block: [String], _ replacement: [String]
+    ) -> (String, Int) {
+        var lines = text.components(separatedBy: "\n")
+        var index = 0
+        var applied = 0
+        while index < lines.count {
+            guard lines[index].trimmingCharacters(in: .whitespaces) == block[0],
+                index + block.count <= lines.count
+            else {
+                index += 1
+                continue
+            }
+            let window = (0..<block.count).map {
+                lines[index + $0].trimmingCharacters(in: .whitespaces)
+            }
+            guard window == block else {
+                index += 1
+                continue
+            }
+            let indent = String(lines[index].prefix(while: { $0 == " " }))
+            let body = replacement.map { indent + $0 }
+            lines.replaceSubrange(index..<(index + block.count), with: body)
+            index += body.count
+            applied += 1
+        }
+        return (lines.joined(separator: "\n"), applied)
+    }
+
+    /// KVMIRROR-001. Drop the layer K/V mirror from the promoted store body:
+    /// the two mirror row pointers, the mirrored V write, the mirrored K
+    /// write, and the two mirror-rooted slot initialisers (both are
+    /// overwritten before use on the rows that dereference them, so they are
+    /// re-rooted on the query output instead). Every removal asserts its own
+    /// match count and the result asserts neither mirror name survives.
+    private static let ringStoreNoKVMirrorSourceText: String = {
+        var text = ringStoreNormRopeSourceText
+        func apply(_ block: [String], _ replacement: [String]) {
+            let (next, applied) = ringStoreLineSurgery(text, block, replacement)
+            precondition(
+                applied == 1,
+                "KVMIRROR-001 store anchor matched \(applied) times")
+            text = next
+        }
+        apply(
+            ["device T* key_slot = k_out;"],
+            ["device T* key_slot = q_out;"])
+        apply(
+            ["device T* value_slot = v_out;"],
+            ["device T* value_slot = q_out;"])
+        apply(
+            [
+                "// Query rows never dereference the mirrors; keep their pointers",
+                "// inside the K/V allocations anyway.",
+                "device T* key_mirror = k_out + (is_key ? local_row : 0) * D;",
+                "device T* value_mirror = v_out + (is_key ? local_row : 0) * D;",
+            ],
+            [])
+        apply(
+            ["*reinterpret_cast<device T4*>(value_mirror + lid * reads) = sharedv;"],
+            [])
+        apply(
+            [
+                "if (is_key) {",
+                "key_mirror[pair] = static_cast<T>(rx1);",
+                "key_mirror[pair + D / 2] = static_cast<T>(rx2);",
+                "}",
+            ],
+            [])
+        precondition(
+            !text.contains("k_out") && !text.contains("v_out")
+                && !text.contains("key_mirror") && !text.contains("value_mirror"),
+            "KVMIRROR-001 left a store mirror reference behind")
+        return text
+    }()
+
+    private static let ringStoreNormRopeKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1",
+        inputNames: [
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "params", "raw_queries", "raw_keys", "q_weight", "k_weight",
+            "position_offsets", "rope_freqs", "write_fence",
+        ],
+        outputNames: ["fence", "q_out", "k_out", "v_out"],
+        source: ringStoreNormRopeSourceText,
+        ensureRowContiguous: true)
+
+    /// KVMIRROR-001 twin of the store above without the layer K/V mirror:
+    /// same inputs, same launch, the same ring slots and the same query plane,
+    /// two fewer outputs and three fewer device store sites. Its own name
+    /// keeps the pipeline cache from serving either body for the other.
+    private static let ringStoreNoKVMirrorKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_nokvmirror_bf16_v1_vec1",
+        inputNames: [
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "params", "raw_queries", "raw_keys", "q_weight", "k_weight",
+            "position_offsets", "rope_freqs", "write_fence",
+        ],
+        outputNames: ["fence", "q_out"],
+        source: ringStoreNoKVMirrorSourceText,
         ensureRowContiguous: true)
 
     /// WRITE-022 kill switch: `DARKBLOOM_GEMMA4_D512_STORE_DISPATCH=0` falls
@@ -6414,7 +6661,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             let normRope = takeFullNormRope(
                 queries: queries, keys: keys, values: values)
         {
-            let stored = ringStoreNormRopeKernel(
+            let storeInputs =
                 keyBuffers + valueBuffers + [
                     paramsArray,
                     normRope.rawQueries,
@@ -6424,22 +6671,43 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     normRope.positionOffsets,
                     normRope.ropeFrequencies,
                     previousWriteFence,
-                ],
-                template: template,
-                grid: (128, 1, batch * kvHeads + batch * queryHeads),
-                threadGroup: (128, 1, 1),
-                outputShapes: [
-                    [1],
-                    [batch, queryHeads, 1, headDim],
-                    [batch, kvHeads, 1, headDim],
-                    [batch, kvHeads, 1, headDim],
-                ],
-                outputDTypes: [.int32, .bfloat16, .bfloat16, .bfloat16]
-            )
-            storeFence = stored[0]
-            liveQueries = stored[1]
-            normalizedKeys = stored[2]
-            normalizedValues = stored[3]
+                ]
+            // KVMIRROR-001: the trunk has told us nothing reads the pair this
+            // body would mirror, so take the twin without it.
+            if CBv2RaggedTwoPassDecodeAttentionV1.kvPairMirrorElided {
+                let stored = ringStoreNoKVMirrorKernel(
+                    storeInputs,
+                    template: template,
+                    grid: (128, 1, batch * kvHeads + batch * queryHeads),
+                    threadGroup: (128, 1, 1),
+                    outputShapes: [
+                        [1],
+                        [batch, queryHeads, 1, headDim],
+                    ],
+                    outputDTypes: [.int32, .bfloat16]
+                )
+                storeFence = stored[0]
+                liveQueries = stored[1]
+                CBv2EngageMark.once("d512-kv-pair-mirror-elided")
+            } else {
+                let stored = ringStoreNormRopeKernel(
+                    storeInputs,
+                    template: template,
+                    grid: (128, 1, batch * kvHeads + batch * queryHeads),
+                    threadGroup: (128, 1, 1),
+                    outputShapes: [
+                        [1],
+                        [batch, queryHeads, 1, headDim],
+                        [batch, kvHeads, 1, headDim],
+                        [batch, kvHeads, 1, headDim],
+                    ],
+                    outputDTypes: [.int32, .bfloat16, .bfloat16, .bfloat16]
+                )
+                storeFence = stored[0]
+                liveQueries = stored[1]
+                normalizedKeys = stored[2]
+                normalizedValues = stored[3]
+            }
             CBv2EngageMark.once("d512-normrope-store")
         } else {
             storeFence = ringStoreKernel(

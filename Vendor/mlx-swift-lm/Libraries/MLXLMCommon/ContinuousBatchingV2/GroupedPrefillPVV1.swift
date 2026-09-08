@@ -9,6 +9,14 @@ enum CBv2GroupedPrefillPVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    // Keep the eight causal blocks of a batch/head adjacent in the Z grid.
+    private static let headLocalityEnabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_GROUPED_PV_HEAD_LOCALITY_V1"] ?? "1"
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }()
+
     private struct Geometry {
         let bm: Int
         let bk: Int
@@ -37,7 +45,7 @@ enum CBv2GroupedPrefillPVV1 {
         #endif
     }()
 
-    private static let source = #"""
+    private static let originalSource = #"""
         using namespace mlx::steel;
         const uint3 tid = threadgroup_position_in_grid;
         const int block = int(tid.z) / (BATCH * 16);
@@ -82,8 +90,19 @@ enum CBv2GroupedPrefillPVV1 {
         });
         """#
 
+    private static let source: String = {
+        guard headLocalityEnabled else { return originalSource }
+        return originalSource.replacingOccurrences(
+            of: "const int block = int(tid.z) / (BATCH * 16);\nconst int batchHead = int(tid.z) % (BATCH * 16);",
+            with: "const int block = int(tid.z) % 8;\nconst int batchHead = int(tid.z) / 8;")
+    }()
+
+    private static let kernelName = headLocalityEnabled
+        ? "cbv2_grouped_prefill_pv_nax_v1_bhz1"
+        : "cbv2_grouped_prefill_pv_nax_v1"
+
     private static let kernel = MLXFast.metalKernel(
-        name: "cbv2_grouped_prefill_pv_nax_v1",
+        name: kernelName,
         inputNames: (0..<8).map { "s\($0)" } + (0..<8).map { "r\($0)" } + ["values"],
         outputNames: ["output"],
         source: source,

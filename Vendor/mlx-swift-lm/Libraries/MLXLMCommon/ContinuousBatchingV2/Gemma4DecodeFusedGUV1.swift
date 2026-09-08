@@ -33,9 +33,26 @@ public enum Gemma4DecodeFusedGUV1 {
 
     /// Raw launch for callers that already passed the fused-GU contract.
     static func call(_ inputs: [MLXArray], taggedRoute: Bool = false) -> MLXArray {
-        (taggedRoute ? kernelTagged : kernelGeneral)(inputs,
+        if taggedRoute && runCap == 4 {
+            let narrow = launch(kernelNarrow, inputs)
+            let wide = launch(kernelWide, inputs)
+            return kernelMerge([narrow, wide, inputs[5]],
+                grid: (64 * 704, 1, 1), threadGroup: (256, 1, 1),
+                outputShapes: [outputShape], outputDTypes: [outputDType])[0]
+        }
+        return launch(taggedRoute ? kernelTagged : kernelGeneral, inputs)
+    }
+
+    private static func launch(
+        _ kernel: MLXFast.MLXFastKernel, _ inputs: [MLXArray]
+    ) -> MLXArray {
+        kernel(inputs,
             grid: (32, 176 * 2, 64), threadGroup: (32, 2, 1),
             outputShapes: [outputShape], outputDTypes: [outputDType])[0]
+    }
+
+    private enum MathWidth: Int {
+        case all, narrow, wide
     }
 
     /// GU-TAGGED-ROUTE. When the route producer emits prefix-bounds tagged
@@ -48,10 +65,13 @@ public enum Gemma4DecodeFusedGUV1 {
     /// two carry distinct kernel names so their pipeline-cache entries never
     /// alias. Only an already-unreachable branch is removed, so the output is
     /// bit-identical.
-    private static func makeKernel(tagged: Bool) -> MLXFast.MLXFastKernel {
+    private static func makeKernel(
+        tagged: Bool, mathWidth: MathWidth = .all
+    ) -> MLXFast.MLXFastKernel {
         MLXFast.metalKernel(
         name: "gemma4_b8_decode_gateup_geglu_threadgroup_v2_solo1"
-            + (tagged ? "_tagged_v1" : ""),
+            + (tagged ? "_tagged_v1" : "")
+            + (mathWidth == .all ? "" : "_\(mathWidth)_cap4_v1"),
         inputNames: ["w", "scales", "biases", "x", "lhs", "rhs"],
         outputNames: ["y"],
         source: #"""
@@ -63,6 +83,16 @@ uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
     if(!run.leader)return;
     const uint localSg=sg&1u, localColumn=(sg/2)*4;
     const uint column=tid.y*(4*guPairs)+localColumn;
+#if GU_MATH_WIDTH != 0
+    const bool selected=GU_MATH_WIDTH==1 ? run.count<=2u:run.count>=3u;
+    if(!selected){
+        if((sg&1u)==0 && lane<run.count*4){
+            const uint localRow=lane/4, hidden=column+lane%4;
+            y[(assignment+localRow)*704+hidden]=bfloat(0.0f);
+        }
+        return;
+    }
+#endif
     const uint packedRow=(column/16)*32+column%16+(localSg==1 ? 16:0)-localSg*4;
     const uint expertBase=run.expert*1408;
     threadgroup bfloat tile[4*8*guPairs];
@@ -82,7 +112,8 @@ uint sg=simdgroup_index_in_threadgroup,lane=thread_index_in_simdgroup;
     }
 
 """#,
-        header: "#define GU_RUN_CAP \(runCap)\n"
+        header: "#define GU_RUN_CAP \(mathWidth == .all ? runCap : 4)\n"
+            + "#define GU_MATH_WIDTH \(mathWidth.rawValue)\n"
             + "#define GU_TAGGED_ROUTE \(tagged ? 1 : 0)\n" + #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helpers from 093e716.
 #include <metal_stdlib>
@@ -735,6 +766,7 @@ METAL_FUNC void tg_qmv_impl(
   }
 }
 
+#if GU_MATH_WIDTH != 2
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void tg_qmv_affine4_g64_pair_impl(
     const device uint32_t* w,
@@ -926,7 +958,9 @@ METAL_FUNC void tg_qmv_affine4_g64_solo_impl(
   }
 }
 
-#if GU_RUN_CAP >= 3
+#endif
+
+#if GU_RUN_CAP >= 3 && GU_MATH_WIDTH != 1
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void tg_qmv_affine4_g64_triple_stream_impl(
     const device uint32_t* w,
@@ -1052,7 +1086,7 @@ METAL_FUNC void tg_qmv_affine4_g64_triple_stream_impl(
 
 #endif
 
-#if GU_RUN_CAP >= 4
+#if GU_RUN_CAP >= 4 && GU_MATH_WIDTH != 1
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void tg_qmv_affine4_g64_quad_stream_impl(
     const device uint32_t* w,
@@ -1248,14 +1282,18 @@ METAL_FUNC void tg_execute_projection(const device uint* w,const device T* scale
     const device T* x,const device uint* lhs,threadgroup T* y0,int rowStride,
     const constant int& outputN,uint assignment,uint count,uint3 tid,uint sg,uint lane) {
     const device T* x0=x+lhs[assignment]*2816;
+#if GU_MATH_WIDTH != 2
     if(count==1){tg_qmv_affine4_g64_solo_impl<T,64,4>(w,scales,biases,x0,y0,guK,tid,sg,lane);return;}
+#endif
     const device T* x1=x+lhs[assignment+1]*2816;threadgroup T* y1=y0+rowStride;
+#if GU_MATH_WIDTH != 2
     if(count==2){tg_qmv_affine4_g64_pair_impl<T,64,4>(w,scales,biases,x0,x1,y0,y1,guK,tid,sg,lane);return;}
-#if GU_RUN_CAP >= 3
+#endif
+#if GU_RUN_CAP >= 3 && GU_MATH_WIDTH != 1
     const device T* x2=x+lhs[assignment+2]*2816;threadgroup T* y2=y1+rowStride;
     if(count==3){tg_qmv_affine4_g64_triple_stream_impl<T,64,4>(w,scales,biases,x0,x1,x2,y0,y1,y2,guK,tid,sg,lane);return;}
 #endif
-#if GU_RUN_CAP >= 4
+#if GU_RUN_CAP >= 4 && GU_MATH_WIDTH != 1
     const device T* x3=x+lhs[assignment+3]*2816;threadgroup T* y3=y2+rowStride;
     tg_qmv_affine4_g64_quad_stream_impl<T,64,4>(w,scales,biases,x0,x1,x2,x3,y0,y1,y2,y3,guK,tid,sg,lane);
 #endif
@@ -1267,4 +1305,26 @@ METAL_FUNC void tg_execute_projection(const device uint* w,const device T* scale
 
     private static let kernelGeneral: MLXFast.MLXFastKernel = makeKernel(tagged: false)
     private static let kernelTagged: MLXFast.MLXFastKernel = makeKernel(tagged: true)
+    private static let kernelNarrow: MLXFast.MLXFastKernel =
+        makeKernel(tagged: true, mathWidth: .narrow)
+    private static let kernelWide: MLXFast.MLXFastKernel =
+        makeKernel(tagged: true, mathWidth: .wide)
+
+    private static let kernelMerge = MLXFast.metalKernel(
+        name: "gemma4_b8_decode_gateup_cap4_merge_bits_v1",
+        inputNames: ["narrow", "wide", "rhs"],
+        outputNames: ["y"],
+        source: #"""
+const uint index=thread_position_in_grid.x;
+if(index>=64u*704u)return;
+const uint row=index/704u;
+const uint offset=(rhs[row]>>8)&0x3fu;
+const uint leader=row-(offset%4u);
+const uint count=min(4u,((rhs[leader]>>14)&0x3fu)+1u);
+const device ushort* selected=count<=2u
+    ? reinterpret_cast<const device ushort*>(narrow)
+    : reinterpret_cast<const device ushort*>(wide);
+reinterpret_cast<device ushort*>(y)[index]=selected[index];
+"""#,
+        ensureRowContiguous: true)
 }

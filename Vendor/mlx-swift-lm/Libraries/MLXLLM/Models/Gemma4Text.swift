@@ -3645,6 +3645,41 @@ private enum Gemma4RouterFinalistsWeightsV1 {
 /// `DARKBLOOM_GEMMA4_ROUTE_ORDER_KEYS=0` retains its original sorting network.
 /// Engage marks: `glue-fold` and, when enabled, `router-native-max8-sg1-decode`.
 private enum Gemma4RouteGlueFoldV1 {
+    /// The native top8 producer guarantees eight distinct expert IDs per row.
+    /// Membership masks preserve expert rank, stable row ties, and prefix bounds.
+    /// Disabled or drifted sources keep the complete original fused kernel.
+    private static let rowBitsetEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTE_ROW_BITSET_V1"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }()
+
+    private static func rowBitsetSource(_ original: String) -> String {
+        guard rowBitsetEnabled && orderKeysEnabled else { return original }
+        let oldPhase = switchRouteGluePrefixBoundsEnabled
+            ? "// Phase 2 -- the incumbent simd-rank scatter, verbatim, over the\n    // staged 64 keys. Threads 0..63 are exactly the two complete\n    // SIMD groups the standalone kernel launched; `assignment` and\n    // `lane` reproduce its coordinates.\n    if (tid < 64u) {\n        const uint assignment = tid;\n        const uint key = sel[assignment];\n        const uint key_low = sel[lane];\n        const uint key_high = sel[32u + lane];\n        uint rank = 0;\n      uint run_offset = 0;\n      uint run_length = 0;\n        #pragma clang loop unroll(full)\n        for (uint source = 0; source < 32; ++source) {\n            const uint other_low = simd_broadcast(key_low, ushort(source));\n            rank += (other_low < key)\n                || (other_low == key && source < assignment);\n          run_offset += other_low == key && source < assignment;\n          run_length += other_low == key;\n            const uint other_high = simd_broadcast(key_high, ushort(source));\n            const uint high_assignment = 32u + source;\n            rank += (other_high < key)\n                || (other_high == key && high_assignment < assignment);\n          run_offset += other_high == key && high_assignment < assignment;\n          run_length += other_high == key;\n        }\n        row_order[rank] = assignment / 8;\n      const uint run_remaining = run_length - run_offset;\n      sorted_keys[rank] = 0x80000000u | key\n          | (run_offset << 8) | ((run_remaining - 1) << 14);\n        inverse_order[assignment] = rank;\n    }"
+            : "// Phase 2 -- the incumbent simd-rank scatter, verbatim, over the\n    // staged 64 keys. Threads 0..63 are exactly the two complete\n    // SIMD groups the standalone kernel launched; `assignment` and\n    // `lane` reproduce its coordinates.\n    if (tid < 64u) {\n        const uint assignment = tid;\n        const uint key = sel[assignment];\n        const uint key_low = sel[lane];\n        const uint key_high = sel[32u + lane];\n        uint rank = 0;\n\n        #pragma clang loop unroll(full)\n        for (uint source = 0; source < 32; ++source) {\n            const uint other_low = simd_broadcast(key_low, ushort(source));\n            rank += (other_low < key)\n                || (other_low == key && source < assignment);\n\n            const uint other_high = simd_broadcast(key_high, ushort(source));\n            const uint high_assignment = 32u + source;\n            rank += (other_high < key)\n                || (other_high == key && high_assignment < assignment);\n\n        }\n        row_order[rank] = assignment / 8;\n      sorted_keys[rank] = key;\n        inverse_order[assignment] = rank;\n    }"
+        let newPhase = switchRouteGluePrefixBoundsEnabled
+            ? "// Phase 2 -- membership rank, valid for the unique top8 producer above.\n    if (tid < 64u) {\n        const uint assignment = tid;\n        const uint key = sel[assignment];\n        const uint key_word = key >> 5u;\n        const uint key_bit = key & 31u;\n        const uint lower_mask = (1u << key_bit) - 1u;\n        const uint own_row = assignment / 8u;\n        uint rank = 0u;\n        uint run_offset = 0u;\n        uint run_length = 0u;\n        #pragma clang loop unroll(full)\n        for (uint source_row = 0u; source_row < 8u; ++source_row) {\n            const uint2 packet = row_bits[source_row][key_word];\n            const uint same = (packet.x >> key_bit) & 1u;\n            const uint earlier = same * uint(source_row < own_row);\n            rank += packet.y + popcount(packet.x & lower_mask) + earlier;\n            run_offset += earlier;\n            run_length += same;\n        }\n        row_order[rank] = assignment / 8;\n        const uint run_remaining = run_length - run_offset;\n        sorted_keys[rank] = 0x80000000u | key\n            | (run_offset << 8) | ((run_remaining - 1) << 14);\n        inverse_order[assignment] = rank;\n    }\n"
+            : "// Phase 2 -- membership rank, valid for the unique top8 producer above.\n    if (tid < 64u) {\n        const uint assignment = tid;\n        const uint key = sel[assignment];\n        const uint key_word = key >> 5u;\n        const uint key_bit = key & 31u;\n        const uint lower_mask = (1u << key_bit) - 1u;\n        const uint own_row = assignment / 8u;\n        uint rank = 0u;\n        #pragma clang loop unroll(full)\n        for (uint source_row = 0u; source_row < 8u; ++source_row) {\n            const uint2 packet = row_bits[source_row][key_word];\n            const uint same = (packet.x >> key_bit) & 1u;\n            const uint earlier = same * uint(source_row < own_row);\n            rank += packet.y + popcount(packet.x & lower_mask) + earlier;\n        }\n        row_order[rank] = assignment / 8;\n        sorted_keys[rank] = key;\n        inverse_order[assignment] = rank;\n    }\n"
+        let replacements: [(String, String)] = [
+            ("    threadgroup uint sel[64];", "    threadgroup uint sel[64];\n    threadgroup uint2 row_bits[8][4];"),
+            ("    threadgroup_barrier(mem_flags::mem_threadgroup);", "    // ROW-BITSET: top8 contains eight DISTINCT expert IDs in each row.\n    const uint selected_key = item & 127u;\n    const uint selected_bit = 1u << (selected_key & 31u);\n    const uint bm0 = simd_or(lane >= 24u && selected_key < 32u ? selected_bit : 0u);\n    const uint bm1 = simd_or(lane >= 24u && selected_key >= 32u && selected_key < 64u ? selected_bit : 0u);\n    const uint bm2 = simd_or(lane >= 24u && selected_key >= 64u && selected_key < 96u ? selected_bit : 0u);\n    const uint bm3 = simd_or(lane >= 24u && selected_key >= 96u ? selected_bit : 0u);\n    const uint count0 = popcount(bm0);\n    const uint count1 = popcount(bm1);\n    const uint count2 = popcount(bm2);\n    const uint4 bit_words = uint4(bm0, bm1, bm2, bm3);\n    const uint4 lower_counts = uint4(0u, count0, count0 + count1, count0 + count1 + count2);\n    if (lane < 4u) row_bits[row][lane] = uint2(bit_words[lane], lower_counts[lane]);\n    threadgroup_barrier(mem_flags::mem_threadgroup);"),
+            (oldPhase, newPhase),
+        ]
+        guard replacements.allSatisfy({
+            original.components(separatedBy: $0.0).count == 2
+        }) else { return original }
+        var result = original
+        for (old, new) in replacements {
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        CBv2EngageMark.once("route-row-bitset")
+        return result
+    }
+
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_GLUE_FOLD"]
@@ -3711,10 +3746,10 @@ private enum Gemma4RouteGlueFoldV1 {
             : "gemma4_route_monolithic_top8_e128_k8_bf16_v2")
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: kernelName,
+        name: kernelName + (rowBitsetEnabled && orderKeysEnabled ? "_row_bitset_v1" : ""),
         inputNames: ["scores", "pes"],
         outputNames: ["indices", "weights", "row_order", "sorted_keys", "inverse_order"],
-        source: orderKeysEnabled ? """
+        source: orderKeysEnabled ? rowBitsetSource("""
             const uint tid = thread_position_in_threadgroup.x;
             const uint row = tid / 32u;
             const uint lane = thread_index_in_simdgroup;
@@ -3788,7 +3823,7 @@ private enum Gemma4RouteGlueFoldV1 {
         \(routeSortedKeySource)
                 inverse_order[assignment] = rank;
             }
-        """ : """
+        """) : """
             const uint tid = thread_position_in_threadgroup.x;
             const uint row = tid / 128u;
             const uint lane = thread_index_in_simdgroup;
@@ -4352,13 +4387,28 @@ private enum Gemma4FusedLayerGlue {
             ensureRowContiguous: true
         )
 
+    /// The four equal BF16 boundary planes share one fresh allocation.
+    /// Each contiguous view owns its original region; V1 keeps its table ABI.
+    private static let prefixBF16ArenaEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFIX_BF16_ARENA_V1"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }()
+
+    private static func prefixBF16ArenaSource(_ original: String) -> String {
+        guard prefixBF16ArenaEnabled else { return original }
+        return "device T* out = branchPlanes;\ndevice T* dense = branchPlanes + 22528u;\ndevice T* expert = branchPlanes + 45056u;\ndevice T* router = branchPlanes + 67584u;\n" + original
+    }
+
     private static let attentionBranchPrefixKernelV2: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
             name: "gemma4_glue_attention_branch_prefix_2816_bf16_v2_nb1"
-                + tbSuffix,
+                + tbSuffix + (prefixBF16ArenaEnabled ? "_bf16_arena_v1" : ""),
             inputNames: ["attn", "res", "wa", "wd", "we", "wr"],
-            outputNames: ["out", "dense", "expert", "router"],
-            source: """
+            outputNames: prefixBF16ArenaEnabled ? ["branchPlanes"] : ["out", "dense", "expert", "router"],
+            source: prefixBF16ArenaSource("""
                 const uint row = threadgroup_position_in_grid.x;
                 const uint lid = thread_position_in_threadgroup.x;
                 const uint simd_lane_id = thread_index_in_simdgroup;
@@ -4389,7 +4439,7 @@ private enum Gemma4FusedLayerGlue {
                     expert[base + i] = we[wbase + i] * nx;
                     router[base + i] = wr[wbase + i] * nx;
                 }
-            """,
+            """),
             ensureRowContiguous: true
         )
 
@@ -4556,24 +4606,45 @@ private enum Gemma4FusedLayerGlue {
         else { return nil }
         if denseXSumElideEnabled {
             CBv2EngageMark.once("dense-xsum-elide")
-            let outs = attentionBranchPrefixKernelV2(
-                [
-                    attn, residual, postAttentionWeight, denseWeight,
-                    expertWeight, routerWeight,
-                ],
-                template: [("T", attn.dtype)],
-                grid: (rows * tgThreads, 1, 1),
-                threadGroup: (tgThreads, 1, 1),
-                outputShapes: [
-                    [rows, 1, axis],
-                    [rows, 1, axis],
-                    [rows, 1, axis],
-                    [rows, 1, axis],
-                ],
-                outputDTypes: [
-                    .bfloat16, .bfloat16, .bfloat16, .bfloat16,
+            let outs: [MLXArray]
+            if prefixBF16ArenaEnabled {
+                let output = attentionBranchPrefixKernelV2(
+                    [
+                        attn, residual, postAttentionWeight, denseWeight,
+                        expertWeight, routerWeight,
+                    ],
+                    template: [("T", attn.dtype)],
+                    grid: (rows * tgThreads, 1, 1),
+                    threadGroup: (tgThreads, 1, 1),
+                    outputShapes: [[90112]],
+                    outputDTypes: [.bfloat16]
+                )[0]
+                outs = [
+                    output[0..<22528].reshaped([rows, 1, axis]),
+                    output[22528..<45056].reshaped([rows, 1, axis]),
+                    output[45056..<67584].reshaped([rows, 1, axis]),
+                    output[67584..<90112].reshaped([rows, 1, axis]),
                 ]
-            )
+            } else {
+                outs = attentionBranchPrefixKernelV2(
+                    [
+                        attn, residual, postAttentionWeight, denseWeight,
+                        expertWeight, routerWeight,
+                    ],
+                    template: [("T", attn.dtype)],
+                    grid: (rows * tgThreads, 1, 1),
+                    threadGroup: (tgThreads, 1, 1),
+                    outputShapes: [
+                        [rows, 1, axis],
+                        [rows, 1, axis],
+                        [rows, 1, axis],
+                        [rows, 1, axis],
+                    ],
+                    outputDTypes: [
+                        .bfloat16, .bfloat16, .bfloat16, .bfloat16,
+                    ]
+                )
+            }
             CBv2EngageMark.once("attention-branch-prefix")
             return AttentionBranchPrefix(
                 out: outs[0],

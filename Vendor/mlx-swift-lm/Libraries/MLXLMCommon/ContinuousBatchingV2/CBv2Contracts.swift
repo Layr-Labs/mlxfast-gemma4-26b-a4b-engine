@@ -337,7 +337,14 @@ extension CBv2SequenceKV {
 /// owning `CBv2LayerCache`'s explicit fused-ring-write fence. Unknown/custom
 /// row implementations make no such claim, so the engine must keep their full
 /// cache inner state as evaluation roots.
-public protocol CBv2DecodeRootCompactionCapableSequenceKV: CBv2SequenceKV {}
+public protocol CBv2DecodeRootCompactionCapableSequenceKV: CBv2SequenceKV {
+    /// True while the row holds no lazily written side plane that the current
+    /// step's attention output leaves unread. A row with an open speculative
+    /// transaction, a staged update, or a quantized mirror whose latest write
+    /// was an ordinary SliceUpdate must answer false: only the full inner
+    /// state can then collapse those writes each step (the DAR-325 bug class).
+    var decodeOutputCoversSideState: Bool { get }
+}
 
 /// Factory for per-sequence KV state; implemented by the v1 contiguous
 /// backend and the v2 paged backend.

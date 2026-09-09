@@ -8164,6 +8164,12 @@ extension Gemma4TextModel: CBv2LanguageModelPrefillForwardable {
 /// that forward's K/V mutations. Cache-layout gates remain in the adapter.
 extension Gemma4TextModel: CBv2LanguageModelDecodeOutputCoversCacheMutations {}
 
+/// `cbv2DecodeArgmax` runs the same sequential trunk (`model(_:cache:)` or
+/// `callWithMMAHeadSums`) and feeds its post-norm hidden state into the fused
+/// head-plus-argmax or the stock head, so the `[B]` token ids root the same
+/// K/V mutations the logits do. The verify branch only adds reads.
+extension Gemma4TextModel: CBv2ArgmaxDecodeOutputCoversCacheMutations {}
+
 // MARK: - ContinuousBatchingV2 multimodal (vision prefill)
 
 /// The CBv2 engine's embedding-spliced prefill surface

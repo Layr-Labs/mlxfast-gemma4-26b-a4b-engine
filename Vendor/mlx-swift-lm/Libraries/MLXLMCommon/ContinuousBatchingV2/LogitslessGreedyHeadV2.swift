@@ -37,7 +37,29 @@ public protocol CBv2ArgmaxDecodeForwardable: AnyObject {
 public protocol CBv2ArgmaxDecodeSteppableModel: CBv2SteppableModel {
     func admitsArgmaxDecode(tokens: MLXArray) -> Bool
     func decodeArgmax(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray
+
+    /// Optional proof surface for the fused-argmax step, the counterpart of
+    /// `compactDecodeEvaluationRoots` for `forwardOutput` = the `[B]` token
+    /// ids. The token graph is a different output from the logits plane, so
+    /// the ordinary proof does not transfer; nil keeps the full inner state.
+    func compactArgmaxDecodeEvaluationRoots(
+        forwardOutput: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> [MLXArray]?
 }
+
+extension CBv2ArgmaxDecodeSteppableModel {
+    public func compactArgmaxDecodeEvaluationRoots(
+        forwardOutput: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> [MLXArray]? {
+        nil
+    }
+}
+
+/// Model-level proof that the `cbv2DecodeArgmax` token output transitively
+/// consumes every K/V mutation of that forward. Separate from the ordinary
+/// logits proof: an argmax entry point may run a different tail, so a model
+/// must affirm this surface on its own.
+public protocol CBv2ArgmaxDecodeOutputCoversCacheMutations: AnyObject {}
 
 /// Samplers that can hand a whole step to a fused greedy head.
 ///

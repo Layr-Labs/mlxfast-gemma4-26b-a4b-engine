@@ -51,6 +51,29 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
         guard model is any CBv2LanguageModelDecodeOutputCoversCacheMutations else {
             return nil
         }
+        return compactRoots(
+            forwardOutput: forwardOutput, caches: caches,
+            requireSideStateCoverage: false, mark: "compact-decode-roots")
+    }
+
+    /// Fused-argmax compaction over the same bank gates, plus a per-row
+    /// side-state check: the token output cannot force an unread mirror or
+    /// BF16 ring SliceUpdate, so any row still carrying one keeps full roots.
+    public func compactArgmaxDecodeEvaluationRoots(
+        forwardOutput: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> [MLXArray]? {
+        guard model is any CBv2ArgmaxDecodeOutputCoversCacheMutations else {
+            return nil
+        }
+        return compactRoots(
+            forwardOutput: forwardOutput, caches: caches,
+            requireSideStateCoverage: true, mark: "compact-argmax-decode-roots")
+    }
+
+    private func compactRoots(
+        forwardOutput: MLXArray, caches: [CBv2AttendingLayerCache],
+        requireSideStateCoverage: Bool, mark: String
+    ) -> [MLXArray]? {
         let contiguous = caches.compactMap { $0 as? CBv2LayerCache }
         guard !contiguous.isEmpty,
             contiguous.count == caches.count,
@@ -59,8 +82,10 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
             rowCount > 0,
             contiguous.allSatisfy({ $0.rows.count == rowCount }),
             contiguous.allSatisfy({ cache in
-                cache.rows.allSatisfy {
-                    $0 is any CBv2DecodeRootCompactionCapableSequenceKV
+                cache.rows.allSatisfy { row in
+                    guard let capable = row as? any CBv2DecodeRootCompactionCapableSequenceKV
+                    else { return false }
+                    return !requireSideStateCoverage || capable.decodeOutputCoversSideState
                 }
             }),
             let stateIdentity = contiguous[0].unifiedPositionStateIdentity,
@@ -75,7 +100,7 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
         roots.append(contentsOf: contiguous.map(\.decodeRingWriteFenceEvaluationRoot))
         if cbv2CompactDecodeRootMarksArmed {
             CBv2EngageMark.once(
-                "compact-decode-roots rows=\(rowCount) layers=\(contiguous.count) "
+                "\(mark) rows=\(rowCount) layers=\(contiguous.count) "
                     + "roots=\(roots.count)")
         }
         return roots

@@ -6215,8 +6215,8 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             threadgroup float partials[32];
             threadgroup float inverse_rms;
             threadgroup T rounded[D];
-            if (simd_group == 0) partials[lane] = 0.0f;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // Every SIMD group publishes its own slot below, so the old
+            // zero-fill and its barrier were redundant.
             if (lane == 0) partials[simd_group] = sum;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (simd_group == 0) {

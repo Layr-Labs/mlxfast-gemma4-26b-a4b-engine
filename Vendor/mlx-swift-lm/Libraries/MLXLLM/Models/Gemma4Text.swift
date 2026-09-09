@@ -3967,6 +3967,323 @@ private enum Gemma4RouteGlueFoldV1 {
 }
 
 
+/// ROUTER-PROJ-GLUE: keep the decode router projection and the existing
+/// route-table fold in one producer. The projection is the only router stage
+/// that still leaves the pinned ZIP path as a separate dispatch: the dense
+/// branch needs its scores as an ordering dependency, while the selected
+/// experts and route table are consumed only after the dense tail. This
+/// producer computes the same affine-4/group-64 QMV arithmetic as the stock
+/// 128-row kernel, publishes the BF16 score plane, and immediately performs
+/// the incumbent stable top-8 plus route scatter in the same 256-thread
+/// dispatch. `DARKBLOOM_GEMMA4_ROUTER_PROJ_GLUE=0` restores the old ZIP
+/// projection and GLUE-FOLD path.
+private enum Gemma4RouterProjectionGlueV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTER_PROJ_GLUE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let routeOrderKeysEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTE_ORDER_KEYS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let routePrefixStateSource =
+        switchRouteGluePrefixBoundsEnabled
+        ? """
+                uint run_offset = 0;
+                uint run_length = 0;
+          """
+        : ""
+    private static let routePrefixLowSource =
+        switchRouteGluePrefixBoundsEnabled
+        ? """
+                    run_offset += other_low == key && source < assignment;
+                    run_length += other_low == key;
+          """
+        : ""
+    private static let routePrefixHighSource =
+        switchRouteGluePrefixBoundsEnabled
+        ? """
+                    run_offset += other_high == key && high_assignment < assignment;
+                    run_length += other_high == key;
+          """
+        : ""
+    private static let routeSortedKeySource =
+        switchRouteGluePrefixBoundsEnabled
+        ? """
+                const uint run_remaining = run_length - run_offset;
+                sorted_keys[rank] = 0x80000000u | key
+                    | (run_offset << 8) | ((run_remaining - 1) << 14);
+          """
+        : """
+                sorted_keys[rank] = key;
+          """
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_router_projection_glue_bf16_v1",
+        inputNames: ["normed", "weight", "scales", "biases", "pes"],
+        outputNames: [
+            "scores", "indices", "weights", "row_order", "sorted_keys",
+            "inverse_order",
+        ],
+        source: """
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint row = tid / 32u;
+            const uint lane = thread_index_in_simdgroup;
+            const uint expert0 = lane;
+            const uint expert1 = 32u + lane;
+            const uint expert2 = 64u + lane;
+            const uint expert3 = 96u + lane;
+
+            const device T* x = normed + row * 2816u;
+            thread float x_thread[8];
+            float result0 = 0.0f;
+            float result1 = 0.0f;
+            float result2 = 0.0f;
+            float result3 = 0.0f;
+
+            // This is the stock affine-4/group-64 pair loop retiled over the
+            // four expert rows carried by each SIMD lane. K=2816 is handled
+            // as eleven complete 256-value blocks, including the final tail.
+            for (uint block = 0u; block < 2816u; block += 256u) {
+                const device T* xb = x + block + lane * 8u;
+                float sum = 0.0f;
+                sum += float(xb[0]) + float(xb[1]) + float(xb[2]) + float(xb[3]);
+                sum += float(xb[4]) + float(xb[5]) + float(xb[6]) + float(xb[7]);
+                x_thread[0] = float(xb[0]);
+                x_thread[1] = float(xb[1]) / 16.0f;
+                x_thread[2] = float(xb[2]) / 256.0f;
+                x_thread[3] = float(xb[3]) / 4096.0f;
+                x_thread[4] = float(xb[4]);
+                x_thread[5] = float(xb[5]) / 16.0f;
+                x_thread[6] = float(xb[6]) / 256.0f;
+                x_thread[7] = float(xb[7]) / 4096.0f;
+
+                const uint word = block / 8u + lane;
+                const uint group = block / 64u + lane / 8u;
+                result0 += gemma4_router_qdot_word(
+                    weight[expert0 * 352u + word], x_thread,
+                    float(scales[expert0 * 44u + group]),
+                    float(biases[expert0 * 44u + group]), sum);
+                result1 += gemma4_router_qdot_word(
+                    weight[expert1 * 352u + word], x_thread,
+                    float(scales[expert1 * 44u + group]),
+                    float(biases[expert1 * 44u + group]), sum);
+                result2 += gemma4_router_qdot_word(
+                    weight[expert2 * 352u + word], x_thread,
+                    float(scales[expert2 * 44u + group]),
+                    float(biases[expert2 * 44u + group]), sum);
+                result3 += gemma4_router_qdot_word(
+                    weight[expert3 * 352u + word], x_thread,
+                    float(scales[expert3 * 44u + group]),
+                    float(biases[expert3 * 44u + group]), sum);
+            }
+
+            const T score0 = T(simd_sum(result0));
+            const T score1 = T(simd_sum(result1));
+            const T score2 = T(simd_sum(result2));
+            const T score3 = T(simd_sum(result3));
+            scores[row * 128u + expert0] = score0;
+            scores[row * 128u + expert1] = score1;
+            scores[row * 128u + expert2] = score2;
+            scores[row * 128u + expert3] = score3;
+
+            // Stable native-BF16 order, with the score values retained in
+            // threadgroup memory for the weight tail. This avoids a device
+            // round trip between the fused projection and selection phases.
+            uint a = gemma4_finalists_pack(bfloat16_t(score0), expert0);
+            uint b = gemma4_finalists_pack(bfloat16_t(score1), expert1);
+            uint c = gemma4_finalists_pack(bfloat16_t(score2), expert2);
+            uint d = gemma4_finalists_pack(bfloat16_t(score3), expert3);
+            uint item = 0u;
+            threadgroup uint sel[64];
+            threadgroup float selected_scores[64];
+
+            #pragma clang loop unroll(full)
+            for (uint rank = 0u; rank < 8u; ++rank) {
+                const uint winner = simd_max(max(max(a, b), max(c, d)));
+                if (lane == 31u - rank) item = winner;
+                if (a == winner) a = 0u;
+                if (b == winner) b = 0u;
+                if (c == winner) c = 0u;
+                if (d == winner) d = 0u;
+            }
+
+            if (lane >= 24u) {
+                const uint selected = item & 127u;
+                const uint out_idx = row * 8u + (lane - 24u);
+                indices[out_idx] = selected;
+                sel[out_idx] = selected;
+                selected_scores[out_idx] =
+                    selected == expert0 ? float(score0)
+                    : (selected == expert1 ? float(score1)
+                       : (selected == expert2 ? float(score2)
+                          : float(score3)));
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float score = (lane >= 24u)
+                ? float(selected_scores[row * 8u + lane - 24u])
+                : -1e38f;
+            float max_score = score;
+            max_score = metal::max(max_score, simd_shuffle_xor(max_score, 4));
+            max_score = metal::max(max_score, simd_shuffle_xor(max_score, 2));
+            max_score = metal::max(max_score, simd_shuffle_xor(max_score, 1));
+
+            float exp_score = (lane >= 24u)
+                ? metal::precise::exp(score - max_score) : 0.0f;
+            float sum_exp = exp_score;
+            sum_exp += simd_shuffle_xor(sum_exp, 4);
+            sum_exp += simd_shuffle_xor(sum_exp, 2);
+            sum_exp += simd_shuffle_xor(sum_exp, 1);
+
+            if (lane >= 24u) {
+                const uint selected = item & 127u;
+                const uint out_idx = row * 8u + (lane - 24u);
+                const float weight = (sum_exp > 0.0f)
+                    ? (exp_score / sum_exp) : 0.0f;
+                weights[out_idx] = T(weight * float(pes[selected]));
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // The following 64 lanes reproduce the incumbent stable
+            // rank-scatter ABI used by SwitchLayers.
+            if (tid < 64u) {
+                const uint assignment = tid;
+                const uint key = sel[assignment];
+                const uint key_low = sel[lane];
+                const uint key_high = sel[32u + lane];
+                uint rank = 0u;
+          \(routePrefixStateSource)
+                #pragma clang loop unroll(full)
+                for (uint source = 0u; source < 32u; ++source) {
+                    const uint other_low =
+                        simd_broadcast(key_low, ushort(source));
+                    rank += (other_low < key)
+                        || (other_low == key && source < assignment);
+          \(routePrefixLowSource)
+                    const uint other_high =
+                        simd_broadcast(key_high, ushort(source));
+                    const uint high_assignment = 32u + source;
+                    rank += (other_high < key)
+                        || (other_high == key
+                            && high_assignment < assignment);
+          \(routePrefixHighSource)
+                }
+                row_order[rank] = assignment / 8u;
+          \(routeSortedKeySource)
+                inverse_order[assignment] = rank;
+            }
+        """,
+        header: """
+            inline float gemma4_router_qdot_word(
+                uint packed_word,
+                const thread float* x,
+                float scale,
+                float bias,
+                float sum)
+            {
+                const uint packed0 = packed_word & 0xffffu;
+                const uint packed1 = packed_word >> 16;
+                float accum =
+                    x[0] * float(packed0 & 0x000fu)
+                    + x[1] * float(packed0 & 0x00f0u)
+                    + x[2] * float(packed0 & 0x0f00u)
+                    + x[3] * float(packed0 & 0xf000u);
+                accum +=
+                    x[4] * float(packed1 & 0x000fu)
+                    + x[5] * float(packed1 & 0x00f0u)
+                    + x[6] * float(packed1 & 0x0f00u)
+                    + x[7] * float(packed1 & 0xf000u);
+                return scale * accum + sum * bias;
+            }
+
+            inline uint gemma4_finalists_pack(
+                bfloat16_t value, uint expert)
+            {
+                const uint bits = uint(bfloat16_to_uint16(value));
+                const uint ordinal = metal::isnan(value)
+                    ? 0xffffu
+                    : (value == bfloat16_t(0.0f)
+                       ? 0x8000u
+                       : ((bits & 0x8000u)
+                          ? ((~bits) & 0xffffu)
+                          : (bits ^ 0x8000u)));
+                return (ordinal << 7) | expert;
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    struct Result {
+        let scores: MLXArray
+        let indices: MLXArray
+        let weights: MLXArray
+        let table: SwitchRouteTable
+    }
+
+    static func apply(
+        normed: MLXArray,
+        projection: Linear,
+        perExpertScale: MLXArray,
+        topK: Int,
+        kth: Int
+    ) -> Result? {
+        guard enabled, routeOrderKeysEnabled,
+            topK == 8, kth == 120,
+            normed.ndim == 3, normed.dim(0) == 8,
+            normed.dim(1) == 1, normed.dim(2) == 2816,
+            normed.dtype == .bfloat16,
+            let quantized = projection as? QuantizedLinear,
+            quantized.bias == nil,
+            quantized.groupSize == 64, quantized.bits == 4,
+            quantized.mode == .affine,
+            quantized.weight.dtype == .uint32,
+            quantized.weight.ndim == 2,
+            quantized.weight.dim(0) == 128,
+            quantized.weight.dim(1) == 352,
+            quantized.scales.dtype == .bfloat16,
+            quantized.scales.shape == [128, 44],
+            quantized.biases.dtype == .bfloat16,
+            quantized.biases.shape == quantized.scales.shape,
+            perExpertScale.ndim == 1,
+            perExpertScale.dim(0) == 128,
+            perExpertScale.dtype == .bfloat16
+        else { return nil }
+
+        let outputs = kernel(
+            [
+                normed, quantized.weight, quantized.scales, quantized.biases,
+                perExpertScale,
+            ],
+            template: [("T", normed.dtype)],
+            grid: (256, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [
+                [8, 1, 128], [8, 1, 8], [8, 1, 8], [64], [64], [64],
+            ],
+            outputDTypes: [
+                .bfloat16, .uint32, .bfloat16, .uint32, .uint32, .uint32,
+            ]
+        )
+        CBv2EngageMark.once("router-proj-glue")
+        return Result(
+            scores: outputs[0],
+            indices: outputs[1],
+            weights: outputs[2],
+            table: SwitchRouteTable(
+                rowOrder: outputs[3],
+                sortedKeys: outputs[4],
+                inverseOrder: outputs[5],
+                hasExpertPrefixBounds: switchRouteGluePrefixBoundsEnabled))
+    }
+}
+
 /// GLUE-003: one-per-forward chain box. Layer L's fused tail deposits the
 /// (output, next-layer-input-norm) pair; layer L+1 consumes the norm instead
 /// of re-reading and re-normalizing the same tensor — guarded by pointer
@@ -5839,6 +6156,18 @@ private enum Gemma4ZipRouterV1 {
         // dual pre-norm arrays unreferenced, so MLX never evaluates them and
         // the caller's stock path rebuilds the identical pair.
         let normed = carriedRouterNorm ?? router.zipNorm(out)
+        // ROUTER-PROJ-GLUE is admitted only alongside the compiled decode
+        // dense path. Its score output remains the ordering dependency for
+        // that path; its route outputs are held until the dense tail below.
+        let fusedRouter: Gemma4RouterProjectionGlueV1.Result? =
+            plan == 1 && Gemma4FusedLayerGlue.denseXSumElideEnabled
+            ? Gemma4RouterProjectionGlueV1.apply(
+                normed: normed,
+                projection: router.proj,
+                perExpertScale: router.perExpertScale,
+                topK: router.topK,
+                kth: router.kth)
+            : nil
 
         // Default ZIP only. The trace keeps the score dependency BETWEEN the
         // same two dense kernels; incoming and outgoing fences stay outside it.
@@ -5846,13 +6175,39 @@ private enum Gemma4ZipRouterV1 {
             Gemma4FusedLayerGlue.denseXSumElideEnabled,
             CBv2DenseMLPQMVV1.compiledPairAvailable
         {
-            let expertScores = router.zipScores(normed)
+            let expertScores = fusedRouter?.scores ?? router.zipScores(normed)
             let denseIn = MLX.depends(input: n1, dependencies: [normed])
             if let denseOut = mlp.zipCompiledGateUpGeluDown(
                 denseIn, expertScores: expertScores)
             {
-                let selected = selectAfterDense(
-                    router: router, expertScores: expertScores, denseOut: denseOut)
+                let selected: (
+                    indices: MLXArray, weights: MLXArray,
+                    table: SwitchRouteTable?
+                )
+                if let fused = fusedRouter {
+                    selected = (
+                        indices: MLX.depends(
+                            input: fused.indices, dependencies: [denseOut]),
+                        weights: MLX.depends(
+                            input: fused.weights, dependencies: [denseOut]),
+                        table: SwitchRouteTable(
+                            rowOrder: MLX.depends(
+                                input: fused.table.rowOrder,
+                                dependencies: [denseOut]),
+                            sortedKeys: MLX.depends(
+                                input: fused.table.sortedKeys,
+                                dependencies: [denseOut]),
+                            inverseOrder: MLX.depends(
+                                input: fused.table.inverseOrder,
+                                dependencies: [denseOut]),
+                            hasExpertPrefixBounds:
+                                fused.table.hasExpertPrefixBounds))
+                } else {
+                    selected = selectAfterDense(
+                        router: router,
+                        expertScores: expertScores,
+                        denseOut: denseOut)
+                }
                 Gemma4RouterProbe.recorder?(expertScores, selected.indices)
                 let expertNorm = MLX.depends(input: n2, dependencies: [denseOut])
                 CBv2EngageMark.once("zip-router")
@@ -5876,7 +6231,7 @@ private enum Gemma4ZipRouterV1 {
         if CBv2DenseMLPQMVV1.denseGeluEpilogueEnabled,
             Gemma4FusedLayerGlue.denseXSumElideEnabled
         {
-            expertScores = router.zipScores(normed)
+            expertScores = fusedRouter?.scores ?? router.zipScores(normed)
             let denseIn = MLX.depends(input: n1, dependencies: [normed])
             if let act = mlp.zipGateUpGelu(denseIn) {
                 fusedActivated = act
@@ -5889,7 +6244,7 @@ private enum Gemma4ZipRouterV1 {
                 up = mlp.zipUp(denseIn, nil)
             }
         } else if Gemma4FusedLayerGlue.denseXSumElideEnabled {
-            expertScores = router.zipScores(normed)
+            expertScores = fusedRouter?.scores ?? router.zipScores(normed)
             let denseIn = MLX.depends(input: n1, dependencies: [normed])
             if let joined = mlp.zipGateUp(denseIn, nil) {
                 (gate, up) = joined
@@ -5940,6 +6295,25 @@ private enum Gemma4ZipRouterV1 {
                 expertScores: expertScores, topKIndices: topKIndices)
         } else {
             denseOut = mlp.zipDown(activated)
+            if let fused = fusedRouter {
+                // The fused producer ran before the dense tail so its score
+                // output could fence the dense trace. Keep the route outputs
+                // on the incumbent post-dense consumer edge without adding a
+                // copy or dispatch.
+                topKIndices = MLX.depends(
+                    input: fused.indices, dependencies: [denseOut])
+                topKWeights = MLX.depends(
+                    input: fused.weights, dependencies: [denseOut])
+                routeTable = SwitchRouteTable(
+                    rowOrder: MLX.depends(
+                        input: fused.table.rowOrder, dependencies: [denseOut]),
+                    sortedKeys: MLX.depends(
+                        input: fused.table.sortedKeys, dependencies: [denseOut]),
+                    inverseOrder: MLX.depends(
+                        input: fused.table.inverseOrder,
+                        dependencies: [denseOut]),
+                    hasExpertPrefixBounds:
+                        fused.table.hasExpertPrefixBounds)
             // GLUE-FOLD: one dispatch emits the top-8 selection, in-register
             // float32 softmax + per-expert scaling, AND the sorted route table,
             // so the standalone rank-scatter launch and the weight tail
@@ -5947,7 +6321,7 @@ private enum Gemma4ZipRouterV1 {
             // The fold consumes the identical fenced scores node the incumbent
             // partition consumed, keeping the tape's ordering edges unchanged.
             // Fail-closed onto the incumbent finalists + slice + weight tail.
-            if let fold = Gemma4RouteGlueFoldV1.apply(
+            } else if let fold = Gemma4RouteGlueFoldV1.apply(
                 MLX.depends(input: expertScores, dependencies: [denseOut]),
                 perExpertScale: router.perExpertScale,
                 topK: router.topK, kth: router.kth)

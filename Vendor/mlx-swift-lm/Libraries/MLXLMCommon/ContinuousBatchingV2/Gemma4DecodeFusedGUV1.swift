@@ -13,15 +13,19 @@ public enum Gemma4DecodeFusedGUV1 {
     /// Runs of three or more are only 14% of runs at real top-8-of-128 routing,
     /// so the rarely-taken wide paths may be taxing the 86% that never run them.
     /// This compiles OUT every impl above the cap.
-    /// DEFAULT 2. Measured single-worker under realistic top-8-of-128 routing:
-    ///   cap4 (incumbent) 0.002927 s/token, cap2 0.002660 = **+9.12%**, zero
-    ///   overlap across five alternating passes, tokens bit-identical.
+    /// DEFAULT 2. An earlier single-worker measurement under realistic
+    /// top-8-of-128 routing read cap4 0.002927 s/token vs cap2 0.002660 =
+    /// +9.12%, zero overlap across five alternating passes, tokens
+    /// bit-identical. That number predates the current crown and was never
+    /// re-measured against it, so it motivates a current-crown retest of
+    /// cap2; it is NOT proof that cap2 still wins here.
     /// Runs of three or more are only 14% of runs, but the triple and quad
     /// impls inline into the same kernel, so their registers were charged to
     /// the 86% of threadgroups that never execute them.
-    /// `DARKBLOOM_GEMMA4_GU_RUN_CAP=4` restores the incumbent.
+    /// `DARKBLOOM_GEMMA4_GU_RUN_CAP=4` is the kill switch: it restores the
+    /// cap4 incumbent without a rebuild.
     static let runCap: Int = {
-        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_RUN_CAP"] ?? "4"
+        let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GU_RUN_CAP"] ?? "2"
         return Int(raw).map { min(max($0, 1), 4) } ?? 2
     }()
 

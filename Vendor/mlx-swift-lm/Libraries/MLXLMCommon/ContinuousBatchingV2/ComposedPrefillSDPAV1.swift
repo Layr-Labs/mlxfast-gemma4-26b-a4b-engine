@@ -704,6 +704,49 @@ enum CBv2PrefillSoftmaxVecV1 {
         return max(1, min(640 / threadgroupSize, 1024 / threadgroupSize))
     }
 
+    // These values are immutable launch metadata. Keeping the common key
+    // lengths resident avoids rebuilding and evaluating the params carrier
+    // for every prefill rectangle.
+    nonisolated(unsafe) private static let precomputedParams: [Int: MLXArray] = {
+        var table: [Int: MLXArray] = [:]
+        for axis in [128, 256, 384, 512, 640, 768, 896, 1024] {
+            let tg = ((axis + 3) / 4 + 31) / 32 * 32
+            let numSimdgroups = tg / 32
+            let arr = MLXArray([UInt32(axis), UInt32(numSimdgroups)])
+            eval(arr)
+            table[axis] = arr
+        }
+        return table
+    }()
+
+    nonisolated(unsafe) private static let precomputedCausalParams: [Int: MLXArray] = {
+        var table: [Int: MLXArray] = [:]
+        for axis in [128, 256, 384, 512, 640, 768, 896, 1024] {
+            let tg = ((axis + 3) / 4 + 31) / 32 * 32
+            let numSimdgroups = tg / 32
+            let arr = MLXArray([UInt32(axis), UInt32(numSimdgroups), UInt32(128)])
+            eval(arr)
+            table[axis] = arr
+        }
+        return table
+    }()
+
+    @inline(__always)
+    fileprivate static func getParams(axisSize: Int, numSimdgroups: Int) -> MLXArray {
+        if let hit = precomputedParams[axisSize] {
+            return hit
+        }
+        return MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+    }
+
+    @inline(__always)
+    fileprivate static func getCausalParams(axisSize: Int, numSimdgroups: Int, causalLen: Int) -> MLXArray {
+        if causalLen == 128, let hit = precomputedCausalParams[axisSize] {
+            return hit
+        }
+        return MLXArray([UInt32(axisSize), UInt32(numSimdgroups), UInt32(causalLen)])
+    }
+
     /// Runs the vectorized softmax, or returns nil to keep the caller on
     /// the stock `MLX.softmax(scores, axis: -1, precise: true)` call.
     /// `scores` may be any contiguous rank; it is treated as a flat
@@ -721,7 +764,7 @@ enum CBv2PrefillSoftmaxVecV1 {
         let threadgroupSize = ((axisSize + 3) / 4 + 31) / 32 * 32
         guard threadgroupSize > 0, threadgroupSize <= 1024 else { return nil }
         let numSimdgroups = threadgroupSize / 32
-        let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        let paramsArray = getParams(axisSize: axisSize, numSimdgroups: numSimdgroups)
 
         // PROMPT-GLUE2 (pg2): prompt-width score rectangles take the
         // rows-per-threadgroup twin; the incumbent computes the identical
@@ -827,6 +870,13 @@ enum CBv2PrefillAttnTrafficV1 {
         ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_PREFILL_ATTN_TRAFFIC_XCHECK"]
         == "1"
 
+    static let causalStatsEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_CAUSAL_STATS_ELIDE_DRAM_V1"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// softmax.cpp's SOFTMAX_LOOPED_LIMIT: the transcribed block kernel.
     private static let maxKeyLength = 4096
 
@@ -871,6 +921,80 @@ enum CBv2PrefillAttnTrafficV1 {
         return text.replacingOccurrences(of: store, with: statsStore)
     }()
 
+    /// PREFILL-CAUSAL-STATS (at2). The at1 statistics text with its single
+    /// per-lane score load guarded by the row's causal length instead of the
+    /// full key length. `params[2]` carries the query block's row count `L`
+    /// (0 keeps the at1 guard exactly), and the caller only sets it for the
+    /// composed path's own `causalMaskBias(L:kL:)` rectangle, whose admitted
+    /// set is `k <= kL - L + row`.
+    ///
+    /// A lane owns the four consecutive words at `base`; when
+    /// `base >= kL - L + row + 1` all four were written by the mask, so each
+    /// one is the bf16 word `0xFF7F` -- widened, the fp32 bit pattern
+    /// `0xFF7F0000`. Substituting that constant in registers feeds the max
+    /// tree and the sum tree the identical operand the load would have
+    /// produced, over the identical lane set, so both reductions and the
+    /// stored `maxval`/`normalizer` pair are bit-identical. Only the DRAM
+    /// read disappears: the masked half of the score rectangle is never
+    /// fetched by this pass.
+    private static let causalStatsSource: String? = statsSource.flatMap { text in
+        let load = [
+            "float ld[4];",
+            "const int base = lid * 4;",
+            "const bool row_valid = base < axis_size;",
+            "const device T* row_in = scores + size_t(gid) * axis_size;",
+            "if (row_valid) {",
+            "    T4 raw = *reinterpret_cast<const device T4*>(row_in + base);",
+            "    #pragma unroll",
+            "    for (int i = 0; i < 4; i++) {",
+            "        ld[i] = static_cast<float>(raw[i]);",
+            "    }",
+            "} else {",
+            "    #pragma unroll",
+            "    for (int i = 0; i < 4; i++) {",
+            "        ld[i] = -INFINITY;",
+            "    }",
+            "}",
+        ].joined(separator: "\n")
+        let causalLoad = [
+            "// PREFILL-CAUSAL-STATS (at2): the causal length of this row.",
+            "// params[2] == 0 restores the at1 guard.",
+            "const int causal_rows = int(params[2]);",
+            "const int causal_len = (causal_rows > 0)",
+            "    ? (axis_size - causal_rows + (gid % causal_rows) + 1)",
+            "    : axis_size;",
+            "float ld[4];",
+            "const int base = lid * 4;",
+            "const bool row_valid = base < causal_len;",
+            "const device T* row_in = scores + size_t(gid) * axis_size;",
+            "if (row_valid) {",
+            "    T4 raw = *reinterpret_cast<const device T4*>(row_in + base);",
+            "    #pragma unroll",
+            "    for (int i = 0; i < 4; i++) {",
+            "        ld[i] = static_cast<float>(raw[i]);",
+            "    }",
+            "} else if (base < axis_size) {",
+            "    // Every word here was written by the causal mask, so it is",
+            "    // bf16 0xFF7F; 0xFF7F0000 is that word widened to fp32.",
+            "    const float masked = as_type<float>(0xFF7F0000u);",
+            "    #pragma unroll",
+            "    for (int i = 0; i < 4; i++) {",
+            "        ld[i] = masked;",
+            "    }",
+            "} else {",
+            "    #pragma unroll",
+            "    for (int i = 0; i < 4; i++) {",
+            "        ld[i] = -INFINITY;",
+            "    }",
+            "}",
+        ].joined(separator: "\n")
+        // Anchor must occur exactly once. On drift the at2 twin is simply
+        // absent and every call falls back to the at1 kernel; nothing is
+        // written to any stream inside the scored process.
+        guard text.components(separatedBy: load).count == 2 else { return nil }
+        return text.replacingOccurrences(of: load, with: causalLoad)
+    }
+
     private static let statsKernel: MLXFast.MLXFastKernel? = statsSource.map { source in
         MLXFast.metalKernel(
             name: "cbv2_prefill_sdpa_softmax_stats_bf16_at1",
@@ -881,11 +1005,30 @@ enum CBv2PrefillAttnTrafficV1 {
         )
     }
 
+    /// Separate name: `CustomKernel::eval_gpu` caches compiled pipelines by
+    /// name and calls `clear_library` on a name/source mismatch, so the at2
+    /// body cannot ship under the at1 name.
+    private static let causalStatsKernel: MLXFast.MLXFastKernel? =
+        causalStatsSource.map { source in
+            MLXFast.metalKernel(
+                name: "cbv2_prefill_sdpa_softmax_stats_bf16_at2",
+                inputNames: ["scores", "params"],
+                outputNames: ["stats"],
+                source: source,
+                ensureRowContiguous: true
+            )
+        }
+
     /// The incumbent per-row softmax statistics and launch geometry.
     /// `scores` is the row-contiguous `[.., L, kL]` score rectangle of one
     /// query block, `values` the `[.., kL, D]` operand the incumbent
     /// `matmul` takes.
-    static func statistics(scores: MLXArray, values: MLXArray) -> MLXArray? {
+    /// `causalRows` is the query block's row count when the caller masked the
+    /// rectangle with `causalMaskBias(L:kL:)`, and nil otherwise; it enables
+    /// the at2 load guard and nothing else.
+    static func statistics(
+        scores: MLXArray, values: MLXArray, causalRows: Int? = nil
+    ) -> MLXArray? {
         guard enabled, CBv2PrefillSoftmaxVecV1.enabled, let statsKernel else { return nil }
         guard scores.dtype == .bfloat16, values.dtype == .bfloat16 else { return nil }
         guard scores.ndim >= 2, values.ndim == scores.ndim else { return nil }
@@ -908,12 +1051,31 @@ enum CBv2PrefillAttnTrafficV1 {
         let rows = CBv2PrefillSoftmaxVecV1.rowsPerThreadgroup(
             axisSize: axisSize, threadgroupSize: threadgroupSize)
         guard rows >= 1, rows * threadgroupSize <= 1024 else { return nil }
-        let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        // at2 needs the row's causal length, so it needs the block's own row
+        // count to recover `gid % L`; refuse the skip unless the caller's L
+        // is the rectangle's own second-to-last extent and the mask can only
+        // be the composed path's `kL >= L` causal one.
+        var causalLen = 0
+        if causalStatsEnabled, causalStatsKernel != nil, let causalRows,
+            causalRows == L, axisSize >= L, L > 0, nRows % L == 0
+        {
+            causalLen = L
+        }
+        // Off, the at1 dispatch is restored byte for byte: same kernel, same
+        // two-element params buffer.
+        let paramsArray =
+            causalLen > 0
+            ? CBv2PrefillSoftmaxVecV1.getCausalParams(
+                axisSize: axisSize, numSimdgroups: numSimdgroups, causalLen: causalLen)
+            : CBv2PrefillSoftmaxVecV1.getParams(
+                axisSize: axisSize, numSimdgroups: numSimdgroups)
         var statsShape = scores.shape
         statsShape[statsShape.count - 1] = 4
 
         CBv2EngageMark.once("prefill-attn-traffic")
-        let stats = statsKernel(
+        if causalLen > 0 { CBv2EngageMark.once("prefill-causal-stats") }
+        let selectedKernel = causalLen > 0 ? (causalStatsKernel ?? statsKernel) : statsKernel
+        let stats = selectedKernel(
             [scores, paramsArray],
             template: [("T", scores.dtype), ("RPT", rows)],
             grid: (threadgroupSize * nRows, 1, 1),
@@ -924,8 +1086,11 @@ enum CBv2PrefillAttnTrafficV1 {
         return stats
     }
 
-    static func attend(scores: MLXArray, values: MLXArray) -> MLXArray? {
-        guard let stats = statistics(scores: scores, values: values) else { return nil }
+    static func attend(
+        scores: MLXArray, values: MLXArray, causalRows: Int? = nil
+    ) -> MLXArray? {
+        guard let stats = statistics(scores: scores, values: values, causalRows: causalRows)
+        else { return nil }
         let axisSize = scores.dim(-1)
         let D = values.dim(-1)
         let nRows = scores.size / axisSize

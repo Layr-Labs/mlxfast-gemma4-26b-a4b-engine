@@ -43,6 +43,42 @@ public enum Gemma4DownTightGridV1 {
     static let packedWordLoads =
         ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_PACKED_WORD_LOAD"] != "0"
 
+    /// DOWN-QUAD-ALIGN. The packed row pitch of this plane is 88 words = 352
+    /// bytes, which is 2.75 device cache lines, so three of every four rows a
+    /// simdgroup accumulates begin off a 128-byte boundary and each of their
+    /// 32-lane code loads is split across two lines. Reordering the four rows
+    /// of one aligned output quad -- 4 x 88 = 352 words = eleven whole 32-word
+    /// blocks -- puts every full-width load of the main walk on a boundary.
+    /// Storage order only: the same lane reads the same word for the same
+    /// logical (row, code-octet), so the qdot chain, the per-row accumulation
+    /// order and the SIMD reduction are untouched.
+    static let quadAlignedStorage: Bool = {
+        #if os(macOS)
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_QUAD_ALIGN"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+        #else
+        return false
+        #endif
+    }()
+
+    /// Reorder each aligned quad of four output rows into eleven 32-word
+    /// blocks. Word `j` of quad row `r` moves from `r * 88 + j` to
+    /// `r * 32 + j` for `j < 32`, `128 + r * 32 + (j - 32)` for `32 <= j < 64`
+    /// and `256 + r * 24 + (j - 64)` for `j >= 64`. That is a bijection on the
+    /// 352 words of a quad, so every code word survives exactly once and no
+    /// value, scale, bias or group boundary moves.
+    static func quadAlignedWeight(_ w: MLXArray) -> MLXArray {
+        let quads = w.reshaped([128, 704, 4, 88])
+        let head = quads[.ellipsis, 0 ..< 32].reshaped([128, 704, 128])
+        let mid = quads[.ellipsis, 32 ..< 64].reshaped([128, 704, 128])
+        let tail = quads[.ellipsis, 64 ..< 88].reshaped([128, 704, 96])
+        let packed = MLX.concatenated([head, mid, tail], axis: 2)
+            .reshaped([128, 2816, 88])
+        eval(packed)
+        return packed
+    }
+
     private static let compiledGateUpEnabled =
         ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_COMPILED_GU_DOWN"] != "0"
 
@@ -85,7 +121,8 @@ public enum Gemma4DownTightGridV1 {
                 scales.dtype == .bfloat16 && scales.shape == [128, 2816, 11],
                 biases.dtype == .bfloat16 && biases.shape == scales.shape
             else { return nil }
-            self.weight = weight
+            self.weight = Gemma4DownTightGridV1.quadAlignedStorage
+                ? Gemma4DownTightGridV1.quadAlignedWeight(weight) : weight
             self.scales = scales
             self.biases = biases
         }
@@ -153,6 +190,7 @@ public enum Gemma4DownTightGridV1 {
         MLXFast.metalKernel(
         name: "gemma4_b8_down_qmv_span4_tight_zorder_v2_solo1"
             + (packedWordLoads ? "_word32" : "")
+            + (quadAlignedStorage ? "_quadaln_v1" : "")
             + (tagged ? "_tagged_v1" : ""),
         inputNames: ["w", "scales", "biases", "x", "lhs_indices", "rhs_indices"],
         outputNames: ["y"],
@@ -171,7 +209,8 @@ gather_qmv_gemma4_down_tile<T, 64, 4, SPAN>(
     tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
 """#,
         header: "#define DOWN_PACKED_WORD_LOAD \(packedWordLoads ? 1 : 0)\n"
-            + "#define DOWN_TAGGED_ROUTE \(tagged ? 1 : 0)\n" + #"""
+            + "#define DOWN_TAGGED_ROUTE \(tagged ? 1 : 0)\n"
+            + "#define DOWN_QUAD_ALIGN \(quadAlignedStorage ? 1 : 0)\n" + #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helper bodies verified byte-identical to 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -870,7 +909,11 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   #pragma unroll
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
+#if DOWN_QUAD_ALIGN
+      packed[row] = *((const device uint*)(ws + row * (SIMD_SIZE * bytes_per_thread)));
+#else
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+#endif
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
@@ -887,7 +930,11 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
       result1[row] += dot1;
     }
 
+#if DOWN_QUAD_ALIGN
+    ws += results_per_simdgroup * SIMD_SIZE * bytes_per_thread;
+#else
     ws += block_size / 2;
+#endif
     scales += block_size / 64;
     biases += block_size / 64;
     x0 += block_size;
@@ -902,7 +949,11 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
       uint((in_vec_size - k) / values_per_thread);
   if (simd_lid < active_tail_lanes) {
     for (int row = 0; row < results_per_simdgroup; row++) {
+#if DOWN_QUAD_ALIGN
+      packed[row] = *((const device uint*)(ws + row * (int(active_tail_lanes) * bytes_per_thread)));
+#else
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+#endif
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
@@ -970,7 +1021,11 @@ METAL_FUNC void qmv_affine4_g64_solo_impl(
   #pragma unroll
   for (; k <= K - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
+#if DOWN_QUAD_ALIGN
+      packed[row] = *((const device uint*)(ws + row * (SIMD_SIZE * bytes_per_thread)));
+#else
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+#endif
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
@@ -982,7 +1037,11 @@ METAL_FUNC void qmv_affine4_g64_solo_impl(
           packed[row], x0_thread, scale_local[row], bias_local[row], sum0);
     }
 
+#if DOWN_QUAD_ALIGN
+    ws += results_per_simdgroup * SIMD_SIZE * bytes_per_thread;
+#else
     ws += block_size / 2;
+#endif
     scales += block_size / 64;
     biases += block_size / 64;
     x0 += block_size;
@@ -996,7 +1055,11 @@ METAL_FUNC void qmv_affine4_g64_solo_impl(
       uint((K - 512) / values_per_thread);
   if (simd_lid < active_tail_lanes) {
     for (int row = 0; row < results_per_simdgroup; row++) {
+#if DOWN_QUAD_ALIGN
+      packed[row] = *((const device uint*)(ws + row * (int(active_tail_lanes) * bytes_per_thread)));
+#else
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+#endif
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }

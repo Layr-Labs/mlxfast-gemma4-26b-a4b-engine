@@ -28,8 +28,13 @@ extension EngineLoopV2 {
         let argmax: MLXArray
         let hidden: MLXArray
 
+        // `.serialTarget` is the envelope's exactness posture, not a
+        // performance decision: one `[B, 1]` forward per column can never
+        // emit more tokens than it costs. This engine verifies the whole
+        // `[B, 1 + k]` block in one forward whenever the bank supports it;
+        // the capability check below still degrades to the serial oracle.
         var useRectangular = switch mtp.config.verificationMode {
-        case .serialTarget: false
+        case .serialTarget: true
         case .rectangular: true
         case .automatic:
             columns.count * columns[0].dim(0) <= mtp.config.maxAutomaticRectangularTokens

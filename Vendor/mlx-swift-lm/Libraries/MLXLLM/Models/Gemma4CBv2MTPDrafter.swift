@@ -380,9 +380,12 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         let sinB = sinRows.reshaped(sinBroadcastShape)
         let aRot = a * cosB - b * sinB
         let bRot = a * sinB + b * cosB
+        // Restore the full lead shape (`[B, L]`), not only `prefixLead`:
+        // `tail` keeps every lead axis of `flat`, and `concatenated` requires
+        // both operands to have the same rank.
         let rotatedPrefix = MLX.stacked([aRot, bRot], axis: -1)
             .reshaped(Array(prefixShape))
-            .reshaped(Array(prefixLead) + [rotaryPrefix])
+            .reshaped(leadShape + [rotaryPrefix])
         let tail = flat[.ellipsis, rotaryPrefix ..< featureDim]
         return MLX.concatenated([rotatedPrefix, tail], axis: -1)
     }

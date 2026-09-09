@@ -89,6 +89,13 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// graph also reaches the multi-output primitive that produces it.
     var decodeRingWriteFenceEvaluationRoot: MLXArray { decodeRingWriteFence.value }
 
+    /// True while a speculative (MTP) engine drives this cache. The drafter
+    /// capture and every staged verify write read a row through
+    /// `snapshot()`, which refuses a BF16 ring the fused q4 pass left stale,
+    /// so such an engine keeps the incumbent BF16 ring writes instead of
+    /// eliding them. Serial engines keep the elision.
+    var keepsBF16RingAuthoritative = false
+
     private var positionOffsetsState: CBv2PositionOffsetsState
     private var usesUnifiedPositionOffsets = false
     private var advancesPositionOffsets = true
@@ -195,7 +202,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             spanContexts: boundSpanContexts,
             serializeQueries: mtpSerializesRectangularAttention,
             decodeRingWriteFence: decodeRingWriteFence,
-            allowFusedRingWrite: !retainsChunkForBorrowers)
+            allowFusedRingWrite: !retainsChunkForBorrowers,
+            elideBF16RingWrites: !keepsBF16RingAuthoritative)
         // Advance offsets ON-DEVICE. A unified bank elects exactly one owning
         // cache; Gemma snapshots the shared pre-step value before this call.
         if advancesPositionOffsets {

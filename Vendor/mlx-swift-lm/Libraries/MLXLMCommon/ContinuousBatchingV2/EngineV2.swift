@@ -580,7 +580,11 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         // collected every token it wants, and the next phase start installs
         // its own limit before any charged work. Token output is untouched.
         Memory.cacheLimit = 0
-        if Self.fastAckShutdown {
+        // A speculative (MTP) engine drains synchronously: its rounds leave
+        // command buffers in flight that the detached drain does not fence
+        // before process exit, and releasing a Metal command queue with
+        // in-flight buffers traps in libdispatch at teardown.
+        if Self.fastAckShutdown, loop.mtp == nil {
             let loop = self.loop
             // Cancel every live row now, so the detached drain completes at
             // the next step boundary instead of running a begin-only cohort

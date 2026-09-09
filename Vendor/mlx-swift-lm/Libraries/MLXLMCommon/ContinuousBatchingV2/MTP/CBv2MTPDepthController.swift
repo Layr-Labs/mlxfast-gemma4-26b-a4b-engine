@@ -56,7 +56,7 @@ final class CBv2MTPDepthController {
     /// removes those rounds. Every committed token is still produced by an
     /// ordinary target decode step, so the emitted stream stays bit-identical
     /// to serial decode.
-    static let speculationEnabled = false
+    static let speculationEnabled = true
 
     private struct CostState {
         var samples = 0

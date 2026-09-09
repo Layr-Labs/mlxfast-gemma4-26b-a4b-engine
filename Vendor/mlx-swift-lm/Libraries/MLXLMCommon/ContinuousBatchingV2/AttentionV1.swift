@@ -464,7 +464,8 @@ enum CBv2AttentionV1 {
         spanContexts: [CBv2SpanChunkContext?]? = nil,
         serializeQueries: Bool = false,
         decodeRingWriteFence: CBv2DecodeRingWriteFence? = nil,
-        allowFusedRingWrite: Bool = false
+        allowFusedRingWrite: Bool = false,
+        elideBF16RingWrites: Bool = true
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -537,8 +538,12 @@ enum CBv2AttentionV1 {
                             // token from the new K/V arrays; on the
                             // quant-authoritative road the BF16 SliceUpdates
                             // are dead graph work, so advance counters only.
-                            // Kill switch restores the incumbent writes.
-                            if CBv2WindowedSequenceKV.q4BF16RingElideEnabled {
+                            // Kill switch restores the incumbent writes, as
+                            // does a speculative engine (see
+                            // `keepsBF16RingAuthoritative`).
+                            if CBv2WindowedSequenceKV.q4BF16RingElideEnabled,
+                                elideBF16RingWrites
+                            {
                                 CBv2EngageMark.once("kvq4-bf16-elide")
                                 for row in ringRows {
                                     row.advanceDecodeRingAfterQuantWrite()

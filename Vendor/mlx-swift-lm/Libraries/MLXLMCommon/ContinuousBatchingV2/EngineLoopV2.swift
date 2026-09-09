@@ -1321,6 +1321,13 @@ public final class EngineLoopV2: @unchecked Sendable {
             eagerCompositionStale = false
         }
         let caches = cacheProvider.layerCaches(rowStates: rowStates)
+        if mtp != nil {
+            // Drafter captures and staged verify writes snapshot the BF16
+            // rings every round; the fused q4 pass must not leave them stale.
+            for cache in caches {
+                (cache as? CBv2LayerCache)?.keepsBF16RingAuthoritative = true
+            }
+        }
         return caches
     }
 
@@ -1344,6 +1351,23 @@ public final class EngineLoopV2: @unchecked Sendable {
         if cbv2CompactDecodeRootsEnabled,
             let compact = model.compactDecodeEvaluationRoots(
                 forwardOutput: logitsRoot, caches: caches)
+        {
+            return compact
+        }
+        return eagerCacheInnerState(caches)
+    }
+
+    /// Fused-argmax counterpart of `eagerDecodeEvaluationRoots`. The `[B]`
+    /// token graph is a separate output from the logits plane, so the model
+    /// answers the argmax-specific proof; the same kill switch applies and
+    /// nil keeps the full cache inner state.
+    func eagerArgmaxDecodeEvaluationRoots(
+        _ caches: [CBv2AttendingLayerCache], tokensRoot: MLXArray,
+        model fusedModel: any CBv2ArgmaxDecodeSteppableModel
+    ) -> [MLXArray] {
+        if cbv2CompactDecodeRootsEnabled,
+            let compact = fusedModel.compactArgmaxDecodeEvaluationRoots(
+                forwardOutput: tokensRoot, caches: caches)
         {
             return compact
         }
@@ -1558,7 +1582,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         {
             let caches = eagerCaches(rowStates: rowStates)
             sampled = fusedModel.decodeArgmax(tokens: inputs, caches: caches)
-            cacheInnerState = eagerCacheInnerState(caches)
+            cacheInnerState = eagerArgmaxDecodeEvaluationRoots(
+                caches, tokensRoot: sampled, model: fusedModel)
             stepLogprobs = nil
             fusedSampler.noteFusedGreedySample()
             if CBv2StepProfiler.enabled {

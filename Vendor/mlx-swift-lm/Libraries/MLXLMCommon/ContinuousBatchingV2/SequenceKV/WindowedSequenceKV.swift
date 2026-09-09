@@ -102,6 +102,20 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// authoritative and self-consistent.
     private(set) var bf16RingStale = false
 
+    /// Q4-BF16-ELIDE evidence for root compaction: true only while the most
+    /// recent mutation was `advanceDecodeRingAfterQuantWrite`, whose mirror
+    /// store the fused pass orders through the layer fence and whose output
+    /// the attention consumes. Every other write path leaves an unread
+    /// SliceUpdate on the mirror or the BF16 ring, so it clears this flag.
+    private var fusedQuantWriteCoversMirror = false
+
+    /// A row qualifies for output-rooted evaluation when nothing is armed or
+    /// staged and either no mirror exists or the latest write proved itself.
+    public var decodeOutputCoversSideState: Bool {
+        !speculativeWriteArmed && staged == nil
+            && (quantMirror == nil || fusedQuantWriteCoversMirror)
+    }
+
     /// `MLX_KV_QUANT=0` disables the quantized-ring read path wholesale
     /// (mirror never allocated, kernels take the established bf16 road).
     /// Default ON. `MLX_` prefix: the worker env sanitizer only passes
@@ -205,6 +219,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         if speculativeWriteArmed {
             return stageSpeculativeUpdate(newKeys: newKeys, newValues: newValues, count: n)
         }
+        fusedQuantWriteCoversMirror = false
         precondition(
             !bf16RingStale,
             "CBv2WindowedSequenceKV: update after fused quant elided writes — "
@@ -276,6 +291,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             staged == nil && newKeys.dim(2) == 1 && newValues.dim(2) == 1
                 && keys != nil && values != nil && retainedCount == window)
         borrowableChunkViews = nil
+        fusedQuantWriteCoversMirror = false
         writeRing(keys!, tokens: newKeys, firstPosition: absoluteOffset)
         writeRing(values!, tokens: newValues, firstPosition: absoluteOffset)
         absoluteOffset += 1
@@ -295,6 +311,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             "CBv2WindowedSequenceKV: fused quant advance outside a full-ring decode step")
         borrowableChunkViews = nil
         bf16RingStale = true
+        fusedQuantWriteCoversMirror = true
         absoluteOffset += 1
         oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
     }
@@ -347,6 +364,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             staged == nil && keys != nil && retainedCount == window,
             "CBv2WindowedSequenceKV: fused ring advance outside a full-ring decode step")
         borrowableChunkViews = nil
+        fusedQuantWriteCoversMirror = false
         // KVQ-DIAG: dispatch the quantized reader on the full ring this step
         // just advanced past, and discard the result. WRITE-016 owns the
         // steady-state decode write, so this is where the probe belongs.
@@ -436,6 +454,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         // (cancelled) row writes nothing.
         let confirmed = absoluteOffset - staged.basePosition
         if confirmed > 0 {
+            fusedQuantWriteCoversMirror = false
             allocateIfNeeded(keyTemplate: staged.keys, valueTemplate: staged.values)
             let writeCount = min(confirmed, window)
             let skip = confirmed - writeCount
@@ -557,6 +576,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             !speculativeWriteArmed && staged == nil,
             "CBv2WindowedSequenceKV.fastForward with a speculative write pending")
         precondition(offset >= absoluteOffset, "fastForward cannot move backwards")
+        fusedQuantWriteCoversMirror = false
         absoluteOffset = offset
         oldestValidPosition = offset
     }
@@ -584,6 +604,9 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         // in-window entries (slot aliasing at distance `window`), so the
         // window shrinks until refilled. Pre-wrap, oldestValidPosition is
         // still the initial offset and the rollback is a full recovery.
+        // The next write cannot take the full-ring fused path, so the
+        // historical elision proves nothing about it.
+        fusedQuantWriteCoversMirror = false
         absoluteOffset -= n
         // Any captured pre-eviction chunk views now cover rolled-back
         // positions — invalidate so borrowing falls back to the ring.
@@ -598,6 +621,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
 
     private func writeDecodeToken(keys newKeys: MLXArray, values newValues: MLXArray) {
         borrowableChunkViews = nil
+        fusedQuantWriteCoversMirror = false
         // KVQ-PAIRWRITE: when both mirror planes go out together the ring
         // writes carry no mirror plane of their own.
         let paired = writePairedMirror(
@@ -1898,6 +1922,7 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         keys newKeys: MLXArray, values newValues: MLXArray, packedMirror: MLXArray
     ) -> (MLXArray, MLXArray) {
         Self.selfTestKVQ4()
+        fusedQuantWriteCoversMirror = false
         keys = newKeys
         values = newValues
         quantMirror = packedMirror

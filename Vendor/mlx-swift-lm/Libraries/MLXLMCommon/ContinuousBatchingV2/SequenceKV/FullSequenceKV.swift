@@ -195,6 +195,11 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
     public private(set) var absoluteOffset: Int = 0
     public var retainedCount: Int { absoluteOffset }
 
+    /// Full rows own no side plane: private or pooled K/V is the only storage,
+    /// and every append is either read by this step's attention or ordered by
+    /// the owning layer's fused-append fence.
+    public var decodeOutputCoversSideState: Bool { true }
+
     /// Hard cap on this sequence's length; growth beyond it is an engine
     /// admission bug and traps.
     public let maxLength: Int

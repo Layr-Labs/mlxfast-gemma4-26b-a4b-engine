@@ -224,7 +224,10 @@ final class CBv2MTPRoundDriver {
         // the controller keeps choosing 0…this per round.
         self.depthController = CBv2MTPDepthController(
             maxDepth: Self.effectiveDraftCeiling(envelopeMax: config.maxDraftTokens),
-            fixedDepth: config.fixedDraftTokens)
+            // MEASUREMENT: pin the depth at the ceiling so every round drafts k
+            // tokens and the acceptance rate of the pinned head is observable.
+            fixedDepth: config.fixedDraftTokens
+                ?? Self.effectiveDraftCeiling(envelopeMax: config.maxDraftTokens))
         self.metrics.verificationMode = config.verificationMode
         self.metrics.maxAutomaticRectangularTokens = config.maxAutomaticRectangularTokens
     }

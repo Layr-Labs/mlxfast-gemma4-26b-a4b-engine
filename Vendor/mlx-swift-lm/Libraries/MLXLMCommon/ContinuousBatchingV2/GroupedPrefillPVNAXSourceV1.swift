@@ -1272,9 +1272,25 @@ auto gemm_loop_softmax(
       const int A_offset = transpose_a ? k * lda : k;
       const int B_offset = transpose_b ? k : k * ldb;
 
-      Atile.load_safe(A + A_offset, lda, Aklims);
+      if constexpr (kAlignedM) {
+        if (psk >= SK) {
+          Atile.load(A + A_offset, lda);
+        } else {
+          Atile.load_safe(A + A_offset, lda, Aklims);
+        }
+      } else {
+        Atile.load_safe(A + A_offset, lda, Aklims);
+      }
       softmax_transform_atile(Atile, sm_rmax, sm_rinv, sm_sc, sgp_sm, psk);
-      Btile.load_safe(B + B_offset, ldb, Bklims);
+      if constexpr (kAlignedN) {
+        if (psk >= SK) {
+          Btile.load(B + B_offset, ldb);
+        } else {
+          Btile.load_safe(B + B_offset, ldb, Bklims);
+        }
+      } else {
+        Btile.load_safe(B + B_offset, ldb, Bklims);
+      }
 
       tile_matmad_nax(
           Dtile,

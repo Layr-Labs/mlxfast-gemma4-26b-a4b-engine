@@ -1643,6 +1643,29 @@ public class SwitchGLU: Module {
         sortedPlane: SwitchSortedPlaneProducer? = nil,
         routeTable: SwitchRouteTable? = nil
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
+        // The pre-norm fallback is already the compact, unsorted token plane.
+        // Gather its rows inside the unchanged NAX contraction, so the sorted
+        // producer need not materialize eight copies of each normalized row.
+        if Gemma4CompactExpertInputV1.available, sortedPlane != nil,
+            inputDims == 2816, hiddenDims == 704, numExperts == 128,
+            weightedReductionProfile == .gemma4ProductionGeGLU,
+            gateUpProj == nil, activationProduct == nil, isGeluActivation,
+            x.ndim == 2, x.dim(1) == 2816, x.dtype == .bfloat16,
+            indices.ndim == 2, indices.shape == [x.dim(0), 8],
+            indices.dtype == .uint32, indices.size >= 512, indices.size % 64 == 0,
+            let fused = fusedGateUpDispatch(),
+            fused.groupSize == 64, fused.bits == 4, fused.mode == .affine
+        {
+            let order = gatherSortOrder(indices: indices, numExperts: numExperts)
+            if let activated = Gemma4CompactExpertInputV1.apply(
+                x, rowOrder: order.rowOrder, sortedKeys: order.sortedKeys,
+                storage: fused.storage)
+            {
+                return (
+                    downProj(activated, order.sortedKeys, sortedIndices: true),
+                    order.inverseOrder, true)
+            }
+        }
         let useLhsIndices =
             indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
             && x.ndim == 2 && x.shape == [8, inputDims]

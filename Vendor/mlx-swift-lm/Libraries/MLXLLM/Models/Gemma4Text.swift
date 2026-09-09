@@ -7086,11 +7086,12 @@ public class Gemma4TextModelInner: Module {
     /// Used by the shared-KV capture hook for the MTP drafter.
     let lastFullAttentionNonSharedIdx: Int
     let lastSlidingAttentionNonSharedIdx: Int
-    /// Engine-thread-confined scratch for the layer-to-layer KV-sharing
-    /// carriers. The array storage is reused only for the scored serial
-    /// CBv2 decode geometry; values are reset before each layer reads them.
+    /// A one-slot pool for layer-to-layer KV-sharing scratch. A forward takes
+    /// exclusive ownership of the array: constructor warmup can outlive its
+    /// bounded drain and overlap another forward on the same model.
     private var reusableIntermediates:
         [(kv: (MLXArray, MLXArray)?, positionOffset: Gemma4.PositionOffset?)] = []
+    private let intermediatesPoolLock = NSLock()
 
     public init(
         _ config: Gemma4TextConfiguration, forceSharedKV: Bool = false,
@@ -7424,17 +7425,25 @@ public class Gemma4TextModelInner: Module {
         let reuseDecodeIntermediates =
             gemma4DecodeIntermediatesReuseEnabled
             && isCBv2 && inputBatchSize == 8 && inputLength == 1
+        var intermediates:
+            [(kv: (MLXArray, MLXArray)?, positionOffset: Gemma4.PositionOffset?)] = []
         if reuseDecodeIntermediates {
-            if reusableIntermediates.count != config.numHiddenLayers {
-                reusableIntermediates = Array(
-                    repeating: (kv: nil, positionOffset: nil),
-                    count: config.numHiddenLayers)
-            }
+            intermediatesPoolLock.lock()
+            swap(&intermediates, &reusableIntermediates)
+            intermediatesPoolLock.unlock()
             CBv2EngageMark.once("gemma4-decode-intermediate-buffer")
-        } else {
-            reusableIntermediates = Array(
+        }
+        if intermediates.count != config.numHiddenLayers {
+            intermediates = Array(
                 repeating: (kv: nil, positionOffset: nil),
                 count: config.numHiddenLayers)
+        }
+        defer {
+            if reuseDecodeIntermediates {
+                intermediatesPoolLock.lock()
+                swap(&intermediates, &reusableIntermediates)
+                intermediatesPoolLock.unlock()
+            }
         }
 
         // GLUE-003: one chain box per forward; layer L's fused tail hands
@@ -7446,11 +7455,11 @@ public class Gemma4TextModelInner: Module {
         for (idx, layer) in layers.enumerated() {
             let prevIdx = previousKvs[idx]
             if reuseDecodeIntermediates {
-                reusableIntermediates[idx] = (kv: nil, positionOffset: nil)
+                intermediates[idx] = (kv: nil, positionOffset: nil)
             }
 
-            let sharedKV = reusableIntermediates[prevIdx].kv
-            let sharedPositionOffset = reusableIntermediates[prevIdx].positionOffset
+            let sharedKV = intermediates[prevIdx].kv
+            let sharedPositionOffset = intermediates[prevIdx].positionOffset
 
             // CBv2: KV-shared layers attend by borrowing the SOURCE layer's
             // cache object (attendBorrowing) instead of consuming raw K/V
@@ -7502,7 +7511,7 @@ public class Gemma4TextModelInner: Module {
                     && !capturePreNorm && dFlashHiddenCapture == nil
             )
             h = out
-            reusableIntermediates[idx] = (kvPair, positionOffset)
+            intermediates[idx] = (kvPair, positionOffset)
             captureHook?(idx, kvPair)
             dFlashHiddenCapture?.capture(h, layer: idx)
 

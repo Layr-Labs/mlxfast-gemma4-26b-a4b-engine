@@ -43,6 +43,13 @@ public enum Gemma4DownTightGridV1 {
     static let packedWordLoads =
         ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_PACKED_WORD_LOAD"] != "0"
 
+    /// DOWN-STORE-VEC8: let lanes 0..3 store rows 0..3 of each simdgroup's
+    /// reduced outputs instead of lane 0 storing all four scalarly. Every lane
+    /// already holds every row total (simd_sum is collective), so the values
+    /// are identical and adjacent lanes form one coalesced write per plane.
+    static let storeVec8Enabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DOWN_STORE_VEC8"] != "0"
+
     private static let compiledGateUpEnabled =
         ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_COMPILED_GU_DOWN"] != "0"
 
@@ -135,7 +142,10 @@ public enum Gemma4DownTightGridV1 {
     static func call(
         _ inputs: [MLXArray], span: Int, taggedRoute: Bool = false
     ) -> MLXArray {
-        (taggedRoute ? kernelTagged : kernel)(
+        if storeVec8Enabled { CBv2EngageMark.once("down-store-vec8") }
+        return (taggedRoute
+            ? (storeVec8Enabled ? kernelTagged : kernelLegacyTagged)
+            : (storeVec8Enabled ? kernel : kernelLegacy))(
             inputs,
             template: [("T", DType.bfloat16), ("SPAN", span)],
             grid: (32, (352 / span) * 2, 64), threadGroup: (32, 2, 1),
@@ -149,11 +159,12 @@ public enum Gemma4DownTightGridV1 {
     /// reads of `rhs_indices` -- can never execute, yet they inline into the
     /// tile helper and are charged to every threadgroup. Selected per call from
     /// the producer's own contract; distinct kernel name; bit-identical output.
-    private static func makeKernel(tagged: Bool) -> MLXFast.MLXFastKernel {
+    private static func makeKernel(tagged: Bool, storeVec8: Bool = true) -> MLXFast.MLXFastKernel {
         MLXFast.metalKernel(
         name: "gemma4_b8_down_qmv_span4_tight_zorder_v2_solo1"
             + (packedWordLoads ? "_word32" : "")
-            + (tagged ? "_tagged_v1" : ""),
+            + (tagged ? "_tagged_v1" : "")
+            + (storeVec8 ? "_stv8" : ""),
         inputNames: ["w", "scales", "biases", "x", "lhs_indices", "rhs_indices"],
         outputNames: ["y"],
         source: #"""
@@ -171,7 +182,8 @@ gather_qmv_gemma4_down_tile<T, 64, 4, SPAN>(
     tid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
 """#,
         header: "#define DOWN_PACKED_WORD_LOAD \(packedWordLoads ? 1 : 0)\n"
-            + "#define DOWN_TAGGED_ROUTE \(tagged ? 1 : 0)\n" + #"""
+            + "#define DOWN_TAGGED_ROUTE \(tagged ? 1 : 0)\n"
+            + "#define DOWN_STORE_VEC8 \(storeVec8 ? 1 : 0)\n" + #"""
 // Copyright © 2023-2024 Apple Inc. Canonical helper bodies verified byte-identical to 093e716.
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -924,11 +936,23 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
     result1[row] = simd_sum(result1[row]);
+  }
+#if DOWN_STORE_VEC8
+  // simd_sum is collective: every lane holds every row total, so lanes
+  // 0..3 storing rows 0..3 writes identical values as one coalesced 8B
+  // write per plane instead of scattered scalar stores from lane 0.
+  if (simd_lid < results_per_simdgroup) {
+    y0[simd_lid] = static_cast<T>(result0[simd_lid]);
+    y1[simd_lid] = static_cast<T>(result1[simd_lid]);
+  }
+#else
+  for (int row = 0; row < results_per_simdgroup; row++) {
     if (simd_lid == 0) {
       y0[row] = static_cast<T>(result0[row]);
       y1[row] = static_cast<T>(result1[row]);
     }
   }
+#endif
 }
 
 template <typename T, const int group_size, const int bits, const int K = 704, const int N = 2816>
@@ -1011,10 +1035,19 @@ METAL_FUNC void qmv_affine4_g64_solo_impl(
 
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
+  }
+#if DOWN_STORE_VEC8
+  // Same coalescing as the pair impl: identical values, one 8B write.
+  if (simd_lid < results_per_simdgroup) {
+    y0[simd_lid] = static_cast<T>(result0[simd_lid]);
+  }
+#else
+  for (int row = 0; row < results_per_simdgroup; row++) {
     if (simd_lid == 0) {
       y0[row] = static_cast<T>(result0[row]);
     }
   }
+#endif
 }
 
 template <typename T, int group_size, int bits, int span>
@@ -1126,4 +1159,6 @@ constant int gemma4_tight_down_N=2816;
 
     private static let kernel: MLXFast.MLXFastKernel = makeKernel(tagged: false)
     private static let kernelTagged: MLXFast.MLXFastKernel = makeKernel(tagged: true)
+    private static let kernelLegacy: MLXFast.MLXFastKernel = makeKernel(tagged: false, storeVec8: false)
+    private static let kernelLegacyTagged: MLXFast.MLXFastKernel = makeKernel(tagged: true, storeVec8: false)
 }

@@ -1264,17 +1264,48 @@ auto gemm_loop_softmax(
       const int k = kk1;
       const short psk = max(0, rem_bk - k);
 
-      const short2 Aklims =
-          transpose_a ? short2(sgp_sm, psk) : short2(psk, sgp_sm);
-      const short2 Bklims =
-          transpose_b ? short2(psk, sgp_sn) : short2(sgp_sn, psk);
+      if constexpr (kAlignedM) {
+        if (psk >= SK) {
+          Atile.load(A + A_offset, lda);
+        } else {
+          Atile.load_safe(A + A_offset, lda, short2(psk, SM));
+        }
+      } else if constexpr (!transpose_a) {
+        if (psk >= SK) {
+          Atile.load_rows(A + A_offset, lda, sgp_sm);
+        } else {
+          Atile.load_safe(A + A_offset, lda, short2(psk, sgp_sm));
+        }
+      } else {
+        const short2 Aklims =
+            transpose_a ? short2(sgp_sm, psk) : short2(psk, sgp_sm);
+        Atile.load_safe(A + A_offset, lda, Aklims);
+      }
+      softmax_transform_atile(
+          Atile,
+          sm_rmax,
+          sm_rinv,
+          sm_sc,
+          kAlignedM ? short(SM) : sgp_sm,
+          psk);
 
-      const int A_offset = transpose_a ? k * lda : k;
-      const int B_offset = transpose_b ? k : k * ldb;
-
-      Atile.load_safe(A + A_offset, lda, Aklims);
-      softmax_transform_atile(Atile, sm_rmax, sm_rinv, sm_sc, sgp_sm, psk);
-      Btile.load_safe(B + B_offset, ldb, Bklims);
+      if constexpr (kAlignedN) {
+        if (psk >= SK) {
+          Btile.load(B + B_offset, ldb);
+        } else {
+          Btile.load_safe(B + B_offset, ldb, short2(SN, psk));
+        }
+      } else if constexpr (transpose_b) {
+        if (psk >= SK) {
+          Btile.load_rows(B + B_offset, ldb, sgp_sn);
+        } else {
+          Btile.load_safe(B + B_offset, ldb, short2(psk, sgp_sn));
+        }
+      } else {
+        const short2 Bklims =
+            transpose_b ? short2(psk, sgp_sn) : short2(sgp_sn, psk);
+        Btile.load_safe(B + B_offset, ldb, Bklims);
+      }
 
       tile_matmad_nax(
           Dtile,

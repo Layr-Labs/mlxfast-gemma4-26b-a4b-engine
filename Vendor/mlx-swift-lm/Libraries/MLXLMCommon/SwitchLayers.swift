@@ -1651,8 +1651,8 @@ public class SwitchGLU: Module {
             && useLhsIndices
             && indices.dtype == .uint32 && x.dtype == .bfloat16
             && expertPrefixBoundsProjectionsEligible
-        var x = MLX.expandedDimensions(x, axes: [-2, -3])
-        let doSort = indices.size >= 64
+        var x = useLhsIndices ? x : MLX.expandedDimensions(x, axes: [-2, -3])
+        let doSort = useLhsIndices || indices.size >= 64
 
         var idx = indices
         // ROUTE-LAZY-INVERSE-ORDER: the sentinel `MLXArray()` this variable
@@ -1664,7 +1664,6 @@ public class SwitchGLU: Module {
         var lhsIndices: MLXArray?
         if doSort {
             if useLhsIndices {
-                x = x.flattened(start: 0, end: -3)
                 // GLUE-FOLD: an upstream producer already emitted the exact
                 // route table beside the top-8 selection; consume it and the
                 // standalone `mlx_lm_route_simd_rank_scatter` dispatch never
@@ -1819,7 +1818,7 @@ public class SwitchGLU: Module {
         // which otherwise materializes the same arange(64) on every call.
         let downLhs: MLXArray? =
             (doSort && idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
-        x = tightDecodeDown(activated, idx, sorted: doSort)
+        x = tightDecodeDown(activated, idx, sorted: doSort, taggedRoute: useExpertPrefixBounds)
             ?? downProj(activated, idx, lhsIndices: downLhs, sortedIndices: doSort)
         // Under `doSort` a producer above always assigned `inverseOrder`;
         // otherwise it is still nil, which is exactly what the old

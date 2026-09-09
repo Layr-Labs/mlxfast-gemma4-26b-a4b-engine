@@ -1,6 +1,8 @@
+import Foundation
+
 // NAX helpers from the pinned MLX steel sources; keep their arithmetic in step.
 enum CBv2GroupedPrefillPVNAXSourceV1 {
-    static let header = #"""
+    private static let originalHeader = #"""
 // Copyright (c) 2024 Apple Inc.
 
 
@@ -1292,4 +1294,240 @@ auto gemm_loop_softmax(
 }
 
 """#
+    static let pairedGQAEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_GROUPED_PV_PAIRED_GQA_V1"] else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    static let kernelSuffix = pairedGQAEnabled ? "_paired_gqa_v1" : ""
+    private static let pairedHelper = #"""
+
+namespace mlx::steel {
+template <
+    typename T,
+    short SM,
+    short SN,
+    short SK,
+    short BK,
+    bool transpose_a,
+    bool transpose_b,
+    bool kAlignedM,
+    bool kAlignedN,
+    bool kAlignedK,
+    typename AccumType = float>
+auto gemm_loop_softmax_paired_gqa_v1(
+    const device T* A0,
+    const device T* A1,
+    const device T* B,
+    int lda,
+    int ldb,
+    int K,
+    int gemm_k_iterations_aligned,
+    const short sgp_sm,
+    const short sgp_sn,
+    const device T* sm_stats0,
+    const device T* sm_stats1) {
+  static_assert(!transpose_a, "at1: non-transposed A0 operand only");
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+
+  constexpr int RA = transpose_a ? TK : TM;
+  constexpr int CA = transpose_a ? TM : TK;
+
+  constexpr int RB = transpose_b ? TN : TK;
+  constexpr int CB = transpose_b ? TK : TN;
+
+  struct PairResult {
+    NAXTile<AccumType, TM, TN> first;
+    NAXTile<AccumType, TM, TN> second;
+  };
+  NAXTile<AccumType, TM, TN> Dtile0;
+  Dtile0.clear();
+  NAXTile<AccumType, TM, TN> Dtile1;
+  Dtile1.clear();
+
+  const bool has_output = sgp_sm > 0 && sgp_sn > 0;
+  (void)has_output;
+
+  constexpr short kSmRows0 = TM * BaseNAXFrag::kElemRows;
+  float sm_rmax0[kSmRows0];
+  float sm_rinv0[kSmRows0];
+  const short2 sm_sc0 = BaseNAXFrag::get_coord();
+  STEEL_PRAGMA_UNROLL
+  for (short mm = 0; mm < TM; mm++) {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < BaseNAXFrag::kElemRows; i++) {
+      const short row = mm * BaseNAXFrag::kFragRows + sm_sc0.y +
+          i * BaseNAXFrag::kElemRowsJump;
+      const short r =
+          metal::max(short(0), metal::min(row, short(sgp_sm - 1)));
+      const uint2 w0 =
+          *reinterpret_cast<const device uint2*>(sm_stats0 + r * 4);
+      sm_rmax0[mm * BaseNAXFrag::kElemRows + i] = as_type<float>(w0.x);
+      sm_rinv0[mm * BaseNAXFrag::kElemRows + i] = as_type<float>(w0.y);
+    }
+  }
+
+  constexpr short kSmRows1 = TM * BaseNAXFrag::kElemRows;
+  float sm_rmax1[kSmRows1];
+  float sm_rinv1[kSmRows1];
+  const short2 sm_sc1 = BaseNAXFrag::get_coord();
+  STEEL_PRAGMA_UNROLL
+  for (short mm = 0; mm < TM; mm++) {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < BaseNAXFrag::kElemRows; i++) {
+      const short row = mm * BaseNAXFrag::kFragRows + sm_sc1.y +
+          i * BaseNAXFrag::kElemRowsJump;
+      const short r =
+          metal::max(short(0), metal::min(row, short(sgp_sm - 1)));
+      const uint2 w1 =
+          *reinterpret_cast<const device uint2*>(sm_stats1 + r * 4);
+      sm_rmax1[mm * BaseNAXFrag::kElemRows + i] = as_type<float>(w1.x);
+      sm_rinv1[mm * BaseNAXFrag::kElemRows + i] = as_type<float>(w1.y);
+    }
+  }
+
+  int gemm_k_iterations_ = gemm_k_iterations_aligned;
+
+  STEEL_PRAGMA_NO_UNROLL
+  for (int kk0 = 0; kk0 < gemm_k_iterations_; kk0++) {
+    threadgroup_barrier(mem_flags::mem_none);
+    if constexpr (
+        (DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY != 0) &&
+        (!kAlignedM || !kAlignedN)) {
+      if (!has_output)
+        continue;
+    }
+
+    STEEL_PRAGMA_NO_UNROLL
+    for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+      NAXTile<T, RA, CA> Atile0;
+      NAXTile<T, RA, CA> Atile1;
+      NAXTile<T, RB, CB> Btile;
+      const int k = kk1;
+
+#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
+      volatile int compiler_barrier;
+#endif
+
+      const int A_offset = transpose_a ? k * lda : k;
+      const int B_offset = transpose_b ? k : k * ldb;
+
+      if constexpr (kAlignedM) {
+        Atile0.load(A0 + A_offset, lda);
+      } else if constexpr (!transpose_a) {
+        Atile0.load_rows(A0 + A_offset, lda, sgp_sm);
+      } else {
+        Atile0.load_safe(A0 + A_offset, lda, short2(sgp_sm, SK));
+      }
+      softmax_transform_atile(
+          Atile0,
+          sm_rmax0,
+          sm_rinv0,
+          sm_sc0,
+          kAlignedM ? short(SM) : sgp_sm,
+          short(SK));
+
+      if constexpr (kAlignedM) {
+        Atile1.load(A1 + A_offset, lda);
+      } else if constexpr (!transpose_a) {
+        Atile1.load_rows(A1 + A_offset, lda, sgp_sm);
+      } else {
+        Atile1.load_safe(A1 + A_offset, lda, short2(sgp_sm, SK));
+      }
+      softmax_transform_atile(
+          Atile1,
+          sm_rmax1,
+          sm_rinv1,
+          sm_sc1,
+          kAlignedM ? short(SM) : sgp_sm,
+          short(SK));
+
+      if constexpr (kAlignedN) {
+        Btile.load(B + B_offset, ldb);
+      } else if constexpr (transpose_b) {
+        Btile.load_rows(B + B_offset, ldb, sgp_sn);
+      } else {
+        Btile.load_safe(B + B_offset, ldb, short2(sgp_sn, SK));
+      }
+
+      tile_matmad_nax(
+          Dtile0,
+          Atile0,
+          metal::bool_constant<transpose_a>{},
+          Btile,
+          metal::bool_constant<transpose_b>{});
+      tile_matmad_nax(
+          Dtile1,
+          Atile1,
+          metal::bool_constant<transpose_a>{},
+          Btile,
+          metal::bool_constant<transpose_b>{});
+
+#if !DARKBLOOM_GEMMA4_NAX_VOLATILE_ELIDE
+      (void)compiler_barrier;
+#endif
+    }
+
+    A0 += transpose_a ? (BK * lda) : BK;
+    A1 += transpose_a ? (BK * lda) : BK;
+    B += transpose_b ? BK : (BK * ldb);
+  }
+
+  if constexpr (!kAlignedK) {
+    simdgroup_barrier(mem_flags::mem_none);
+    if constexpr (
+        (DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY != 0) &&
+        (!kAlignedM || !kAlignedN)) {
+      if (!has_output)
+        return PairResult{Dtile0, Dtile1};
+    }
+
+    const short rem_bk = K - gemm_k_iterations_ * BK;
+
+    STEEL_PRAGMA_NO_UNROLL
+    for (int kk1 = 0; kk1 < rem_bk; kk1 += SK) {
+      NAXTile<T, RA, CA> Atile0;
+      NAXTile<T, RA, CA> Atile1;
+      NAXTile<T, RB, CB> Btile;
+
+      const int k = kk1;
+      const short psk = max(0, rem_bk - k);
+
+      const short2 Aklims =
+          transpose_a ? short2(sgp_sm, psk) : short2(psk, sgp_sm);
+      const short2 Bklims =
+          transpose_b ? short2(psk, sgp_sn) : short2(sgp_sn, psk);
+
+      const int A_offset = transpose_a ? k * lda : k;
+      const int B_offset = transpose_b ? k : k * ldb;
+
+      Atile0.load_safe(A0 + A_offset, lda, Aklims);
+      softmax_transform_atile(Atile0, sm_rmax0, sm_rinv0, sm_sc0, sgp_sm, psk);
+      Atile1.load_safe(A1 + A_offset, lda, Aklims);
+      softmax_transform_atile(Atile1, sm_rmax1, sm_rinv1, sm_sc1, sgp_sm, psk);
+      Btile.load_safe(B + B_offset, ldb, Bklims);
+
+      tile_matmad_nax(
+          Dtile0,
+          Atile0,
+          metal::bool_constant<transpose_a>{},
+          Btile,
+          metal::bool_constant<transpose_b>{});
+      tile_matmad_nax(
+          Dtile1,
+          Atile1,
+          metal::bool_constant<transpose_a>{},
+          Btile,
+          metal::bool_constant<transpose_b>{});
+    }
+  }
+
+  return PairResult{Dtile0, Dtile1};
+}
+}
+"""#
+    static let header = pairedGQAEnabled ? originalHeader + pairedHelper : originalHeader
 }

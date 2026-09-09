@@ -37,7 +37,7 @@ enum CBv2GroupedPrefillPVV1 {
         #endif
     }()
 
-    private static let source = #"""
+    private static let originalSource = #"""
         using namespace mlx::steel;
         const uint3 tid = threadgroup_position_in_grid;
         const int block = int(tid.z) / (BATCH * 16);
@@ -82,8 +82,56 @@ enum CBv2GroupedPrefillPVV1 {
         });
         """#
 
+    private static let pairedSource = #"""
+        using namespace mlx::steel;
+        const uint3 tid = threadgroup_position_in_grid;
+        const int block = int(tid.z) / (BATCH * 8);
+        const int batchHead = (int(tid.z) % (BATCH * 8)) * 2;
+        const int b = batchHead / 16;
+        const int h = batchHead % 16;
+        const int tid_y = (int(tid.y) << SWIZZLE) +
+            (int(tid.x) & ((1 << SWIZZLE) - 1));
+        const int tid_x = int(tid.x) >> SWIZZLE;
+        if (tid_y >= 128 / BM || tid_x >= D / 128) return;
+        const int K = (block + 1) * 128;
+        const device T* scores = nullptr;
+        const device T* stats = nullptr;
+        switch (block) {
+            case 0: scores = s0; stats = r0; break;
+            case 1: scores = s1; stats = r1; break;
+            case 2: scores = s2; stats = r2; break;
+            case 3: scores = s3; stats = r3; break;
+            case 4: scores = s4; stats = r4; break;
+            case 5: scores = s5; stats = r5; break;
+            case 6: scores = s6; stats = r6; break;
+            default: scores = s7; stats = r7; break;
+        }
+        threadgroup_barrier(mem_flags::mem_none);
+        constexpr short SM = BM / WM;
+        constexpr short SN = 128 / 4;
+        const short tm = SM * (simdgroup_index_in_threadgroup / 4);
+        const short tn = SN * (simdgroup_index_in_threadgroup % 4);
+        const int row = tid_y * BM + tm;
+        const int col = tid_x * 128 + tn;
+        const device T* A = scores + (size_t(batchHead) * 128 + row) * K;
+        const device T* C = stats + (size_t(batchHead) * 128 + row) * 4;
+        const device T* V = values +
+            (size_t(b) * KVHEADS + h / (16 / KVHEADS)) * 1024 * D + col;
+        device T* O = output +
+            ((size_t(b) * 1024 + block * 128 + row) * 16 + h) * D + col;
+        dispatch_bool(K % BK == 0, [&](auto alignedK) {
+            auto tiles = gemm_loop_softmax_paired_gqa_v1<
+                T, SM, SN, 32, BK, false, false, true, true, alignedK.value, float>(
+                A, A + 128 * K, V, K, D, K, K / BK, SM, SN, C, C + 128 * 4);
+            tiles.first.store(O, 16 * D);
+            tiles.second.store(O + D, 16 * D);
+        });
+        """#
+    private static let source = CBv2GroupedPrefillPVNAXSourceV1.pairedGQAEnabled
+        ? pairedSource : originalSource
+
     private static let kernel = MLXFast.metalKernel(
-        name: "cbv2_grouped_prefill_pv_nax_v1",
+        name: "cbv2_grouped_prefill_pv_nax_v1" + CBv2GroupedPrefillPVNAXSourceV1.kernelSuffix,
         inputNames: (0..<8).map { "s\($0)" } + (0..<8).map { "r\($0)" } + ["values"],
         outputNames: ["output"],
         source: source,
@@ -142,7 +190,7 @@ enum CBv2GroupedPrefillPVV1 {
             template: [("T", queries.dtype), ("BATCH", batch), ("D", dim),
                 ("KVHEADS", keys.dim(1)), ("BM", geometry.bm), ("BK", geometry.bk),
                 ("WM", geometry.wm), ("SWIZZLE", geometry.swizzle)],
-            grid: (tilesN * 32, tilesM * 4, batch * 16 * 8 * geometry.wm),
+            grid: (tilesN * 32, tilesM * 4, batch * (CBv2GroupedPrefillPVNAXSourceV1.pairedGQAEnabled ? 8 : 16) * 8 * geometry.wm),
             threadGroup: (32, 4, geometry.wm),
             outputShapes: [[batch, 1024, 16, dim]],
             outputDTypes: [.bfloat16])[0]

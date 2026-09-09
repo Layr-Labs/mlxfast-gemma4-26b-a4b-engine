@@ -248,7 +248,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
 // identical [0, gh) / [gh, G) split across the threadgroup's two simdgroups
 // and the identical simdgroup-0-adds-simdgroup-1 close, per tile. Every output
 // word is therefore the same float sum accumulated in the same order.
-template <typename T, int KS, int TILES, int KFIX, int SPLIT = 0, int NFIX = 0>
+template <typename T, int KS, int TILES, int KFIX, int SPLIT = 0, int NFIX = 0, int SPLIT2 = 0>
 METAL_FUNC void qkv_mma8_affine4_g64_mt(
     const device uint32_t* w,
     const device T* scales,
@@ -260,7 +260,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     threadgroup float2* red,
     uint simd_gid,
     uint simd_lid,
-    device T* y2 = nullptr) {
+    device T* y2 = nullptr,
+    device T* y3 = nullptr) {
   constexpr int K = KFIX;
   constexpr int G = K / 64;
   constexpr int gh = (G + 1) / 2;
@@ -395,8 +396,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     if (SPLIT == 0) {
       const int strideN = (NFIX != 0) ? NFIX : N;
       y[c.fn * strideN + nt + c.fm] = static_cast<T>(acc0[t]);
-      y[(c.fn + 1) * strideN + nt + c.fm] = static_cast<T>(acc1[t]);
-    } else {
+    } else if (SPLIT2 == 0) {
       // Fused Q||K plane: columns below SPLIT belong to Q, the rest to K.
       // Both rows of a store pair share one column, so the branch is uniform.
       const int col = nt + c.fm;
@@ -408,6 +408,27 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         const int c2 = col - SPLIT;
         y2[c.fn * stride_n2 + c2] = static_cast<T>(acc0[t]);
         y2[(c.fn + 1) * stride_n2 + c2] = static_cast<T>(acc1[t]);
+      }
+    } else {
+      // Fused Q||K||V plane (sliding decode triple): columns below SPLIT
+      // belong to Q, below SPLIT2 to K, the rest to V. The column is shared
+      // by both rows of a store pair, so the branch stays uniform; each
+      // output buffer is written densely with its own width as stride, the
+      // same layout the three separate dispatches produce.
+      const int col = nt + c.fm;
+      if (col < SPLIT) {
+        y[c.fn * SPLIT + col] = static_cast<T>(acc0[t]);
+        y[(c.fn + 1) * SPLIT + col] = static_cast<T>(acc1[t]);
+      } else if (col < SPLIT2) {
+        const int stride_n2 = SPLIT2 - SPLIT;
+        const int c2 = col - SPLIT;
+        y2[c.fn * stride_n2 + c2] = static_cast<T>(acc0[t]);
+        y2[(c.fn + 1) * stride_n2 + c2] = static_cast<T>(acc1[t]);
+      } else {
+        const int stride_n3 = (NFIX != 0) ? (NFIX - SPLIT2) : (N - SPLIT2);
+        const int c3 = col - SPLIT2;
+        y3[c.fn * stride_n3 + c3] = static_cast<T>(acc0[t]);
+        y3[(c.fn + 1) * stride_n3 + c3] = static_cast<T>(acc1[t]);
       }
     }
   }
@@ -511,7 +532,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_rsp(
 // output word is the same float sum in the same order.
 // QKFUSE-001 merge: the SPLIT/y2 store split mirrors the MT body's, so the
 // fused concatenated-N dispatch can consume this rsp body unchanged.
-template <typename T, int KS, int TILES, int KFIX, int SPLIT = 0, int NFIX = 0>
+template <typename T, int KS, int TILES, int KFIX, int SPLIT = 0, int NFIX = 0, int SPLIT2 = 0>
 METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     const device uint32_t* w,
     const device T* scales,
@@ -524,8 +545,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     threadgroup float2* red,
     uint simd_gid,
     uint simd_lid,
-    device T* y2 = nullptr) {
-  constexpr int K = KFIX;
+    device T* y2 = nullptr,
+    device T* y3 = nullptr) {
   constexpr int G = K / 64;
   constexpr int gh = (G + 1) / 2;
   constexpr int nGroups = (KS == 2) ? gh : G;
@@ -618,7 +639,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
       const int strideN = (NFIX != 0) ? NFIX : N;
       y[c.fn * strideN + nt + c.fm] = static_cast<T>(acc0[t]);
       y[(c.fn + 1) * strideN + nt + c.fm] = static_cast<T>(acc1[t]);
-    } else {
+    } else if (SPLIT2 == 0) {
       // Fused Q||K plane: columns below SPLIT belong to Q, the rest to K.
       // Both rows of a store pair share one column, so the branch is uniform.
       const int col = nt + c.fm;
@@ -630,6 +651,27 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         const int c2 = col - SPLIT;
         y2[c.fn * stride_n2 + c2] = static_cast<T>(acc0[t]);
         y2[(c.fn + 1) * stride_n2 + c2] = static_cast<T>(acc1[t]);
+      }
+    } else {
+      // Fused Q||K||V plane (sliding decode triple): same uniform column
+      // branch as above with a second split point for V. The rsp run-sum
+      // table is indexed by activation row and K-group only, so the triple
+      // dispatch reads the identical entries the three separate rsp
+      // dispatches would.
+      const int col = nt + c.fm;
+      if (col < SPLIT) {
+        y[c.fn * SPLIT + col] = static_cast<T>(acc0[t]);
+        y[(c.fn + 1) * SPLIT + col] = static_cast<T>(acc1[t]);
+      } else if (col < SPLIT2) {
+        const int stride_n2 = SPLIT2 - SPLIT;
+        const int c2 = col - SPLIT;
+        y2[c.fn * stride_n2 + c2] = static_cast<T>(acc0[t]);
+        y2[(c.fn + 1) * stride_n2 + c2] = static_cast<T>(acc1[t]);
+      } else {
+        const int stride_n3 = (NFIX != 0) ? (NFIX - SPLIT2) : (N - SPLIT2);
+        const int c3 = col - SPLIT2;
+        y3[c.fn * stride_n3 + c3] = static_cast<T>(acc0[t]);
+        y3[(c.fn + 1) * stride_n3 + c3] = static_cast<T>(acc1[t]);
       }
     }
   }
@@ -728,6 +770,30 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             """,
         header: mma8KernelHeader,
         ensureRowContiguous: true)
+    /// QKV-TRIPLE-001: sliding layers project Q, K AND V from the same
+    /// activation, so the three planes concatenate into one 8192-wide plane
+    /// (Q 4096 | K 2048 | V 2048) served by a single dispatch. Each output
+    /// column accumulates independently from its own plane row, so the three
+    /// outputs are bit-exact versus the three separate dispatches; the extra
+    /// split point only steers the already-computed pair into a third dense
+    /// buffer. New kernel names keep the pipeline cache distinct.
+    private static let fusedSlidingTripleKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qkv8192_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y", "y2", "y3"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt<T, 2, 2, 2816, 4096, 8192, 6144>(
+                w, scales, biases, x, y,
+                8192, int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup, y2, y3);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
 
     // MMA-RS-001 on QKFUSE-001: the fused Q||K dispatch consumes the shared
     // run-sum table. The table is per activation row and per 64-group of K,
@@ -767,6 +833,27 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             """,
         header: mma8KernelHeader,
         ensureRowContiguous: true)
+    /// QKV-TRIPLE-001 rsp twin: the same three-way split store with the
+    /// precomputed run-sum table. Table entries are per activation row and
+    /// K-group only, so the triple dispatch consumes the identical floats
+    /// the three separate rsp dispatches would.
+    private static let fusedSlidingTripleRspKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qkv8192_rsp_v1",
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y", "y2", "y3"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816, 4096, 8192, 6144>(
+                w, scales, biases, x, rs_table, y,
+                8192, int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup, y2, y3);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
 
     private static let mma8Kernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_bfill_v4",
@@ -1035,6 +1122,91 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             outputDTypes: [x.dtype, x.dtype])
         return (outputs[0], outputs[1])
     }
+    /// QKV-TRIPLE-001 host. Sliding decode layers project Q (4096), K
+    /// (2048) AND V (2048) from the same activation, so one 8192-wide
+    /// dispatch replaces the fused-QK dispatch plus the separate V dispatch.
+    /// The concatenated plane is cached per layer under the Q identity, in a
+    /// table disjoint from the QK planes so neither admission disturbs the
+    /// other. Fail-closed: any shape, dtype, contract, or switch mismatch
+    /// returns nil and the caller keeps the incumbent two-dispatch road.
+    nonisolated(unsafe) private static var triplePlanes:
+        [ObjectIdentifier: (MLXArray, MLXArray, MLXArray)] = [:]
+
+    public static func fusedQKVMatmul(
+        x: MLXArray,
+        qWeight: MLXArray, qScales: MLXArray, qBiases: MLXArray?,
+        kWeight: MLXArray, kScales: MLXArray, kBiases: MLXArray?,
+        vWeight: MLXArray, vScales: MLXArray, vBiases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode,
+        cacheKey: ObjectIdentifier,
+        rsTable: MLXArray? = nil
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard enabled, fuseQKEnabled, multiTileEnabled,
+            groupSize == Self.groupSize,
+            bits == Self.bits,
+            mode == .affine,
+            let qBiases, let kBiases, let vBiases,
+            x.dtype == .bfloat16,
+            qScales.dtype == x.dtype, qBiases.dtype == x.dtype,
+            kScales.dtype == x.dtype, kBiases.dtype == x.dtype,
+            vScales.dtype == x.dtype, vBiases.dtype == x.dtype,
+            qWeight.dtype == .uint32, kWeight.dtype == .uint32,
+            vWeight.dtype == .uint32,
+            x.ndim == 3,
+            x.dim(0) == batch, x.dim(1) == sequence, x.dim(2) == inputWidth,
+            x.size == batch * sequence * inputWidth,
+            qWeight.ndim == 2, kWeight.ndim == 2, vWeight.ndim == 2,
+            qWeight.dim(0) == 4096, kWeight.dim(0) == 2048,
+            vWeight.dim(0) == 2048,
+            qWeight.dim(1) == inputWidth * Self.bits / 32,
+            kWeight.dim(1) == inputWidth * Self.bits / 32,
+            vWeight.dim(1) == inputWidth * Self.bits / 32,
+            qScales.shape == [4096, inputWidth / Self.groupSize],
+            qBiases.shape == qScales.shape,
+            kScales.shape == [2048, inputWidth / Self.groupSize],
+            kBiases.shape == kScales.shape,
+            vScales.shape == [2048, inputWidth / Self.groupSize],
+            vBiases.shape == vScales.shape
+        else { return nil }
+
+        let tableReady =
+            rsTable != nil
+            && rsTable!.dtype == .float32
+            && rsTable!.shape == [batch, inputWidth / Self.groupSize]
+        let kernel =
+            tableReady ? fusedSlidingTripleRspKernel : fusedSlidingTripleKernel
+        let yTiles = 8192 / outputsPerGroup
+        guard yTiles % tilesPerGroup == 0 else { return nil }
+
+        fusedLock.lock()
+        var plane = triplePlanes[cacheKey]
+        if plane == nil {
+            let w = concatenated([qWeight, kWeight, vWeight], axis: 0)
+            let s = concatenated([qScales, kScales, vScales], axis: 0)
+            let b = concatenated([qBiases, kBiases, vBiases], axis: 0)
+            eval(w, s, b)
+            plane = (w, s, b)
+            triplePlanes[cacheKey] = plane
+        }
+        fusedLock.unlock()
+        guard let (fw, fs, fb) = plane else { return nil }
+
+        let outputs = kernel(
+            tableReady ? [x, fw, fs, fb, rsTable!] : [x, fw, fs, fb],
+            template: [("T", x.dtype)],
+            grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [
+                [batch, sequence, 4096], [batch, sequence, 2048],
+                [batch, sequence, 2048],
+            ],
+            outputDTypes: [x.dtype, x.dtype, x.dtype])
+        CBv2EngageMark.once("qkv-triple-sliding")
+        return (outputs[0], outputs[1], outputs[2])
+    }
+
 
     /// Q widths the fused kernels bake as a compile-time split point.
     private static func liveFusedSplit(_ width: Int) -> Bool {

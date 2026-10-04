@@ -424,11 +424,12 @@ jobs:
               # was busy and never told us BY WHAT, so every quiescence timeout
               # looked alike and no one could name the hog after the fact.
               top="$(ps -Ameo pid,pcpu,rss,etime,command -r | head -15 || true)"
-              lingering="$(pgrep -fl 'mlxfast-runtime-worker|benchctl|mlxfast-swift' || true)"
+              bench_procs='mlxfast-runtime-worker|benchctl|mlxfast-swift'
+              lingering="$(pgrep -fl "${bench_procs}" || true)"
               [[ -n "${lingering}" ]] || lingering="(none found)"
               echo "gemma4-ranked: top processes by CPU at the quiescence ceiling:"
               printf '%s\n' "${top}"
-              echo "gemma4-ranked: lingering benchmark processes (mlxfast-runtime-worker|benchctl|mlxfast-swift):"
+              echo "gemma4-ranked: lingering benchmark processes (${bench_procs}):"
               printf '%s\n' "${lingering}"
               {
                 echo "### Quiescence ceiling reached"
@@ -440,7 +441,7 @@ jobs:
                 printf '%s\n' "${top}"
                 echo '```'
                 echo
-                echo "Lingering benchmark processes (mlxfast-runtime-worker|benchctl|mlxfast-swift):"
+                echo "Lingering benchmark processes (${bench_procs}):"
                 echo '```'
                 printf '%s\n' "${lingering}"
                 echo '```'

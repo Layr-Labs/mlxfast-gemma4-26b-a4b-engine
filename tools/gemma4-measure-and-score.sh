@@ -224,12 +224,13 @@ gemma4_report_failure_class() {
     fi
   fi
 
-  echo "gemma4-measure-and-score.sh: failure class: ${class}${facts}" >&2
+  local trailer="gemma4-measure-and-score.sh: failure class: ${class}${facts}"
+  echo "${trailer}" >&2
 
   # The annotation. Without it the run page's own error list says only the exit
   # code; with it the class is the first thing a submitter reads.
   if [ -n "${GITHUB_ACTIONS:-}" ]; then
-    echo "::error::gemma4-measure-and-score.sh: failure class: ${class}${facts}" >&2
+    echo "::error::${trailer}" >&2
     if [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -w "${GITHUB_STEP_SUMMARY}" ]; then
       {
         echo "### Benchmark step failed (exit ${rc})"

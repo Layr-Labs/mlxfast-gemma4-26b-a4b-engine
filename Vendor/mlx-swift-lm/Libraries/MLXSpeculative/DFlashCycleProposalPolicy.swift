@@ -108,11 +108,7 @@ public struct DFlashCycleProposalPolicy: Equatable, Sendable {
     /// run still has to commit (>= 1); a round always emits at least the
     /// verified bonus column, so a block never needs to be wider than
     /// `remaining + 1`.
-    ///
-    /// `mutating` by contract: the round decision belongs to the policy, and
-    /// the session calls this exactly once per round before running it. The
-    /// current body only reads phase state.
-    public mutating func nextAction(remaining: Int) -> Action {
+    public func nextAction(remaining: Int) -> Action {
         precondition(
             remaining >= 1,
             "nextAction(remaining:) is only meaningful while the run still "

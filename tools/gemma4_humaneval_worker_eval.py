@@ -579,6 +579,38 @@ def _dflash_attempt(
     return result
 
 
+def failed_generation(
+    failure: str,
+    *,
+    attempts: list[dict[str, Any]] | None,
+    rerun_position: int | None,
+    engine_error_retries: int,
+    respawned: bool,
+) -> dict[str, Any]:
+    """The outcome of a problem that produced no usable generation."""
+
+    return {
+        "tokens": [],
+        "prefill_s": None,
+        "decode_s": None,
+        "stopped_on": None,
+        "truncated": False,
+        "rounds": 0,
+        "acceptance_lengths": None,
+        "drafted_total": None,
+        "accepted_total": None,
+        "committed_total": None,
+        "effective_spec": None,
+        "attempts": attempts,
+        "rerun": rerun_position is not None,
+        "rerun_position": rerun_position,
+        "engine_error_retries": engine_error_retries,
+        "respawned": respawned,
+        "failed": True,
+        "failure": failure,
+    }
+
+
 def generate_dflash(
     handle: WorkerHandle,
     *,
@@ -644,26 +676,13 @@ def generate_dflash(
         counts.append(budget)
 
     def _failed(error_text: str) -> dict[str, Any]:
-        return {
-            "tokens": [],
-            "prefill_s": None,
-            "decode_s": None,
-            "stopped_on": None,
-            "truncated": False,
-            "rounds": 0,
-            "acceptance_lengths": None,
-            "drafted_total": None,
-            "accepted_total": None,
-            "committed_total": None,
-            "effective_spec": None,
-            "attempts": attempts,
-            "rerun": rerun_position is not None,
-            "rerun_position": rerun_position,
-            "engine_error_retries": engine_error_retries,
-            "respawned": respawned,
-            "failed": True,
-            "failure": error_text,
-        }
+        return failed_generation(
+            error_text,
+            attempts=attempts,
+            rerun_position=rerun_position,
+            engine_error_retries=engine_error_retries,
+            respawned=respawned,
+        )
 
     def _succeeded(
         outcome: Mapping[str, Any], tokens: list[int], stopped_on: int | None
@@ -1204,26 +1223,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                         hint_tokens=hints.get(task_id),
                     )
             except (RuntimeError, OSError) as error:
-                outcome = {
-                    "tokens": [],
-                    "prefill_s": None,
-                    "decode_s": None,
-                    "stopped_on": None,
-                    "truncated": False,
-                    "rounds": 0,
-                    "acceptance_lengths": None,
-                    "drafted_total": None,
-                    "accepted_total": None,
-                    "committed_total": None,
-                    "effective_spec": None,
-                    "attempts": None,
-                    "rerun": False,
-                    "rerun_position": None,
-                    "engine_error_retries": 0,
-                    "respawned": False,
-                    "failed": True,
-                    "failure": f"{type(error).__name__}: {error}",
-                }
+                outcome = failed_generation(
+                    f"{type(error).__name__}: {error}",
+                    attempts=None,
+                    rerun_position=None,
+                    engine_error_retries=0,
+                    respawned=False,
+                )
             tokens = list(outcome["tokens"])
             text, raw_text = decode_completion(tokenizer, tokens, stop_ids)
             solution = sanitize(text, entrypoint=str(task["entry_point"]))

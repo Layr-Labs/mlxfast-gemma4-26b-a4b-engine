@@ -141,7 +141,10 @@ final class RuntimeWorkerDFlashFreeRunSession {
     /// block ceiling (`MLXFastConstants.experimentalDFlashMaxBlockSize`), the
     /// same rectangle the drafter's own trained `block_size` allows, so a
     /// cycle round verifies a shape the target already runs.
-    static let cycleProposalBlockSize = MLXFastConstants.experimentalDFlashMaxBlockSize
+    private static let cycleProposalBlockSize = MLXFastConstants.experimentalDFlashMaxBlockSize
+
+    /// The widest block a cycle round can put in front of the verifier.
+    var cycleWideBlockSize: Int { cycleProposals.wideBlockSize }
 
     /// Open the window: prefill the seed prompt through the target's DFlash
     /// forward (which captures the tap hidden states in the SAME pass) and

@@ -423,10 +423,20 @@ jobs:
               # one fact the trace never carried -- the ceiling told us the box
               # was busy and never told us BY WHAT, so every quiescence timeout
               # looked alike and no one could name the hog after the fact.
-              top="$(ps -Ameo pid,pcpu,rss,etime,command -r | head -15 || true)"
+              #
+              # NO ARGUMENTS REACH THE LOG. This log and the step summary are
+              # public, and any process's argv can hold a credential, so every
+              # listing prints the kernel process name (`ucomm`) and never
+              # `command` or `pgrep -l`. `comm` is not enough on macOS: it
+              # prints argv[0]. `-r` alone sets the order, so the list is by CPU.
+              proc_cols='pid,pcpu,rss,etime,ucomm'
+              top="$(ps -Ao "${proc_cols}" -r | head -15 || true)"
               bench_procs='mlxfast-runtime-worker|benchctl|mlxfast-swift'
-              lingering="$(pgrep -fl "${bench_procs}" || true)"
-              [[ -n "${lingering}" ]] || lingering="(none found)"
+              lingering_pids="$(pgrep -f "${bench_procs}" | paste -sd, - || true)"
+              lingering="(none found)"
+              if [[ -n "${lingering_pids}" ]]; then
+                lingering="$(ps -o "${proc_cols}" -p "${lingering_pids}" || true)"
+              fi
               echo "gemma4-ranked: top processes by CPU at the quiescence ceiling:"
               printf '%s\n' "${top}"
               echo "gemma4-ranked: lingering benchmark processes (${bench_procs}):"

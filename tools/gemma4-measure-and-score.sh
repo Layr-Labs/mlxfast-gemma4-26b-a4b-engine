@@ -173,9 +173,11 @@ set -euo pipefail
 # in Yukon, which reports every one of them as `benchmark_failed`. The submitter
 # could not tell which had hit them. This adds ONE line naming the class.
 #
-# IT NAMES, IT DOES NOT DIAGNOSE. Only two exit codes carry a meaning this
-# script can honestly translate -- benchctl's 5 and 6 -- and everything else is
-# pointed back at the error that was actually printed rather than guessed at.
+# IT NAMES, IT DOES NOT DIAGNOSE. Three exit codes carry a meaning this
+# script can honestly translate -- benchctl's 5, 6 and 8 -- and everything else
+# is pointed back at the error that was actually printed rather than guessed at.
+# That includes exit 2, a usage error from this script, the score emitter or
+# benchctl, because the usage message above already names it.
 # The cause of a refusal is still whatever benchctl or the emitter said above;
 # this only stops that cause being invisible behind a number.
 #
@@ -199,6 +201,7 @@ gemma4_report_failure_class() {
   case "${rc}" in
     5) class="benchctl refused the candidate after measurement (acceptance gates)" ;;
     6) class="benchctl refusal, named in its own output above (die 6)" ;;
+    8) class="benchctl prerequisite failure before any measurement (die 8)" ;;
     *) class="see the last error above (exit ${rc})" ;;
   esac
 
